@@ -13,13 +13,15 @@ readme = { file = "README.md", content-type = "text/markdown" }
 name = "nemo-rl"
 dynamic = ["version", "readme"]
 description = "NeMo RL: A Scalable and Efficient Post-Training Library for Models Ranging from 1 GPU to 1000s, and from Tiny to >100B Parameters"
-requires-python = ">=3.13.13"
+requires-python = ">=3.13.7" # bare-metal: relaxed from >=3.13.13 (undocumented routine bump, not
+# tied to any known fix) since that exact patch isn't downloadable via uv's interpreter catalog;
+# cp313 wheels (incl. wheelyard's) are ABI-stable across 3.13.x patches.
 license = { text = "Apache 2.0" }
 dependencies = [
   "setuptools",
   "pip",                                                                                                              # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",                                                                                                            # for flash-attn parallel build
-  "torch==2.10.0",
+  "torch==2.15.0.dev20260817+cu126",                                                                                  # bare-metal: pinned to match our own wheelyard build (see [tool.uv.sources])
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]==2.54.0",
@@ -42,8 +44,28 @@ dependencies = [
   "plotly",
   "sympy>=1.14.0",
   "pillow>=12.1.1",
-  "torchvision==0.25.0",
-  "transformers==5.3.0",
+  "torchvision==0.30.0.dev20260817+cu126",                                                                    # bare-metal: pinned to match our own wheelyard build
+  # bare-metal: only ever pulled in transitively (via transformers' AutoProcessor
+  # import chain, unused here) until now — [tool.uv.sources] doesn't apply to
+  # transitive deps, so making it explicit here is what actually routes it to the
+  # pytorch-cpu index below instead of a stray CUDA-13-linked PyPI build.
+  "torchaudio",
+  # bare-metal: was 5.3.0, with a separate extra=='vllm'-scoped override bumping
+  # it to 5.16.0 for vllm 0.27.2rc1's real floor (>=5.5.3). That worked for
+  # flashinfer/openai/etc., but for a package ALSO declared unconditionally here
+  # AND with a floor in the automodel extra, having three overlapping
+  # declarations (unconditional, extra floor, extra-scoped override) hit the
+  # same uv quirk as xgrammar: it silently dropped transformers from the
+  # automodel-only install set entirely (present in metadata, absent from the
+  # actual tree — `uv tree --extra automodel` showed nothing). Consolidated to
+  # one unconditional pin instead — 5.16.0 already satisfies automodel's own
+  # >=5.3.0 floor too, so there's no need for a separate override at all.
+  # `; extra != 'sglang'`: sglang==0.5.10 itself hard-pins transformers==5.3.0
+  # (a real constraint we don't control) — straight conflict with 5.16.0.
+  # sglang is never actually used bare-metal, so scoping it away here (one
+  # declaration, not overlapping ones) sidesteps the conflict without
+  # reintroducing the silent-drop problem above.
+  "transformers==5.16.0; extra != 'sglang'",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
   "mlflow>=3.11.1",
   "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
@@ -57,37 +79,93 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-fsdp = ["flash-attn==2.8.1", "mamba-ssm", "causal-conv1d"]
+# mamba-ssm/causal-conv1d dropped (bare-metal): SSM/Mamba-architecture support we
+# don't use, and their git builds fail to compile against our CUDA 12.6/gcc pairing
+# (nvcc errors like "namespace std has no member string_view", missing -std=c++17).
+# Re-add if that gets fixed or Mamba-style models are ever needed.
+fsdp = ["flash-attn==2.8.4"]
 automodel = [
-  "nemo-automodel[moe]",
+  # bare-metal: dropped [moe] (pulls in nemo_automodel[cuda], which is where
+  # mamba-ssm/causal-conv1d actually come from, plus its own
+  # transformer-engine[pytorch]<=2.11.0 pin conflicting with our wheelyard
+  # override below). DomynEdge is dense, not MoE.
+  "nemo-automodel",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-  "flash-attn==2.8.1",
+  "flash-attn==2.8.4",
   "transformers>=5.3.0",
-  "mamba-ssm",
-  "causal-conv1d",
-  "nv-grouped-gemm",
-  "transformer-engine[pytorch]>=2.9.0a0,<2.12.0",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
+  # mamba-ssm/causal-conv1d dropped (bare-metal) — see fsdp extra's comment above.
+  # nv-grouped-gemm/deep_ep dropped (bare-metal): MoE-only expert-parallel kernels
+  # (DomynEdge is dense), and deep_ep's internode kernels hard-require Hopper
+  # TMA/cp.async.bulk PTX instructions (sm_90+) — they don't even compile for
+  # Leonardo's A100s (sm_80), regardless of toolchain fixes.
+  "transformer-engine[pytorch]==2.19.0.dev0+f167a424",                                                               # bare-metal: pinned to match our own wheelyard build
 ]
 vllm = [
   "cuda-python",
-  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c",
-  # deep_ep also needs libibverbs-dev
-  # sudo apt-get update
-  # sudo apt-get install libibverbs-dev
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  "vllm==0.17.1",
+  # deep_gemm/deep_ep dropped (bare-metal): both hard-require Hopper (sm_90+ for
+  # deep_gemm's FP8 kernels; sm_90+ TMA instructions for deep_ep) — Leonardo only
+  # has A100s (sm_80), so neither can build here regardless of toolchain fixes.
+  "vllm==0.27.2rc1.dev363+gc8438a3d4.cu126",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.4",
-  "flashinfer-cubin==0.6.4",
-  "nvidia-cutlass-dsl>=4.4.0.dev1",
+  # bare-metal: vllm 0.27.2rc1 hard-pins flashinfer-python==0.6.17. flashinfer-cubin
+  # (a separate release train) hasn't published a matching 0.6.17 build as of this
+  # writing (0.6.13 is the latest on PyPI) — genuine upstream release lag, not
+  # something wheelyard or an override can fix. Runtime bypasses the resulting
+  # self-consistency check via FLASHINFER_DISABLE_VERSION_CHECK=1 (see launcher).
+  "flashinfer-python==0.6.17",
+  "flashinfer-cubin==0.6.13",
+  # bare-metal: vllm 0.27.2rc1 declares nvidia-cutlass-dsl==4.6.2 exactly, but our
+  # own loose >=4.4.0.dev1 floor let it resolve to 4.7.1 (newest available)
+  # instead — same override-supersedes-the-real-need pattern as llguidance/
+  # xgrammar above, caught via the same systematic metadata diff, not a crash.
+  "nvidia-cutlass-dsl==4.6.2",
+  # bare-metal: vllm 0.27.2rc1's responses-API code imports `NamespaceTool` from
+  # openai.types.responses, missing from openai 2.6.1 (vllm's own metadata only
+  # declares openai>=2.0.0, too loose for what its actual code needs). An
+  # extra-scoped override-dependencies entry alone didn't work — openai is only
+  # ever pulled in transitively (via vllm), and uv dropped it from the lockfile
+  # entirely rather than just overriding its version. Direct dep instead, same
+  # fix as torchaudio/sglang-kernel above: transitive-only packages need to be
+  # made explicit for our own pins/sources to reliably apply.
+  # Pinned to 2.25.0 specifically (bisected via `uv pip install` in a scratch venv,
+  # not published release notes) as the MINIMAL version with NamespaceTool — not
+  # the latest — to stay as close as possible to what nemo_gym's own openai<=2.7.2
+  # (see 3rdparty/Gym-workspace/Gym/pyproject.toml, which upper-bounds it "for
+  # schema compatibility") was actually tested against, since that ceiling had to
+  # be raised too for the universal lock to resolve at all.
+  "openai==2.25.0",
+  # bare-metal: vllm 0.27.2rc1 requires xgrammar>=0.2.1,<1.0.0 (structured-output
+  # support; the ModuleNotFoundError was for xgrammar.openai_tool_call_schema,
+  # added well after our old 0.1.33 CVE-fix pin). Direct dep for the same reason
+  # as openai/torchaudio above — only ever pulled in transitively otherwise.
+  # 0.2.3, not the newer 0.2.5: 0.2.5 has no cp313 wheel on PyPI (cp310 only) and
+  # would need a from-source build; 0.2.3 is the highest version that ships one
+  # and still satisfies vllm's >=0.2.1 floor. Its compiled extension also needs
+  # a newer libstdc++ than RHEL8's base gcc ships — see custom/ray_bare_metal.sub.
+  "xgrammar==0.2.3",
+  # bare-metal: vllm 0.27.2rc1 requires llguidance>=1.7.0,<1.8.0 (was 1.3.x for
+  # vllm 0.17.1). See override-dependencies comment above for how this was found.
+  "llguidance==1.7.6",
 ]
 sglang = [
   "sglang",
   "sglang-kernel", # Must be a direct dep so [tool.uv.sources] VCS override applies (transitive deps don't use sources)
 ]
+# bare-metal: dropped the xgrammar==0.1.33 CVE-fix override for sglang
+# (GHSA-7rgv-gqhr-fxg3) — sglang isn't used bare-metal (mutually exclusive with
+# vllm/automodel here anyway, see `conflicts` below). Trying to force it
+# alongside vllm's own xgrammar==0.2.3 caused two separate problems:
+# (1) sglang==0.5.10 itself hard-pins xgrammar==0.1.32, directly conflicting
+#     with our 0.1.33 override once both were plain per-extra direct deps.
+# (2) Before that: overriding it while vllm also directly depended on a
+#     DIFFERENT xgrammar version silently dropped xgrammar from
+#     [package.optional-dependencies].vllm entirely — present in
+#     [package.metadata].requires-dist, absent from the section that actually
+#     drives `uv sync`'s install set (symptom: vllm's engine init crashing with
+#     ModuleNotFoundError on xgrammar.openai_tool_call_schema).
+# Revisit if sglang is ever actually used bare-metal.
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
   # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
@@ -98,13 +176,17 @@ mcore = [
   # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
   # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
   # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
-  "transformer-engine[pytorch,core_cu12] @ git+https://github.com/NVIDIA/TransformerEngine.git@71bbefbf153418f943640df0f7373625dc93fa46",
+  # NOTE (bare-metal): kept on the git build (not wheelyard) because this extra specifically needs
+  # the `core_cu12` build (Megatron's C++/CUDA TE bindings), which our wheelyard TE wheel wasn't
+  # built with (it only targets the `[pytorch]` extra, per the `automodel`/`fsdp` use case). Verify
+  # this still builds cleanly bare-metal before relying on the mcore path.
+  "transformer-engine[pytorch,core_cu12]",
   "megatron-core",
   "megatron-bridge",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-  "flash-attn==2.8.1",
+  "flash-attn==2.8.4",
   "emerging-optimizers==0.2.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
 ]
@@ -129,6 +211,8 @@ build = [
   "pybind11",
   # Build requirement for flash-attn
   "psutil",
+  # cmake/setuptools-scm/wheel/grpcio-tools removed: were vllm's own build-system
+  # requires, needed while building it from source. Now a prebuilt wheelyard wheel.
 ]
 docs = [
   "sphinx",
@@ -164,22 +248,45 @@ nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = t
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace", editable = true }
 nemo_gym = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
-# torch/torchaudio/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
+# bare-metal: torch/torchvision/triton/flash-attn come from our own wheelyard build (pre-built for
+# this cluster's RHEL8/glibc + CUDA 12.6, see the [[tool.uv.index]] "wheelyard" entry below) instead
+# of the official PyTorch/PyPI CUDA wheels. torchaudio has no wheelyard build yet, so it stays on the
+# torch index (and is left unpinned — see the note near override-dependencies).
 torch = [
-  { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
+  { index = "wheelyard", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 torchvision = [
-  { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
+  { index = "wheelyard", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
+# bare-metal: CPU-only build. torchaudio's own PyPI/pytorch-cuXXX wheels bundle a
+# compiled extension linked against whatever CUDA runtime matches THAT wheel's own
+# build (e.g. libcudart.so.13) — pytorch-cu129 doesn't have one for our exotic
+# wheelyard torch dev build, and PyPI's default silently resolved to a newer
+# CUDA-13-linked build, which then failed to load at runtime ("libcudart.so.13:
+# cannot open shared object file") since our actual stack is CUDA 12.6. We don't
+# use any audio functionality (transformers imports it transitively via
+# AutoProcessor, unconditionally, even though it's unused here) — CPU-only avoids
+# the whole CUDA-runtime-matching problem.
 torchaudio = [
-  { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
+  { index = "pytorch-cpu", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 triton = [
-  { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
+  { index = "wheelyard", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
+]
+flash-attn = { index = "wheelyard" }
+# bare-metal: prebuilt vllm wheel from wheelyard's 18082026 set (built by fbertolo for NeMo-RL
+# specifically), so we skip the from-source CUDA-kernel compile entirely (see no-build-isolation-package
+# and extra-build-dependencies below — no longer needed now that vllm isn't built here).
+vllm = { index = "wheelyard" }
+# automodel gets our wheelyard TE wheel; mcore keeps the git build since it needs the core_cu12 extra
+# (Megatron's C++/CUDA TE bindings) that our wheelyard wheel wasn't built with.
+transformer-engine = [
+  { index = "wheelyard", extra = "automodel" },
+  { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "71bbefbf153418f943640df0f7373625dc93fa46", extra = "mcore" },
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
@@ -211,19 +318,35 @@ name = "pytorch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+# bare-metal: our own pre-built wheels (torch/torchvision/triton/flash-attn/transformer-engine),
+# built for this cluster's RHEL8 (glibc 2.28) + CUDA 12.6, avoiding the need for a container.
+[[tool.uv.index]]
+name = "wheelyard"
+url = "file:///leonardo_scratch/fast/AIFAC_L13_018/fbertolo/wheelyard/sets/18082026/simple"
+explicit = true
+
 [tool.uv]
 preview = true # Enable preview features like extra-build-dependencies
+# bare-metal: our wheelyard torch/torchvision/triton/flash-attn/transformer-engine builds are
+# Linux-only, so a universal lockfile (which still tries to solve for e.g. darwin) fails outright.
+# Same restriction edgerunner's pyproject.toml uses for the same reason.
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 extra-build-variables = { sglang-kernel = { CMAKE_BUILD_PARALLEL_LEVEL = "24", FLASHINFER_CUDA_ARCH_LIST = "9.0a 10.0a", CMAKE_ARGS = "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" } }
 no-build-isolation-package = [
+  # transformer-engine/-torch stay here only for the mcore extra's git build (see
+  # [tool.uv.sources].transformer-engine); automodel's copy is a prebuilt wheelyard wheel now.
   "transformer-engine-torch",
   "transformer-engine",
-  "flash-attn",
+  # flash-attn removed: now a prebuilt wheelyard wheel, no longer built from source.
   "mamba-ssm",
   "causal-conv1d",
-  "deep_gemm",
-  "deep_ep",
-  "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
   "sglang-kernel",
+  # vllm removed: now a prebuilt wheelyard wheel (18082026 set), no longer built from source.
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
@@ -234,38 +357,69 @@ default-groups = ["dev", "build"]
 #  --link-mode=copy (slower but more reliable; supresses warning)
 #  --link-mode=symlink (fastest option when uv cache and venv on different file-system; caveat: venv is brittle since it depends on the environment/container)
 link-mode = "copy"
-# The TE override is needed to pin the TE version across all extras
 # The opencv-python-headless override is needed because automodel pins it to 4.10.0.84, whereas vllm>=0.11.0 needs >= 4.11.0
 # The timm override is needed because current automodel pins to 1.0.16. This can be removed once we move ToT automodel
 # The nvidia-modelopt override is needed because mcore is still on 0.33
+# NOTE (bare-metal): dropped the blanket TE override that used to pin one git-built TE version across
+# every extra — automodel and mcore now intentionally use different TE sources (see
+# [tool.uv.sources].transformer-engine): automodel gets our wheelyard wheel, mcore keeps the git build
+# (needs the core_cu12 extra that wheelyard's wheel doesn't have).
+# NOTE (bare-metal): dropped the torchaudio==2.10.0 pin — it no longer matches our bumped torch version
+# and PyTorch's nightly index doesn't retain a build from the same date as our wheelyard torch wheel
+# (nightlies rotate out). Left unpinned; verify at lock time that whatever resolves is ABI-compatible.
+# This mainly matters for the sglang extra, whose pinned dependency-metadata (torch==2.9.1 etc.) is
+# also stale relative to our torch bump and will likely need reconciling before sglang is actually used.
 override-dependencies = [
-  "transformer-engine[pytorch,core_cu12] @ git+https://github.com/NVIDIA/TransformerEngine.git@71bbefbf153418f943640df0f7373625dc93fa46",
   "nvidia-cudnn-cu12==9.19.0.56",
   "opencv-python-headless>=4.11.0",
   "timm<=1.0.22",
   "nvidia-modelopt[torch]>=0.39.0",
-  "torch==2.10.0",
-  "torchaudio==2.10.0",
-  # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
-  "llguidance>=1.3.0,<1.4.0",
+  "torch==2.15.0.dev20260817+cu126",
+  # vllm's own metadata pins its own torch/torchvision versions; override to our wheelyard versions.
+  "torchvision==0.30.0.dev20260817+cu126",
+  # nemo-automodel[moe] pins transformer-engine[pytorch]<=2.11.0 itself; override for the automodel
+  # extra specifically (mcore needs a different TE build/version, see [tool.uv.sources]).
+  "transformer-engine[pytorch]==2.19.0.dev0+f167a424; extra == 'automodel'",
+  # bare-metal: was pinned to match vllm 0.17.1's own need (>=1.3.0,<1.4.0); vllm
+  # 0.27.2rc1 now requires llguidance>=1.7.0,<1.8.0 instead. Found via a systematic
+  # diff of vllm's full Requires-Dist metadata against our pins after repeatedly
+  # hitting these one crash at a time (flashinfer/transformers/openai/xgrammar) —
+  # this one hadn't crashed yet but was silently just as stale. Moved to the vllm
+  # extra's own direct deps (see below) since llguidance is only ever pulled in
+  # transitively otherwise, same as openai/torchaudio/xgrammar.
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  # Note: flashinfer versions are pinned per-extra (vllm uses 0.6.4, sglang uses 0.6.7.post2)
-  # since vllm and sglang extras are mutually exclusive and have different requirements.
-  # Override megatron-core's flashinfer~=0.5.0 constraint to allow both vllm (0.6.4) and sglang (0.6.7.post2)
-  "flashinfer-python>=0.5.0",
-  "flashinfer-cubin>=0.5.0",
-  # sglang 0.5.10 requires nvidia-cutlass-dsl>=4.4.1 (via flashinfer 0.6.7.post2 which uses CUTLASS 4.4.2).
-  # Override to >=4.4.1 so uv can resolve to a version satisfying both vllm and sglang.
-  "nvidia-cutlass-dsl>=4.4.1",
+  # bare-metal: flashinfer versions are pinned per-extra (vllm uses 0.6.17/0.6.13,
+  # sglang uses 0.6.7.post2) since vllm and sglang extras are mutually exclusive
+  # and have different requirements. A loose ">=0.5.0" override here previously let
+  # flashinfer-python and flashinfer-cubin resolve to DIFFERENT versions (0.6.17 vs
+  # 0.6.13) since it doesn't actually enforce either extra's real requirement — that
+  # caused a runtime RuntimeError from flashinfer's own self-consistency check.
+  # Extra-scoped exact pins close that gap.
+  "flashinfer-python==0.6.17; extra == 'vllm'",
+  "flashinfer-cubin==0.6.13; extra == 'vllm'",
+  "flashinfer-python==0.6.7.post2; extra == 'sglang'",
+  "flashinfer-cubin==0.6.7.post2; extra == 'sglang'",
+  # openai pin moved to the vllm extra's own direct deps above (see its comment) —
+  # overriding it here alone didn't work since it's only ever pulled in transitively.
+  # nvidia-cutlass-dsl override removed: it was unconditionally replacing vllm's
+  # own exact ==4.6.2 need (now a direct dep in the vllm extra above) with a loose
+  # floor that let it drift to whatever's newest on PyPI (4.7.1) instead. sglang's
+  # own >=4.4.1 need (via flashinfer 0.6.7.post2) is satisfied without an override.
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
-  # vLLM 0.17.0 code is compatible with transformers v5 but the PyPI metadata still declares <5.
-  # Override until vllm officially relaxes the constraint (https://github.com/vllm-project/vllm/issues/30466).
-  "transformers==5.3.0",
-  #Override till we can upgrade sglang version to address CVE GHSA-7rgv-gqhr-fxg3
-  "xgrammar==0.1.33",
+  # bare-metal: vllm 0.27.2rc1 hard-requires transformers>=5.5.3 (vllm 0.17.1's own
+  # transformers pin moved to an unconditional direct dependency above — an
+  # extra=='vllm'-scoped override here, alongside automodel's own >=5.3.0 floor,
+  # hit the same silent-drop uv quirk as xgrammar (see its comment above): it
+  # dropped transformers from automodel's install set entirely. If megatron-
+  # bridge's <=5.3.0 stub below ever actually conflicts with 5.16.0 for the
+  # mcore extra, that needs solving there directly, not via a scoped override
+  # here — that's exactly the pattern that broke twice already.
+  # xgrammar pins (CVE GHSA-7rgv-gqhr-fxg3 fix for sglang; vllm's own >=0.2.1 need)
+  # moved to each extra's own direct deps — see their comments for why an
+  # override here didn't serialize correctly for vllm.
   # Override dependencies to address CVEs
   "mlflow>=3.11.1",
   # Override outlines for Python 3.13 support
@@ -329,22 +483,17 @@ conflicts = [
 
 # Augment build dependencies for packages that need torch at build time
 [tool.uv.extra-build-dependencies]
-flash-attn = [{ requirement = "torch", match-runtime = true }]
+# flash-attn removed: now a prebuilt wheelyard wheel, no longer built from source.
 # Git-sourced packages CAN use match-runtime = true if we provide dependency-metadata
-deep_ep = [{ requirement = "torch", match-runtime = true }]
-deep_gemm = [{ requirement = "torch", match-runtime = true }]
 transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
-nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
 sglang-kernel = [{ requirement = "torch", match-runtime = true }]
+# vllm entry removed: now a prebuilt wheelyard wheel, no longer built from source.
 
 # Needed when building from source
-[[tool.uv.dependency-metadata]]
-name = "flash-attn"
-requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
-
+# flash-attn stub removed: now a prebuilt wheelyard wheel with real metadata, no stub needed.
 [[tool.uv.dependency-metadata]]
 name = "causal-conv1d"
 # This version has to match the version in the commit/rev/tag used
@@ -493,9 +642,13 @@ requires-dist = [
   "qwen-vl-utils",
   # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13
   "transformer-engine[pytorch,core_cu12]",
-  "mamba-ssm",
+  # mamba-ssm/causal-conv1d dropped (bare-metal) — see the fsdp extra's comment
+  # for why (unbuildable against our toolchain, and unused: we don't train
+  # SSM/Mamba-hybrid models). This makes the stub inaccurate vs megatron-bridge's
+  # real setup.py, but megatron-bridge/mcore aren't in active use here either
+  # (see the mcore extra's own "verify this still builds" note) — re-add both
+  # if that changes.
   "nvidia-resiliency-ext",
-  "causal-conv1d",
   "flash-linear-attention",
   "timm",
   "open-clip-torch>=3.2.0",
