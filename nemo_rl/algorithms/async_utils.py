@@ -1,3 +1,10 @@
+# Custom override of nemo_rl.algorithms.async_utils
+# Adds NemoGym rollout support to AsyncTrajectoryCollector._run_prompt_group_worker
+#
+# This file is mounted over the upstream module via sys.modules patching
+# in custom/script/run_grpo.py.
+
+
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,6 +33,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
+    run_async_nemo_gym_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 
@@ -291,6 +299,9 @@ class AsyncTrajectoryCollector:
         # Track which target weights are currently being generated (globally)
         self._generating_targets: set[int] = set()
 
+        # Track current epoch for checkpointing (0 means not started)
+        self.current_epoch: int = 0
+
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
 
@@ -390,54 +401,82 @@ class AsyncTrajectoryCollector:
         print("Collection thread started, start_collection returning")
 
     def _collection_loop(self):
-        """Run the collection loop in background thread."""
+        """Run the collection loop in background thread.
+
+        This loop runs indefinitely until self.running is set to False,
+        restarting from epoch 0 each time the dataloader is exhausted.
+        """
         try:
-            for batch in self.dataloader:
-                if not self.running:
-                    break
+            while self.running:
+                self.current_epoch += 1
+                print(f"Starting epoch {self.current_epoch} of trajectory collection")
 
-                # Check if manually paused and wait
-                if not self._manual_pause_cleared.is_set() and self.running:
-                    self._manual_pause_cleared.wait()
+                # Defensive: torchdata's multiprocess iterator asserts
+                # "_snapshot" in next_iter_state. If a stale/partial state was
+                # loaded elsewhere, drop it so iter() doesn't die here.
+                next_state = getattr(self.dataloader, "next_iter_state", None)
+                if (
+                    isinstance(next_state, dict)
+                    and (getattr(self.dataloader, "num_workers", 0) or 0) > 0
+                    and "_snapshot" not in next_state
+                ):
+                    print(
+                        "⚠️  Clearing incompatible dataloader next_iter_state "
+                        "(missing '_snapshot'); using a fresh iterator."
+                    )
+                    self.dataloader.next_iter_state = None
 
-                # Check if refit is in progress and wait
-                if not self._refit_pause_cleared.is_set() and self.running:
-                    print("⏸️ Pausing collection for refit...")
-                    self._refit_pause_cleared.wait()
-                    print("▶️ Refit completed, resuming collection")
-
-                # Check if generation limits require pausing collection
-                if self._should_pause_for_generation_limits() and self.running:
-                    # Only log warning once per weight version
-                    if self._last_limit_warning_version != self.current_weight_version:
-                        async_cfg = self.master_config.get("grpo", {}).get(
-                            "async_grpo", {}
-                        )
-                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
-
-                        print(
-                            f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
-                            f"already exist in buffer. Waiting for weight update..."
-                        )
-                        self._last_limit_warning_version = self.current_weight_version
-
-                        self._generation_limit_cleared.clear()  # Clear the event to pause
-
-                    # Efficiently wait for generation limits to be cleared (no polling!)
-                    self._generation_limit_cleared.wait()
-
-                    # Double-check we're still running after being woken up
+                for batch in self.dataloader:
                     if not self.running:
                         break
 
-                if not self.running:
-                    break
+                    # Check if manually paused and wait
+                    if not self._manual_pause_cleared.is_set() and self.running:
+                        self._manual_pause_cleared.wait()
 
-                self._process_batch(batch)
+                    # Check if refit is in progress and wait
+                    if not self._refit_pause_cleared.is_set() and self.running:
+                        print("⏸️ Pausing collection for refit...")
+                        self._refit_pause_cleared.wait()
+                        print("▶️ Refit completed, resuming collection")
+
+                    # Check if generation limits require pausing collection
+                    if self._should_pause_for_generation_limits() and self.running:
+                        # Only log warning once per weight version
+                        if self._last_limit_warning_version != self.current_weight_version:
+                            async_cfg = self.master_config.get("grpo", {}).get(
+                                "async_grpo", {}
+                            )
+                            max_trajectory_age = async_cfg["max_trajectory_age_steps"]
+                            target_weights = [
+                                self.current_weight_version + i
+                                for i in range(max_trajectory_age)
+                            ]
+
+                            print(
+                                f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
+                                f"already exist in buffer. Waiting for weight update..."
+                            )
+                            self._last_limit_warning_version = self.current_weight_version
+
+                            self._generation_limit_cleared.clear()  # Clear the event to pause
+
+                        # Efficiently wait for generation limits to be cleared (no polling!)
+                        self._generation_limit_cleared.wait()
+
+                        # Double-check we're still running after being woken up
+                        if not self.running:
+                            break
+
+                    if not self.running:
+                        break
+
+                    self._process_batch(batch)
+
+                if self.running:
+                    print(
+                        f"Completed epoch {self.current_epoch}, starting next epoch..."
+                    )
 
         except Exception as e:
             print(f"❌ Error in trajectory collection: {e}")
@@ -623,10 +662,50 @@ class AsyncTrajectoryCollector:
             time.sleep(0.5)
 
     def get_dataloader_state(self) -> dict:
-        """Get the current dataloader state for checkpointing."""
+        """Get the current dataloader state for checkpointing.
+
+        Returns a dict containing:
+            - dataloader_state: The StatefulDataLoader's state_dict
+            - current_epoch: The current epoch number (1-indexed)
+        """
+        state = {"current_epoch": self.current_epoch}
         if hasattr(self, "dataloader") and hasattr(self.dataloader, "state_dict"):
-            return self.dataloader.state_dict()
-        return {}
+            state["dataloader_state"] = self.dataloader.state_dict()
+        return state
+
+    def set_dataloader_state(self, state: dict) -> None:
+        """Restore dataloader state from checkpoint.
+
+        Args:
+            state: Dict containing 'current_epoch' and optionally 'dataloader_state'
+        """
+        if "current_epoch" in state:
+            self.current_epoch = state["current_epoch"]
+            print(f"Restored epoch to {self.current_epoch}")
+
+        if (
+            "dataloader_state" in state
+            and hasattr(self, "dataloader")
+            and hasattr(self.dataloader, "load_state_dict")
+        ):
+            dl_state = state["dataloader_state"]
+            num_workers = getattr(self.dataloader, "num_workers", 0) or 0
+            # torchdata's _StatefulMultiProcessingDataLoaderIter asserts
+            # "_snapshot" in next_iter_state; if the saved state lacks it we
+            # must NOT load it or iter() will raise and kill the collector.
+            if num_workers > 0 and isinstance(dl_state, dict) and "_snapshot" not in dl_state:
+                print(
+                    "⚠️  Saved dataloader state is missing '_snapshot'; "
+                    "skipping restore and resuming with a fresh iterator."
+                )
+            else:
+                try:
+                    self.dataloader.load_state_dict(dl_state)
+                    print("Restored dataloader state")
+                except AssertionError as e:
+                    print(
+                        f"⚠️  Skipping dataloader state restore ({e}); resuming with a fresh iterator."
+                    )
 
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:
@@ -642,37 +721,30 @@ class AsyncTrajectoryCollector:
         prompt_idx: int,
     ) -> None:
         try:
-            # Import here to avoid circular dependency
-            from nemo_rl.algorithms.grpo import _should_use_nemo_gym
-            from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
+            # Check if NemoGym should be used
+            env_config = self.master_config.get("env", {})
+            use_nemo_gym = bool(env_config.get("should_use_nemo_gym"))
 
-            # Run rollout for this prompt group
-            # Async engine supports concurrent generation; avoid locking
-            # Check if we should use nemo_gym (similar to synchronous GRPO)
-            if _should_use_nemo_gym(self.master_config):
+            if use_nemo_gym:
+                # NemoGym handles rollouts via its own environment (chat completions API)
                 generation_config = self.master_config["policy"]["generation"]
-                env_cfg = self.master_config.get("env") or {}
-                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                nemo_gym_result = run_async_nemo_gym_rollout(
                     policy_generation=self.policy_generation,
                     input_batch=repeated_batch,
                     tokenizer=self.tokenizer,
                     task_to_env=self.task_to_env,
-                    max_seq_len=None,
                     generation_config=generation_config,
-                    max_rollout_turns=None,
-                    greedy=False,
                 )
-                final_batch = nemo_gym_rollout_result.final_batch
-                rollout_metrics = nemo_gym_rollout_result.rollout_metrics
+                final_batch = nemo_gym_result.final_batch
+                rollout_metrics = nemo_gym_result.rollout_metrics
             else:
+                # Standard multi-turn rollout with direct vLLM generation
                 final_batch, rollout_metrics = run_async_multi_turn_rollout(
                     policy_generation=self.policy_generation,
                     input_batch=repeated_batch,
                     tokenizer=self.tokenizer,
                     task_to_env=self.task_to_env,
-                    max_seq_len=self.master_config["policy"][
-                        "max_total_sequence_length"
-                    ],
+                    max_seq_len=self.master_config["policy"]["max_total_sequence_length"],
                     max_rollout_turns=self.master_config["grpo"]["max_rollout_turns"],
                     greedy=False,
                 )

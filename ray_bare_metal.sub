@@ -1,0 +1,382 @@
+#!/bin/bash
+#SBATCH --nodes=2
+#SBATCH --exclusive
+#SBATCH --account=ACCOUNT
+#SBATCH --job-name=JOB_NAME
+#SBATCH --partition=PARTITION
+#SBATCH --time=1:0:0
+#SBATCH --dependency=singleton
+
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Bare-metal counterpart of ray_singularity.sub — same Ray/SLURM cluster
+# orchestration, but runs directly against a `uv`-managed venv (built via
+# `uv sync` against RL/pyproject.toml) instead of a Singularity container.
+# The only structural difference from ray_singularity.sub is that every
+# `$SINGULARITY_CMD ...` prefix is simply dropped, and paths that pointed
+# into the container (/opt/nemo_rl_venv, /opt/nemo-rl) now point at
+# $NEMO_RL_DIR/.venv and $NEMO_RL_DIR instead. No MOUNTS/bind-mount
+# translation is needed at all — there's no container filesystem namespace
+# to shadow host paths, so the whole class of mount-shadowing bugs
+# (e.g. the /root/.cache/uv one that broke `ray.scripts.scripts`) can't
+# happen here.
+
+set -eoux pipefail
+
+########################################################
+# Function to detect if SLURM cluster uses GRES
+########################################################
+maybe_gres_arg() {
+  # Check if any nodes in the partition have GRES configured
+  # Assumes a homogeneous allocation (not a heterogeneous job)
+  if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
+    # Do a quick assert here that gpus:8 == gpus:$GPUS_PER_NODE. It is probably a user error if someone isn't using GPUS_PER_NODE=8 on our clusters if it supports --gres=gpu:8 or gpu:a100:8
+    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | awk -F: '{print $NF}') ]]; then
+      echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but GRES detected is $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:") meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
+      exit 1
+    fi
+    echo "--gres=gpu:${GPUS_PER_NODE}"
+    return
+  fi
+
+  # No GRES support detected
+  echo ""
+}
+
+
+########################################################
+# User defined variables
+########################################################
+: "${NEMO_RL_DIR:?NEMO_RL_DIR must be set (path to the RL/ checkout with a synced .venv)}"
+VENV_BIN="$NEMO_RL_DIR/.venv/bin"
+[ -x "$VENV_BIN/ray" ] || {
+  echo "ERROR: $VENV_BIN/ray not found. Run 'uv sync' in $NEMO_RL_DIR first." >&2
+  exit 1
+}
+COMMAND=${COMMAND:-}
+########################################################
+# Ports for all nodes
+NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
+OBJECT_MANAGER_PORT=${OBJECT_MANAGER_PORT:-53003}
+RUNTIME_ENV_AGENT_PORT=${RUNTIME_ENV_AGENT_PORT:-53005}
+DASHBOARD_AGENT_GRPC_PORT=${DASHBOARD_AGENT_GRPC_PORT:-53007}
+METRICS_EXPORT_PORT=${METRICS_EXPORT_PORT:-53009}
+
+# Ports for the head node
+PORT=${PORT:-54514}
+RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-10001}
+DASHBOARD_PORT=${DASHBOARD_PORT:-8265}
+DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
+RAY_DEBUGGER_ARGS=
+if [ "${RAY_DEBUG:-}" = "legacy" ]; then
+  RAY_DEBUGGER_ARGS="--ray-debugger-external"
+fi
+
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+
+if [[ $(ulimit -Hn) == "unlimited" ]] || [[ 65535 -lt $(ulimit -Hn) ]]; then
+  ulimit -Sn 65535
+elif [[ $(ulimit -Hn) != "unlimited" ]] && [[ $(ulimit -Hn) -lt 65535 ]]; then
+  echo "[WARNING]: Cannot increase ulimit on file descriptors to 65535"
+fi
+
+MIN_WORKER_PORT=${MIN_WORKER_PORT:-54001}
+MAX_WORKER_PORT=${MAX_WORKER_PORT:-54513}
+RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
+
+unset UV_CACHE_DIR
+
+# NeMo-Gym's own per-resource-server `uv venv --seed` builds pick up a
+# persistent cache via UV_CACHE_DIR, same purpose as ray_singularity.sub's
+# UV_CACHE_DIR_OVERRIDE mount — just without any bind-mount indirection,
+# since there's no container path to collide with here.
+if [[ -n "${UV_CACHE_DIR_OVERRIDE:-}" ]]; then
+  mkdir -p "$UV_CACHE_DIR_OVERRIDE"
+  export UV_CACHE_DIR="$UV_CACHE_DIR_OVERRIDE"
+fi
+
+BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
+LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
+mkdir -p $LOG_DIR
+
+GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+
+# Detect GRES support and set GRES_ARG
+GRES_ARG=$(maybe_gres_arg)
+if [[ -n "$GRES_ARG" ]]; then
+  echo "[INFO] GRES support detected. Using: $GRES_ARG"
+else
+  echo "[INFO] No GRES support detected. Running without --gres flag."
+fi
+
+COMMON_SRUN_ARGS="$GRES_ARG"
+COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
+COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
+COMMON_SRUN_ARGS+=" --exclusive"
+
+# Number of CPUs per worker node
+CPUS_PER_WORKER=${CPUS_PER_WORKER:-$((GPUS_PER_NODE * 16))}
+
+num_retries=3
+
+declare -A SRUN_PIDS
+
+check_srun_processes() {
+  for name in "${!SRUN_PIDS[@]}"; do
+    pid="${SRUN_PIDS[$name]}"
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "[ERROR] Background srun '$name' died (pid=$pid)" >&2
+      touch "$LOG_DIR/ENDED"
+      exit 1
+    fi
+  done
+}
+
+nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+nodes_array=($nodes)
+ip_addresses_array=()
+
+for node in $nodes; do
+    ip_address=$(host $node 2>/dev/null | awk '/has address/ { print $4 }' | head -1 || echo $node)
+    echo "[INFO] Node: $node -> IP: $ip_address"
+    ip_addresses_array+=("$ip_address")
+done
+
+head_node=${nodes_array[0]}
+head_node_ip=${ip_addresses_array[0]}
+
+ip_head=$head_node_ip:$PORT
+
+head_cmd=$(cat <<'EOF'
+cd SLURM_SUBMIT_DIR_PLACEHOLDER
+export PATH="VENV_BIN_PLACEHOLDER:$PATH"
+# bare-metal: some prebuilt wheels (e.g. xgrammar) are linked against a newer
+# libstdc++ ABI than RHEL8's base gcc 8.5.0 ships (undefined symbol errors like
+# `_ZNSt7__cxx1119basic_ostringstreamIcSt11char_traitsIcESaIcEEC1Ev` at import
+# time). Our presync scripts `module load gcc/12.2.0` for this reason, but that
+# never happened at actual training runtime — only here. Prepending its
+# libstdc++ directly (skip `module load`: shell functions from the module
+# system aren't guaranteed to be available inside this non-interactive
+# srun/bash -c context) covers it without needing the full module machinery.
+export LD_LIBRARY_PATH="/leonardo/prod/spack/06/install/0.22/linux-rhel8-icelake/gcc-8.5.0/gcc-12.2.0-lkcazt4letxjj4s7nlhzryoyivevsatz/lib64:${LD_LIBRARY_PATH:-}"
+touch LOG_DIR_PLACEHOLDER/STARTED_RAY_HEAD
+env
+
+monitor-sidecar() {
+  set +x
+  while true; do
+    sleep 60
+    if [[ -f "LOG_DIR_PLACEHOLDER/ENDED" ]]; then
+      echo "Detected ENDED file, terminating..."
+      pkill -P $$ || true
+      exit 1
+    fi
+  done
+}
+monitor-sidecar &
+
+sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' VENV_BIN_PLACEHOLDER/../lib/python*/site-packages/ray/_private/runtime_env/nsight.py 2>/dev/null || true
+
+count=0
+num_retries=NUM_RETRIES_PLACEHOLDER
+while [[ $count -lt $num_retries ]]; do
+  ray start --head \
+      --disable-usage-stats \
+      --num-gpus=GPUS_PER_NODE_PLACEHOLDER \
+      --resources='{"worker_units": GPUS_PER_NODE_PLACEHOLDER, "slurm_managed_ray_cluster": 1}' \
+      --node-ip-address="HEAD_NODE_IP_PLACEHOLDER" \
+      --port=PORT_PLACEHOLDER \
+      --ray-client-server-port=RAY_CLIENT_SERVER_PORT_PLACEHOLDER \
+      --dashboard-port=DASHBOARD_PORT_PLACEHOLDER \
+      --node-manager-port=NODE_MANAGER_PORT_HEAD_PLACEHOLDER \
+      --object-manager-port=OBJECT_MANAGER_PORT_HEAD_PLACEHOLDER \
+      --runtime-env-agent-port=RUNTIME_ENV_AGENT_PORT_HEAD_PLACEHOLDER \
+      --dashboard-agent-grpc-port=DASHBOARD_AGENT_GRPC_PORT_HEAD_PLACEHOLDER \
+      --dashboard-agent-listen-port=DASHBOARD_AGENT_LISTEN_PORT_HEAD_PLACEHOLDER \
+      --metrics-export-port=METRICS_EXPORT_PORT_HEAD_PLACEHOLDER \
+      RAY_DEBUGGER_ARGS_PLACEHOLDER \
+      --block
+  count=$((count+1))
+  echo "Head node failed $count/$num_retries times, restarting in 5 seconds..."
+  sleep 5
+done
+
+touch LOG_DIR_PLACEHOLDER/ENDED
+exit 1
+EOF
+)
+
+head_cmd="${head_cmd//SLURM_SUBMIT_DIR_PLACEHOLDER/$SLURM_SUBMIT_DIR}"
+head_cmd="${head_cmd//VENV_BIN_PLACEHOLDER/$VENV_BIN}"
+head_cmd="${head_cmd//LOG_DIR_PLACEHOLDER/$LOG_DIR}"
+head_cmd="${head_cmd//GPUS_PER_NODE_PLACEHOLDER/$GPUS_PER_NODE}"
+head_cmd="${head_cmd//HEAD_NODE_IP_PLACEHOLDER/$head_node_ip}"
+head_cmd="${head_cmd//RAY_CLIENT_SERVER_PORT_PLACEHOLDER/$RAY_CLIENT_SERVER_PORT}"
+head_cmd="${head_cmd//DASHBOARD_PORT_PLACEHOLDER/$DASHBOARD_PORT}"
+head_cmd="${head_cmd//NODE_MANAGER_PORT_HEAD_PLACEHOLDER/$((NODE_MANAGER_PORT + 1))}"
+head_cmd="${head_cmd//OBJECT_MANAGER_PORT_HEAD_PLACEHOLDER/$((OBJECT_MANAGER_PORT + 1))}"
+head_cmd="${head_cmd//RUNTIME_ENV_AGENT_PORT_HEAD_PLACEHOLDER/$((RUNTIME_ENV_AGENT_PORT + 1))}"
+head_cmd="${head_cmd//DASHBOARD_AGENT_GRPC_PORT_HEAD_PLACEHOLDER/$((DASHBOARD_AGENT_GRPC_PORT + 1))}"
+head_cmd="${head_cmd//DASHBOARD_AGENT_LISTEN_PORT_HEAD_PLACEHOLDER/$((DASHBOARD_AGENT_LISTEN_PORT + 1))}"
+head_cmd="${head_cmd//METRICS_EXPORT_PORT_HEAD_PLACEHOLDER/$((METRICS_EXPORT_PORT + 1))}"
+head_cmd="${head_cmd//RAY_DEBUGGER_ARGS_PLACEHOLDER/$RAY_DEBUGGER_ARGS}"
+head_cmd="${head_cmd//PORT_PLACEHOLDER/$PORT}"
+head_cmd="${head_cmd//NUM_RETRIES_PLACEHOLDER/$num_retries}"
+
+srun $COMMON_SRUN_ARGS --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
+SRUN_PIDS["ray-head"]=$!
+
+NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
+
+for ((i = 1; i < SLURM_JOB_NUM_NODES; i++)); do
+  node_i=${nodes_array[$i]}
+
+  worker_cmd=$(cat <<'EOF'
+cd SLURM_SUBMIT_DIR_PLACEHOLDER
+export PATH="VENV_BIN_PLACEHOLDER:$PATH"
+# bare-metal: some prebuilt wheels (e.g. xgrammar) are linked against a newer
+# libstdc++ ABI than RHEL8's base gcc 8.5.0 ships (undefined symbol errors like
+# `_ZNSt7__cxx1119basic_ostringstreamIcSt11char_traitsIcESaIcEEC1Ev` at import
+# time). Our presync scripts `module load gcc/12.2.0` for this reason, but that
+# never happened at actual training runtime — only here. Prepending its
+# libstdc++ directly (skip `module load`: shell functions from the module
+# system aren't guaranteed to be available inside this non-interactive
+# srun/bash -c context) covers it without needing the full module machinery.
+export LD_LIBRARY_PATH="/leonardo/prod/spack/06/install/0.22/linux-rhel8-icelake/gcc-8.5.0/gcc-12.2.0-lkcazt4letxjj4s7nlhzryoyivevsatz/lib64:${LD_LIBRARY_PATH:-}"
+env
+
+monitor-sidecar() {
+  set +x
+  while true; do
+    sleep 60
+    if [[ -f "LOG_DIR_PLACEHOLDER/ENDED" ]]; then
+      echo "Detected ENDED file, terminating..."
+      pkill -P $$ || true
+      exit 1
+    fi
+  done
+}
+monitor-sidecar &
+
+sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' VENV_BIN_PLACEHOLDER/../lib/python*/site-packages/ray/_private/runtime_env/nsight.py 2>/dev/null || true
+
+count=0
+num_retries=NUM_RETRIES_PLACEHOLDER
+while [[ $count -lt $num_retries ]]; do
+  ray start --address "IP_HEAD_PLACEHOLDER" \
+            --disable-usage-stats \
+            --num-gpus=GPUS_PER_NODE_PLACEHOLDER \
+            --resources='{"worker_units": GPUS_PER_NODE_PLACEHOLDER, "slurm_managed_ray_cluster": 1}' \
+            --min-worker-port=MIN_WORKER_PORT_PLACEHOLDER \
+            --max-worker-port=MAX_WORKER_PORT_PLACEHOLDER \
+            --node-manager-port=NODE_MANAGER_PORT_PLACEHOLDER \
+            --object-manager-port=OBJECT_MANAGER_PORT_PLACEHOLDER \
+            --runtime-env-agent-port=RUNTIME_ENV_AGENT_PORT_PLACEHOLDER \
+            --dashboard-agent-grpc-port=DASHBOARD_AGENT_GRPC_PORT_PLACEHOLDER \
+            --dashboard-agent-listen-port=DASHBOARD_AGENT_LISTEN_PORT_PLACEHOLDER \
+            --metrics-export-port=METRICS_EXPORT_PORT_PLACEHOLDER \
+            RAY_DEBUGGER_ARGS_PLACEHOLDER \
+            --block
+  count=$((count+1))
+  echo "Worker failed $count/$num_retries times, restarting in 5 seconds..."
+  sleep 5
+done
+
+touch LOG_DIR_PLACEHOLDER/ENDED
+exit 1
+EOF
+)
+
+  worker_cmd="${worker_cmd//SLURM_SUBMIT_DIR_PLACEHOLDER/$SLURM_SUBMIT_DIR}"
+  worker_cmd="${worker_cmd//VENV_BIN_PLACEHOLDER/$VENV_BIN}"
+  worker_cmd="${worker_cmd//LOG_DIR_PLACEHOLDER/$LOG_DIR}"
+  worker_cmd="${worker_cmd//IP_HEAD_PLACEHOLDER/$ip_head}"
+  worker_cmd="${worker_cmd//GPUS_PER_NODE_PLACEHOLDER/$GPUS_PER_NODE}"
+  worker_cmd="${worker_cmd//MIN_WORKER_PORT_PLACEHOLDER/$MIN_WORKER_PORT}"
+  worker_cmd="${worker_cmd//MAX_WORKER_PORT_PLACEHOLDER/$MAX_WORKER_PORT}"
+  worker_cmd="${worker_cmd//NODE_MANAGER_PORT_PLACEHOLDER/$NODE_MANAGER_PORT}"
+  worker_cmd="${worker_cmd//OBJECT_MANAGER_PORT_PLACEHOLDER/$OBJECT_MANAGER_PORT}"
+  worker_cmd="${worker_cmd//RUNTIME_ENV_AGENT_PORT_PLACEHOLDER/$RUNTIME_ENV_AGENT_PORT}"
+  worker_cmd="${worker_cmd//DASHBOARD_AGENT_GRPC_PORT_PLACEHOLDER/$DASHBOARD_AGENT_GRPC_PORT}"
+  worker_cmd="${worker_cmd//DASHBOARD_AGENT_LISTEN_PORT_PLACEHOLDER/$DASHBOARD_AGENT_LISTEN_PORT}"
+  worker_cmd="${worker_cmd//METRICS_EXPORT_PORT_PLACEHOLDER/$METRICS_EXPORT_PORT}"
+  worker_cmd="${worker_cmd//RAY_DEBUGGER_ARGS_PLACEHOLDER/$RAY_DEBUGGER_ARGS}"
+  worker_cmd="${worker_cmd//NUM_RETRIES_PLACEHOLDER/$num_retries}"
+
+  srun $COMMON_SRUN_ARGS --exact --nodes=1  --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$node_i" -o $LOG_DIR/ray-worker-$i.log bash -x -c "$worker_cmd" &
+  SRUN_PIDS["ray-worker-$i"]=$!
+  sleep 3
+done
+
+while check_srun_processes && ! srun --overlap --nodes=1 --ntasks=1 --mem=0 -w $head_node test -f $LOG_DIR/STARTED_RAY_HEAD; do
+  echo "[INFO][$(date)] Waiting for head node to start..."
+  sleep 2
+done
+
+extract_worker_units() {
+  status_output=$(srun --overlap --nodes=1 --ntasks=1 --mem=0 -w "$head_node" "$VENV_BIN/ray" status 2>/dev/null)
+  if echo "$status_output" | grep -q "worker_units"; then
+    worker_units=$(echo "$status_output" | grep "worker_units" | awk '{print $1}' | cut -d'/' -f2)
+    echo $worker_units
+  else
+    echo 0
+  fi
+}
+
+while true; do
+  worker_units=$(extract_worker_units)
+  worker_units_int=$(echo "$worker_units" | cut -d'.' -f1)
+  echo "[INFO] Number of actors online: $worker_units/$NUM_ACTORS"
+  if [[ "$worker_units_int" -ge "$NUM_ACTORS" ]]; then
+    break
+  fi
+  check_srun_processes
+  sleep 2
+done
+
+echo "All workers connected!"
+
+if [[ -n "$COMMAND" ]]; then
+  srun --overlap  --ntasks=1 --nodes=1 --mem=0 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "$COMMAND"
+else
+  echo "[INFO]: Ray Cluster is idled"
+  cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
+#!/bin/bash
+WORKER_NUM=\${1:-}
+if [[ -z "\$WORKER_NUM" ]]; then
+  if [[ -n "\${COMMAND:-}" ]]; then
+    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap  --ntasks=1 --nodes=1 -w "$head_node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
+  else
+    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap  --ntasks=1 --nodes=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
+  fi
+else
+  if [[ \$WORKER_NUM -lt 1 || \$WORKER_NUM -ge $SLURM_JOB_NUM_NODES ]]; then
+    echo "Error: WORKER_NUM must be between 1 and $((SLURM_JOB_NUM_NODES-1))"
+    exit 1
+  fi
+  nodes_array=($nodes)
+  if [[ -n "\${COMMAND:-}" ]]; then
+    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap  --ntasks=1 --nodes=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
+  else
+    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap  --ntasks=1 --nodes=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty bash
+  fi
+fi
+EOF
+  chmod +x $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
+  echo "     COMMAND='echo hello' bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh"
+  echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh"
+  echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 1"
+  sleep infinity
+fi

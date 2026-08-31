@@ -1594,6 +1594,19 @@ def grpo_train(
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
 
+                    # [CUSTOM] per-step TRAINING rollout logging (decoded text):
+                    #   stdout: num_val_samples_to_print samples; jsonl: complete dump (train/)
+                    #   Bypassed when NRL_ROLLOUT_LOG_MODE=wandb.  Never breaks the step.
+                    try:
+                        from nemo_rl.utils.logger import log_rollouts as _log_rollouts
+                        _log_rollouts(
+                            repeated_batch["message_log"], rewards, tokenizer=tokenizer,
+                            num_print=master_config["logger"].get("num_val_samples_to_print", 3),
+                            step=total_steps + 1, tag="train",
+                        )
+                    except Exception as _e:
+                        print(f"  \u26A0\uFE0F  per-step train rollout logging failed: {_e}", flush=True)
+
                     print("▶ Computing advantages...", flush=True)
                     if master_config["grpo"].get("calculate_advantages_on_gpu"):
                         print("Computing advantages on GPU!")
@@ -2287,12 +2300,23 @@ def validate(
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
             # Collect message logs for later display
-            to_env = [
-                get_keys_from_message_log(
-                    val_batch["message_log"][i], ["role", "content"]
-                )
-                for i in range(len(val_batch["message_log"]))
-            ]
+            # [CUSTOM] decode gym token_ids -> text inline so all_message_logs holds
+            # only strings (json-safe for stock log_batched_dict_as_jsonl below).
+            to_env = []
+            for _i in range(len(val_batch["message_log"])):
+                _decoded = []
+                for _m in val_batch["message_log"][_i]:
+                    _role = _m.get("role", "") if isinstance(_m, dict) else ""
+                    _content = _m.get("content", "") if isinstance(_m, dict) else ""
+                    if not _content and isinstance(_m, dict) and "token_ids" in _m and tokenizer is not None:
+                        try:
+                            _tok = _m["token_ids"]
+                            _ids = _tok.tolist() if hasattr(_tok, "tolist") else list(_tok)
+                            _content = tokenizer.decode(_ids, skip_special_tokens=False)
+                        except Exception:
+                            pass
+                    _decoded.append({"role": _role, "content": _content})
+                to_env.append(_decoded)
 
             all_message_logs.extend(to_env)
 
@@ -2316,14 +2340,14 @@ def validate(
 
         # Print sample conversations only once at the end of validation
         try:
-            print_message_log_samples(
+            from nemo_rl.utils.logger import log_rollouts as _log_rollouts
+            _log_rollouts(
                 all_message_logs,
                 total_rewards,
-                num_samples=min(
-                    master_config["logger"]["num_val_samples_to_print"],
-                    len(all_message_logs),
-                ),
+                tokenizer=None,   # already decoded inline
+                num_print=master_config["logger"]["num_val_samples_to_print"],
                 step=step,
+                tag="val",
             )
         except Exception as e:
             print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
@@ -2441,6 +2465,38 @@ def async_grpo_train(
     val_at_start = master_config["grpo"]["val_at_start"]
     val_at_end = master_config["grpo"]["val_at_end"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+
+    # ── Multi-epoch support ──────────────────────────────────────────────────
+    # The async trainer samples from the replay buffer rather than iterating the
+    # dataloader directly (the AsyncTrajectoryCollector does that, looping over
+    # epochs continuously). To honor grpo.max_num_epochs we bound the global step
+    # count exactly as the synchronous loop does:
+    #     effective_max_steps = min(max_num_steps, max_num_epochs * steps_per_epoch)
+    # steps_per_epoch == len(dataloader) because each training step consumes one
+    # dataloader batch worth of prompt groups (num_prompts_per_step prompts).
+    max_num_steps = master_config["grpo"]["max_num_steps"]
+    max_num_epochs = master_config["grpo"]["max_num_epochs"]
+    try:
+        steps_per_epoch = len(dataloader)
+    except TypeError:
+        steps_per_epoch = None
+    if master_config["data"].get("use_multiple_dataloader", False) or not steps_per_epoch:
+        # Infinite / unknown-length dataloader: epoch boundary is undefined, so
+        # fall back to the global step cap (matches the sync-loop behavior).
+        effective_max_steps = max_num_steps
+        steps_per_epoch = None
+        print(
+            "⚠️ Async multi-epoch: steps-per-epoch unknown (multiple/infinite "
+            f"dataloader); using max_num_steps={max_num_steps} only, "
+            "max_num_epochs ignored."
+        )
+    else:
+        effective_max_steps = min(max_num_steps, max_num_epochs * steps_per_epoch)
+        print(
+            f"📐 Async multi-epoch bound: max_num_epochs={max_num_epochs} × "
+            f"steps_per_epoch={steps_per_epoch} = {max_num_epochs * steps_per_epoch}, "
+            f"max_num_steps={max_num_steps} → effective_max_steps={effective_max_steps}"
+        )
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -2622,10 +2678,16 @@ def async_grpo_train(
 
     # Main training loop
     try:
-        while step < master_config["grpo"]["max_num_steps"]:
-            print(
-                f"\n{'=' * 25} Step {step + 1}/{master_config['grpo']['max_num_steps']} {'=' * 25}"
-            )
+        while step < effective_max_steps:
+            if steps_per_epoch:
+                epoch_idx = step // steps_per_epoch
+                header = (
+                    f"Epoch {epoch_idx + 1}/{max_num_epochs} | "
+                    f"Step {step + 1}/{effective_max_steps}"
+                )
+            else:
+                header = f"Step {step + 1}/{effective_max_steps}"
+            print(f"\n{'=' * 25} {header} {'=' * 25}")
             maybe_gpu_profile_step(policy, step + 1)
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, step + 1)
@@ -2885,7 +2947,7 @@ def async_grpo_train(
 
                 # Validation
                 val_metrics, validation_timings = None, None
-                is_last_step = step + 1 == master_config["grpo"]["max_num_steps"]
+                is_last_step = step + 1 >= effective_max_steps
 
                 # Run validation if it's a validation step or last step with val_at_end
                 if (val_period > 0 and (step + 1) % val_period == 0) or (
@@ -3006,6 +3068,8 @@ def async_grpo_train(
                     should_save_by_step or should_save_by_timeout
                 ):
                     grpo_save_state["current_step"] = step + 1
+                    if steps_per_epoch:
+                        grpo_save_state["current_epoch"] = (step + 1) // steps_per_epoch
                     grpo_save_state["total_valid_tokens"] = total_valid_tokens
                     if val_metrics is not None:
                         grpo_save_state["val_reward"] = val_metrics["accuracy"]
@@ -3169,11 +3233,18 @@ def async_grpo_train(
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
-            if step >= master_config["grpo"]["max_num_steps"]:
-                print(
-                    "Max number of steps has been reached, stopping training early",
-                    flush=True,
-                )
+            if step >= effective_max_steps:
+                if steps_per_epoch and effective_max_steps < max_num_steps:
+                    print(
+                        f"Reached max_num_epochs={max_num_epochs} "
+                        f"({effective_max_steps} steps), stopping training.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "Max number of steps has been reached, stopping training early",
+                        flush=True,
+                    )
                 return
 
     except Exception as e:
