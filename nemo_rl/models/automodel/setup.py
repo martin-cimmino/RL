@@ -131,6 +131,176 @@ def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     automodel_kwargs["force_hf"] = True
 
 
+def _maybe_patch_domyn_edge_varlen_attn(model_config) -> None:
+    """Monkeypatches torch.nn.attention.varlen.varlen_attn for DomynEdge.
+
+    DomynEdge's own trust_remote_code modeling file calls varlen_attn with
+    kwargs (scale, window_size, enable_gqa) that match flash-attn's API, not
+    our pinned torch==2.10.0's actual varlen_attn signature (no scale/
+    window_size/enable_gqa at all) — a checkpoint/torch-version mismatch, not
+    something to fix in this repo. Routes those calls to
+    flash_attn.flash_attn_varlen_func instead, restoring the causal=True the
+    checkpoint code never passes. No-op for every other model.
+    """
+    architectures = getattr(model_config, "architectures", None) or []
+    if not architectures or architectures[0] != "DomynEdgeForCausalLM":
+        return
+
+    import torch.nn.attention.varlen
+
+    original_varlen_attn = torch.nn.attention.varlen.varlen_attn
+
+    def _varlen_attn_compat(query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, *args, **kwargs):
+        if "scale" in kwargs or "window_size" in kwargs or "enable_gqa" in kwargs:
+            import flash_attn
+
+            scale = kwargs.pop("scale", None)
+            window_size = kwargs.pop("window_size", (-1, -1))
+            kwargs.pop("enable_gqa", None)  # flash-attn auto-detects GQA from q/k head-count mismatch
+            return flash_attn.flash_attn_varlen_func(
+                query,
+                key,
+                value,
+                cu_seq_q,
+                cu_seq_k,
+                max_q,
+                max_k,
+                softmax_scale=scale,
+                window_size=window_size,
+                causal=True,
+                **kwargs,
+            )
+        return original_varlen_attn(query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, *args, **kwargs)
+
+    torch.nn.attention.varlen.varlen_attn = _varlen_attn_compat
+
+
+def _maybe_patch_domyn_edge_attention_head_sharding(model_config) -> None:
+    """Monkeypatches Automodel's post-TP head-count update for DomynEdge.
+
+    After applying a tensor-parallel plan, Automodel auto-updates each
+    attention layer's local head count (_update_attention_head_counts_for_tp)
+    so DomynEdgeAttention.forward()'s .view() calls use the per-rank head
+    count instead of the global one — without it, .view() is called with the
+    *global* head count against a tensor TP already sharded to 1/tp_size the
+    heads, e.g. observed: `shape '[1, 16384, 32, 256]' is invalid for input
+    of size 33554432` (33554432 == 1*16384*8*256, i.e. the real, TP=4-local
+    head count of 8, not the global 32 the .view() call was still using).
+
+    Two independent gaps, both from the same root cause — DomynEdge's real
+    attention module is named "attention", not "self_attn" (see
+    modeling_domynedge.py):
+
+    1. Whether the update runs at all is gated by _attention_is_head_sharded,
+       which only recognizes "self_attn.*_proj" keys, so it always returns
+       False for DomynEdge's custom_parallel_plan.
+    2. Even when forced to run, _update_attention_head_counts_for_tp's own
+       body only touches `attn.num_heads`/`attn.num_key_value_heads` on
+       layers matching `hasattr(layer, "self_attn")` — that pattern matches
+       standard HF attention classes that cache their head count as instance
+       attributes read at forward time. DomynEdge's DomynEdgeAttention has no
+       such attributes; it reads `self.config.num_attention_heads` /
+       `num_key_value_heads` directly off the (shared) config object every
+       forward call. So even with the gate fixed, the original function's
+       update logic is a complete no-op for this architecture — it needs the
+       shared config object's attributes updated instead, which is what
+       every layer's `self.config` (same object reference, not a copy)
+       actually reads.
+
+    No-op for every other model.
+    """
+    architectures = getattr(model_config, "architectures", None) or []
+    if not architectures or architectures[0] != "DomynEdgeForCausalLM":
+        return
+
+    import nemo_automodel.components.distributed.parallelizer as _parallelizer
+
+    original_is_head_sharded = _parallelizer._attention_is_head_sharded
+
+    def _is_head_sharded_compat(model_parallel_plan):
+        aliased = dict(model_parallel_plan)
+        for key, style in model_parallel_plan.items():
+            if key.endswith(("attention.q_proj", "attention.k_proj", "attention.v_proj")):
+                aliased[key.replace("attention.", "self_attn.", 1)] = style
+        return original_is_head_sharded(aliased)
+
+    _parallelizer._attention_is_head_sharded = _is_head_sharded_compat
+
+    original_update_head_counts = _parallelizer._update_attention_head_counts_for_tp
+
+    def _update_head_counts_compat(model, tp_size):
+        config = getattr(model, "config", None)
+        model_architectures = getattr(config, "architectures", None) or []
+        if (
+            tp_size > 1
+            and config is not None
+            and model_architectures
+            and model_architectures[0] == "DomynEdgeForCausalLM"
+        ):
+            config.num_attention_heads = config.num_attention_heads // tp_size
+            if getattr(config, "num_key_value_heads", None) is not None:
+                config.num_key_value_heads = config.num_key_value_heads // tp_size
+        return original_update_head_counts(model, tp_size)
+
+    _parallelizer._update_attention_head_counts_for_tp = _update_head_counts_compat
+
+
+def get_domyn_edge_tp_plan() -> dict:
+    """Tensor-parallel plan for DomynEdge, referenced by import path from
+    policy.dtensor_cfg.custom_parallel_plan in the experiment YAML.
+
+    DomynEdge is a custom trust_remote_code architecture: not in Automodel's
+    optimized_tp_plans.py registry and no _tp_plan attribute on its modeling
+    code, so auto-select has nothing to resolve. `_get_parallel_plan`'s
+    explicit-dict path (nemo_automodel/components/distributed/parallelizer.py)
+    expects real ParallelStyle objects as values, not the simple style-name
+    strings used by the *other* (HF `_tp_plan`-attribute) fallback path —
+    passing strings here crashes downstream in translate_to_lora, which
+    tries an in-place `__class__` reassignment that only works on mutable
+    objects, not plain strings.
+
+    Same colwise/rowwise strategy as the default template `_get_parallel_plan`
+    uses for any other unregistered model (and the one edgerunner's torchtitan
+    sharding.py uses for this same architecture), with DomynEdge's real
+    attribute names from modeling_domynedge.py (`attention`/`feedforward`,
+    not `self_attn`/`mlp`). q_norm/k_norm need no entry: pure per-head
+    elementwise ops that follow whichever local heads a rank gets after
+    q/k_proj's colwise split. Also requires
+    _maybe_patch_domyn_edge_attention_head_sharding (above) to recognize
+    these same attention.* keys.
+
+    `model.embed_tokens`/`lm_head` are deliberately left OUT of this plan
+    (unlisted keys stay fully replicated) rather than TP-sharded along the
+    vocab dimension. DomynEdge's vocab_size (115276) isn't evenly divisible
+    by tp_size, and — crucially — the per-TP-rank remainder is odd, so no
+    dp_shard size greater than 1 can ever split it further either. That
+    combination (TP-then-FSDP sharding the same, already-odd dimension)
+    hits a genuine gap in torch's `_StridedShard._shard_tensor`
+    (torch/distributed/tensor/placement_types.py): it calls
+    `_split_tensor(..., with_padding=True)` expecting padding to equalize
+    chunk sizes, but the resulting chunks are NOT actually equal-shaped,
+    so its own `assert all(first.shape == v.shape for v in it)` fires
+    during checkpoint loading — confirmed by reproducing this exact
+    AssertionError locally (CPU-only, tiny model, real vocab_size=115276)
+    and seeing it disappear once these two keys are dropped from the plan.
+    Leaving them replicated costs a modest fixed ~590MB (vocab_size *
+    hidden_size, bf16) duplicated across TP ranks on the same node — the
+    actual memory win from TP was always in attention/FFN activations,
+    which scale with sequence length, not the embedding table.
+    """
+    from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
+
+    return {
+        "model.layers.*.attention.q_proj": ColwiseParallel(),
+        "model.layers.*.attention.k_proj": ColwiseParallel(),
+        "model.layers.*.attention.v_proj": ColwiseParallel(),
+        "model.layers.*.attention.o_proj": RowwiseParallel(),
+        "model.layers.*.feedforward.gate_proj": ColwiseParallel(),
+        "model.layers.*.feedforward.up_proj": ColwiseParallel(),
+        "model.layers.*.feedforward.down_proj": RowwiseParallel(),
+    }
+
+
 def get_tokenizer(
     tokenizer_config: TokenizerConfig, get_processor: bool = False
 ) -> Union[PreTrainedTokenizerBase, AutoProcessor]:
@@ -645,6 +815,10 @@ def setup_model_and_optimizer(
     # HF conversion (required for weight syncing).
     _maybe_set_force_hf(automodel_kwargs, model_config)
 
+    # Must run before from_pretrained, which applies the TP plan (and the
+    # head-count patch this gates) internally.
+    _maybe_patch_domyn_edge_attention_head_sharding(model_config)
+
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
     model = model_class.from_pretrained(
@@ -662,6 +836,8 @@ def setup_model_and_optimizer(
         **from_pretrained_kwargs,
         **automodel_kwargs,
     )
+
+    _maybe_patch_domyn_edge_varlen_attn(model_config)
 
     print(model)
 
