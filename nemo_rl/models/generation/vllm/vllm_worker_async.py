@@ -321,9 +321,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             TokenizeResponse,
         )
         from vllm.entrypoints.serve.tokenize.serving import (
-            ServingTokenization as OpenAIServingTokenization,
+            OpenAIServingTokenization,
         )
-        from vllm.renderers.online_renderer import OnlineRenderer
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
@@ -346,32 +345,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             lora_modules=None,
         )
         openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
-
-        # bare-metal: vllm 0.27.2rc1 (this integration was written for 0.17.1)
-        # replaced the old pattern of passing chat_template/request_logger/etc
-        # directly to each serving class with a single `OnlineRenderer` object
-        # that bundles them, now a required kwarg on every serving class below.
-        # Built once here from the same values `serving_chat_kwargs` uses (moved
-        # up from further below so this can reuse it), matching vllm's own
-        # construction in vllm/entrypoints/launchers/api_server/app_state.py.
-        serving_chat_default_kwargs = dict(
-            response_role="assistant",
-            request_logger=None,
-            chat_template=None,
-            chat_template_content_format="auto",
-        )
-        serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
-            "http_server_serving_chat_kwargs", dict()
-        )
-        online_renderer = OnlineRenderer(
-            model_config=model_config,
-            renderer=engine_client.renderer,
-            request_logger=serving_chat_kwargs["request_logger"],
-            chat_template=serving_chat_kwargs["chat_template"],
-            chat_template_content_format=serving_chat_kwargs[
-                "chat_template_content_format"
-            ],
-        )
 
         class NeMoRLOpenAIChatRequestMixin:
             def model_post_init(self, context):
@@ -502,13 +475,19 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingMixin, OpenAIServingChat):
             pass
 
-        # serving_chat_kwargs/online_renderer built earlier, right after
-        # openai_serving_models — see the comment there for why.
+        serving_chat_default_kwargs = dict(
+            response_role="assistant",
+            request_logger=None,
+            chat_template=None,
+            chat_template_content_format="auto",
+        )
+        serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
+            "http_server_serving_chat_kwargs", dict()
+        )
         serving_chat_kwargs.update(
             dict(
                 engine_client=engine_client,
                 models=openai_serving_models,
-                online_renderer=online_renderer,
                 return_tokens_as_token_ids=True,
             )
         )
@@ -567,18 +546,14 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         ):
             pass
 
-        # bare-metal: ServingTokenization's own constructor changed too — it no
-        # longer takes engine_client at all (models/online_renderer are its
-        # first two positional args now; see vllm's own construction in
-        # vllm/entrypoints/launchers/api_server/app_state.py).
         serving_tokenization_kwargs = dict(
             request_logger=serving_chat_kwargs["request_logger"],
             chat_template=serving_chat_kwargs["chat_template"],
             chat_template_content_format=serving_chat_kwargs[
                 "chat_template_content_format"
             ],
+            engine_client=serving_chat_kwargs["engine_client"],
             models=serving_chat_kwargs["models"],
-            online_renderer=online_renderer,
         )
         openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
             **serving_tokenization_kwargs

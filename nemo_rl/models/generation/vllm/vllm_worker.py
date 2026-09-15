@@ -37,6 +37,18 @@ from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
+def _register_domyn_edge_plugin() -> None:
+    """Registers DomynEdge with vLLM's model/config registries."""
+    import vllm
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
+
+    from nemo_rl.models.generation.vllm.domyn_edge import DomynEdgeForCausalLM
+    from nemo_rl.models.generation.vllm.domyn_edge_config import DomynEdgeConfig
+
+    vllm.ModelRegistry.register_model("DomynEdgeForCausalLM", DomynEdgeForCausalLM)
+    _CONFIG_REGISTRY["domynedge"] = DomynEdgeConfig
+
+
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
     def __repr__(self) -> str:
@@ -555,13 +567,14 @@ class BaseVllmGenerationWorker:
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
             trust_remote_code=True,
             worker_extension_cls="nemo_rl.models.generation.vllm.vllm_backend.VllmInternalWorkerExtension",
-            enable_sleep_mode=True,
+            enable_sleep_mode=self.cfg["vllm_cfg"].get("enable_sleep_mode", True),
             # Set disable_log_stats=False so that self.llm.get_metrics() works.
             disable_log_stats=False,
             logprobs_mode="processed_logprobs",
             **vllm_kwargs,
         )
 
+        _register_domyn_edge_plugin()
         self._create_engine(llm_kwargs)
 
         # will be initialized in post_init

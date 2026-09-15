@@ -66,6 +66,24 @@ VENV_BIN="$NEMO_RL_DIR/.venv/bin"
   exit 1
 }
 COMMAND=${COMMAND:-}
+# bare-metal: this script's own top-level environment is inherited from
+# `sbatch`, which inherits it from whatever shell submitted the job — in
+# practice the launcher, which does `module load cuda/12.6` for the venv
+# pre-build step. That module's lib64 (bundling its OWN libnvidia-ml.so.1,
+# often a different version than the node's actual driver) ends up on
+# LD_LIBRARY_PATH here too. head_cmd/worker_cmd fix this for the `ray start`
+# process itself (see their own comments) — but that fix is scoped to their
+# own `srun ... bash -c "$head_cmd"` subshell only. The driver process
+# (`srun ... bash -c "$COMMAND"` further below) is a SEPARATE srun
+# invocation that does NOT inherit head_cmd's env — it inherits THIS
+# top-level scope directly. And critically, nemo_rl's own actor creation
+# (virtual_cluster.py's `env_vars = dict(os.environ)`) passes the driver's
+# entire environment through to every Ray actor's runtime_env — so without
+# this fix here, every actor (not just the ray head/worker startup
+# processes) would still see the mismatched NVML library. Fix it once,
+# here, before anything downstream (head_cmd, worker_cmd, and the driver)
+# forks off this script's environment.
+export LD_LIBRARY_PATH="/lib64:${LD_LIBRARY_PATH:-}"
 ########################################################
 # Ports for all nodes
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
@@ -171,6 +189,26 @@ export PATH="VENV_BIN_PLACEHOLDER:$PATH"
 # system aren't guaranteed to be available inside this non-interactive
 # srun/bash -c context) covers it without needing the full module machinery.
 export LD_LIBRARY_PATH="/leonardo/prod/spack/06/install/0.22/linux-rhel8-icelake/gcc-8.5.0/gcc-12.2.0-lkcazt4letxjj4s7nlhzryoyivevsatz/lib64:${LD_LIBRARY_PATH:-}"
+# bare-metal: the launcher's own `module load cuda/12.6` (needed on the login
+# node to build per-actor venvs) leaks into this job's environment all the way
+# through sbatch/srun (nothing here uses --export=NONE), so the cuda module's
+# own lib64 ends up on LD_LIBRARY_PATH. That directory ships its OWN
+# libnvidia-ml.so.1 (bundled with the toolkit install, currently version
+# 560.35.03) which can be newer than the node's actual loaded kernel driver
+# (confirmed 535.274.02 via nvidia-smi) — a classic NVML userspace/kernel
+# version mismatch that makes nvmlInit() fail for many (not reliably all)
+# callers. The correct, driver-matched libnvidia-ml.so.1 lives in the
+# system's default /lib64 (confirmed via ldconfig -p) but the module path
+# was shadowing it by coming first. Prepending /lib64 here forces the
+# correct one to resolve first for every dlopen("libnvidia-ml.so.1") call
+# (torch's raw CDLL check, pynvml, vLLM's platform detection) while leaving
+# the rest of the cuda module's lib64 (libcudart.so etc, needed by
+# transformer_engine at import time) still reachable afterward. This is why
+# the container-based path never hits this: singularity starts from a clean
+# env and only bind-mounts the real driver files via --nv, never inheriting
+# the host's `module load cuda` state at all.
+export LD_LIBRARY_PATH="/lib64:${LD_LIBRARY_PATH:-}"
+nvidia-smi -L >/dev/null 2>&1 || true
 touch LOG_DIR_PLACEHOLDER/STARTED_RAY_HEAD
 env
 
@@ -255,6 +293,12 @@ export PATH="VENV_BIN_PLACEHOLDER:$PATH"
 # system aren't guaranteed to be available inside this non-interactive
 # srun/bash -c context) covers it without needing the full module machinery.
 export LD_LIBRARY_PATH="/leonardo/prod/spack/06/install/0.22/linux-rhel8-icelake/gcc-8.5.0/gcc-12.2.0-lkcazt4letxjj4s7nlhzryoyivevsatz/lib64:${LD_LIBRARY_PATH:-}"
+# bare-metal: same libnvidia-ml.so.1 version-mismatch fix as the head node
+# (see head_cmd for the full explanation) — every worker node's LD_LIBRARY_PATH
+# also inherits the leaked `module load cuda/12.6` lib64, shadowing the
+# correct system driver library with the toolkit's own (mismatched) copy.
+export LD_LIBRARY_PATH="/lib64:${LD_LIBRARY_PATH:-}"
+nvidia-smi -L >/dev/null 2>&1 || true
 env
 
 monitor-sidecar() {
