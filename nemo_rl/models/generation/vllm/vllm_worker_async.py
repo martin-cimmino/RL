@@ -305,6 +305,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
+        from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
             ChatCompletionResponse,
@@ -483,6 +484,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         )
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
+        )
+        # The actual chat template is needed here instead of its path
+        serving_chat_kwargs["chat_template"] = load_chat_template(
+            serving_chat_kwargs["chat_template"]
         )
         serving_chat_kwargs.update(
             dict(

@@ -38,11 +38,11 @@ class DomynEdgeAttention(torch.nn.Module):
         rms_norm_eps: float = 1e-06,
         qkv_bias: bool = False,
         cache_config: vllm.config.CacheConfig | None = None,
-        quant_config: vllm.model_executor.layers.quantization.QuantizationConfig | None = None,
+        quant_config: vllm.model_executor.layers.quantization.QuantizationConfig
+        | None = None,
         window_size: int = 0,
         prefix: str = "",
     ) -> None:
-
         super().__init__()
         self.hidden_size = hidden_size
         tp_size = vllm.distributed.get_tensor_model_parallel_world_size()
@@ -110,15 +110,18 @@ class DomynEdgeAttention(torch.nn.Module):
             # reference. window_size <= 0 means full (non-sliding) attention.
             per_layer_sliding_window=window_size + 1 if window_size > 0 else None,
         )
-        self.q_norm = vllm.model_executor.layers.layernorm.RMSNorm(self.head_dim, eps=rms_norm_eps, has_weight=False)
-        self.k_norm = vllm.model_executor.layers.layernorm.RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.q_norm = vllm.model_executor.layers.layernorm.RMSNorm(
+            self.head_dim, eps=rms_norm_eps, has_weight=False
+        )
+        self.k_norm = vllm.model_executor.layers.layernorm.RMSNorm(
+            self.head_dim, eps=rms_norm_eps
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # Add qk-norm
@@ -142,13 +145,16 @@ class DomynEdgeDecoderLayer(torch.nn.Module):
         self,
         config,
         cache_config: vllm.config.CacheConfig | None = None,
-        quant_config: vllm.model_executor.layers.quantization.QuantizationConfig | None = None,
+        quant_config: vllm.model_executor.layers.quantization.QuantizationConfig
+        | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        match config.position_layers[vllm.model_executor.models.utils.extract_layer_index(prefix)]:
+        match config.position_layers[
+            vllm.model_executor.models.utils.extract_layer_index(prefix)
+        ]:
             case "rope":
                 rope_parameters = config.rope_parameters
             case "nope":
@@ -165,11 +171,15 @@ class DomynEdgeDecoderLayer(torch.nn.Module):
             num_kv_heads=config.num_key_value_heads,
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=False,
-            head_dim=config.head_sizes[vllm.model_executor.models.utils.extract_layer_index(prefix)],
+            head_dim=config.head_sizes[
+                vllm.model_executor.models.utils.extract_layer_index(prefix)
+            ],
             cache_config=cache_config,
             quant_config=quant_config,
             rope_parameters=rope_parameters,
-            window_size=config.window_sizes[vllm.model_executor.models.utils.extract_layer_index(prefix)][0],
+            window_size=config.window_sizes[
+                vllm.model_executor.models.utils.extract_layer_index(prefix)
+            ][0],
             prefix=f"{prefix}.attention",
         )
         self.feedforward = vllm.model_executor.models.qwen2.Qwen2MLP(
@@ -234,7 +244,11 @@ ALL_DECODER_LAYER_TYPES = {
 )
 class DomynEdgeModel(vllm.model_executor.models.qwen2.Qwen2Model):
     def __init__(self, *, vllm_config: vllm.config.VllmConfig, prefix: str = ""):
-        super().__init__(vllm_config=vllm_config, prefix=prefix, decoder_layer_type=DomynEdgeDecoderLayer)
+        super().__init__(
+            vllm_config=vllm_config,
+            prefix=prefix,
+            decoder_layer_type=DomynEdgeDecoderLayer,
+        )
 
 
 class DomynEdgeForCausalLM(
@@ -271,25 +285,36 @@ class DomynEdgeForCausalLM(
         self.vllm_config = vllm_config
         self.quant_config = quant_config
         self.model = DomynEdgeModel(
-            vllm_config=vllm_config, prefix=vllm.model_executor.models.utils.maybe_prefix(prefix, "model")
+            vllm_config=vllm_config,
+            prefix=vllm.model_executor.models.utils.maybe_prefix(prefix, "model"),
         )
 
         if vllm.distributed.get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
-                self.lm_head = vllm.model_executor.layers.vocab_parallel_embedding.ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=vllm.model_executor.models.utils.maybe_prefix(prefix, "lm_head"),
+                self.lm_head = (
+                    vllm.model_executor.layers.vocab_parallel_embedding.ParallelLMHead(
+                        config.vocab_size,
+                        config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=vllm.model_executor.models.utils.maybe_prefix(
+                            prefix, "lm_head"
+                        ),
+                    )
                 )
         else:
             self.lm_head = vllm.model_executor.models.utils.PPMissingLayer()
 
-        self.logits_processor = vllm.model_executor.layers.logits_processor.LogitsProcessor(config.vocab_size)
+        self.logits_processor = (
+            vllm.model_executor.layers.logits_processor.LogitsProcessor(
+                config.vocab_size
+            )
+        )
 
-        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -301,7 +326,9 @@ class DomynEdgeForCausalLM(
         intermediate_tensors: vllm.sequence.IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | vllm.sequence.IntermediateTensors:
-        hidden_states = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        hidden_states = self.model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
         return hidden_states
 
     def compute_logits(
@@ -311,6 +338,49 @@ class DomynEdgeForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def load_weights(self, weights: collections.abc.Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(
+        self, weights: collections.abc.Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        # Record the names as they stream past rather than materializing the
+        # iterable
+        seen: list[str] = []
+
+        def _tracked(src):
+            for weight_name, weight in src:
+                seen.append(weight_name)
+                yield weight_name, weight
+
         loader = vllm.model_executor.models.utils.AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(_tracked(weights))
+
+        # NeMo-RL boots vLLM with load_format="dummy" during training
+        # (see nemo_rl/models/generation/__init__.py)
+        # The inherited load_weights silently `continue`s on any name missing from its params_dict
+        # So unmapped weights leave tensors at random init.
+        # Audit the mapping here instead, where it is cheap.
+        unused = vllm.model_executor.models.utils.AutoWeightsLoader.ROTARY_EMBEDS_UNUSED_WEIGHTS
+        dropped = []
+        for name in seen:
+            if any(suffix in name for suffix in unused):
+                continue  # skipped by design upstream
+            dest = name
+            for packed, shards in self.packed_modules_mapping.items():
+                for shard in shards:
+                    if shard in name:
+                        dest = name.replace(shard, packed)
+                        break
+                else:
+                    continue
+                break
+            if dest not in loaded:
+                dropped.append(name)
+        if dropped:
+            raise ValueError(
+                f"{len(dropped)} weight(s) were handed to DomynEdgeForCausalLM.load_weights "
+                f"but matched no parameter and were silently discarded: {dropped[:10]}"
+                f"{'...' if len(dropped) > 10 else ''}. With load_format='dummy' those "
+                "tensors keep their random init, which shows up as gibberish generations "
+                "rather than an error. Check the HF->vLLM parameter name mapping."
+            )
+
+        return loaded
