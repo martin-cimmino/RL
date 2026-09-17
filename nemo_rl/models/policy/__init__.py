@@ -102,8 +102,21 @@ class DTensorConfig(TypedDict):
     sequence_parallel: bool
     activation_checkpointing: bool
     cpu_offload: bool
+    # dtype FSDP2 casts each wrapped module's *output* to at every module
+    # boundary -- one of "float32"/"bfloat16"/"float16", or None/omitted 
+    # for no forced cast (module output stays in whatever dtype its compute
+    # produced). Recommended default: None
+    output_dtype: NotRequired[str | None]
     custom_parallel_plan: NotRequired[str | None]
     defer_fsdp_grad_sync: NotRequired[bool]
+    # When True, computes the training-loss next-token logprobs via a fused
+    # linear-CE kernel (never materializing the full [seq_len, vocab_size]
+    # logits tensor) instead of the plain lm_head-then-log_softmax-then-gather
+    # path. Only applies to LossInputType.LOGPROB loss functions (e.g. GRPO's 
+    # ClippedPGLossFn, SFT's NLLLossFn) and only to models whose forward exposes
+    # hidden states before the lm_head projection. Incompatible with training-time
+    # temperature scaling != 1.0 or top-k/top-p logit filtering.
+    use_linear_ce_fusion_loss: NotRequired[bool]
     # MoE parallelizer config
     moe_parallelizer: NotRequired[MoEParallelizerOptions]
     # Model config

@@ -170,7 +170,8 @@ class ClippedPGLossFn(LossFunction):
 
     input_type = LossInputType.LOGPROB
 
-    def __init__(self, cfg: ClippedPGLossConfig):
+    def __init__(self, cfg: ClippedPGLossConfig, use_linear_ce_fusion: bool = False):
+        self.use_linear_ce_fusion = use_linear_ce_fusion
         self.ratio_clip_min = cfg["ratio_clip_min"]
         self.ratio_clip_max = cfg["ratio_clip_max"]
         self.ratio_clip_c = cfg["ratio_clip_c"]  # set to None to disable dual-clipping

@@ -109,6 +109,14 @@ automodel = [
   # override actually applies (same footgun already hit on flash-attn/torchaudio/
   # openai/xgrammar/llguidance, see CLAUDE.md).
   "transformer-engine-torch==2.11.0",
+  # bare-metal: nemo-automodel only declares this in its own "dev" dependency
+  # group (not in our default-groups, so not installed), used here for a
+  # chunked/fused linear-CE loss (avoids materializing full [seq_len,
+  # vocab_size] logits — needed for DomynEdge's ~115k vocab at long context).
+  # Made a direct dep of this extra, pinned to the exact same rev Automodel
+  # itself vendors (see [tool.uv.sources] below), so our source route applies
+  # (same footgun as flash-attn/torchaudio/openai/xgrammar/llguidance).
+  "cut-cross-entropy",
 ]
 vllm = [
   "cuda-python",
@@ -288,6 +296,11 @@ transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", 
 # upstream packaging bug), against torch==2.10.0+cu126/py3.13 to match this project's
 # exact pins. See vllm-domyn-edge/build-scripts/pre_build.sh for the build recipe.
 transformer-engine-torch = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.6.0/transformer_engine_torch-2.11.0-cp313-cp313-linux_x86_64.whl", extra = "automodel" }
+# bare-metal: same rev nemo-automodel's own pyproject.toml pins for this
+# package in its "dev" group (see cut-cross-entropy comment above) — keeping
+# them identical avoids a second, possibly-incompatible build of the same
+# Triton kernel ever landing in the same venv.
+cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }

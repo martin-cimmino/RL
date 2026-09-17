@@ -21,6 +21,7 @@ from functools import partial
 from typing import Any, Optional, Union
 
 import torch
+import torch.utils.checkpoint
 from hydra.utils import get_class
 from nemo_automodel import NeMoAutoModelForSequenceClassification
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -31,6 +32,7 @@ from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
 from nemo_automodel.components.moe.config import MoEParallelizerConfig
+from nemo_automodel.shared.utils import dtype_from_str
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from transformers import (
     AutoConfig,
@@ -131,6 +133,78 @@ def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     automodel_kwargs["force_hf"] = True
 
 
+def _maybe_patch_domyn_edge_activation_checkpointing(
+    model, activation_checkpointing: bool
+) -> None:
+    """Monkeypatches each decoder layer's actual runtime class to checkpoint.
+
+    Automodel's generic activation-checkpointing (applied inside
+    from_pretrained -> fsdp2_strategy_parallelize) only wraps submodules
+    named `mlp`/`self_attn`/`input_layernorm`/`post_attention_layernorm`
+    (Llama-style naming). DomynEdge's real attribute names are `attention`/
+    `feedforward`/`pre_attention_norm`/`post_attention_norm`/
+    `pre_feedforward_norm`/`post_feedforward_norm` — silent no-op for this 
+    model.
+
+    A property-based attribute-aliasing approach (making `layer.self_attn`
+    resolve to `layer.attention`) does NOT work here. Patches `forward`
+    directly instead, wrapping the attention and feedforward sub-blocks 
+    in `torch.utils.checkpoint.checkpoint`.
+
+    Must run AFTER `from_pretrained`, on the model's ACTUAL runtime layer
+    classes -- not before, on the plain `DomynEdgeDecoderLayer` imported
+    from the modeling module.
+    """
+    if not activation_checkpointing:
+        return
+    architectures = getattr(getattr(model, "config", None), "architectures", None) or []
+    if not architectures or architectures[0] != "DomynEdgeForCausalLM":
+        return
+
+    def _checkpointed_forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        past_key_values=None,
+        position_embeddings=None,
+        **kwargs,
+    ):
+        def attn_block(hidden_states):
+            return self.post_attention_norm(
+                self.attention(
+                    hidden_states=self.pre_attention_norm(hidden_states),
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+            )
+
+        hidden_states = hidden_states + torch.utils.checkpoint.checkpoint(
+            attn_block, hidden_states, use_reentrant=False
+        )
+
+        def ffn_block(hidden_states):
+            return self.post_feedforward_norm(
+                self.feedforward(self.pre_feedforward_norm(hidden_states))
+            )
+
+        hidden_states = hidden_states + torch.utils.checkpoint.checkpoint(
+            ffn_block, hidden_states, use_reentrant=False
+        )
+        return hidden_states
+
+    layers = model.model.layers
+    if isinstance(layers, torch.nn.ModuleDict):
+        layers = layers.values()
+    for layer in layers:
+        layer_cls = type(layer)
+        if getattr(layer_cls, "_activation_checkpointing_patched", False):
+            continue
+        layer_cls.forward = _checkpointed_forward
+        layer_cls._activation_checkpointing_patched = True
+
+
 def _maybe_patch_domyn_edge_varlen_attn(model_config) -> None:
     """Monkeypatches torch.nn.attention.varlen.varlen_attn for DomynEdge.
 
@@ -175,6 +249,52 @@ def _maybe_patch_domyn_edge_varlen_attn(model_config) -> None:
     torch.nn.attention.varlen.varlen_attn = _varlen_attn_compat
 
 
+class _SkipLMHeadSignal(Exception):
+    """Raised from a lm_head forward-pre-hook to abort a forward pass early.
+
+    Carries the pre-lm_head hidden states out of the model call.
+    """
+
+    def __init__(self, hidden_states):
+        super().__init__()
+        self.hidden_states = hidden_states
+
+
+def _maybe_patch_domyn_edge_skip_lm_head_support(model) -> None:
+    """Registers a forward-pre-hook on lm_head to support skip_lm_head.
+
+    Used by the linear-CE-fusion training-loss path (nemo_rl.models.automodel
+    .train.model_forward's skip_lm_head=True), which needs pre-lm_head hidden
+    states to apply lm_head+cross-entropy together via a fused kernel instead
+    of materializing the full [seq_len, vocab_size] logits tensor.
+
+    Two other mechanisms were tried and both failed under the real
+    setup_model_and_optimizer/from_pretrained + FSDP2 + TP path:
+    1. Calling `model.model(...)` directly
+    2. Monkeypatching `type(model).forward`
+
+    A forward-pre-hook on `lm_head` sidesteps all of that.
+    """
+    architectures = getattr(getattr(model, "config", None), "architectures", None) or []
+    if not architectures or architectures[0] != "DomynEdgeForCausalLM":
+        return
+
+    lm_head = model.lm_head
+    if getattr(lm_head, "_skip_lm_head_hook_registered", False):
+        return
+
+    enabled = {"value": False}
+    model._nemo_rl_skip_lm_head_state = enabled
+
+    def _capture_hidden_states_hook(module, args):
+        if enabled["value"]:
+            raise _SkipLMHeadSignal(args[0])
+        return None
+
+    lm_head.register_forward_pre_hook(_capture_hidden_states_hook)
+    lm_head._skip_lm_head_hook_registered = True
+
+
 def _maybe_patch_domyn_edge_attention_head_sharding(model_config) -> None:
     """Monkeypatches Automodel's post-TP head-count update for DomynEdge.
 
@@ -215,6 +335,15 @@ def _maybe_patch_domyn_edge_attention_head_sharding(model_config) -> None:
 
     import nemo_automodel.components.distributed.parallelizer as _parallelizer
 
+    # Idempotency guard: without this, calling this function twice in the
+    # same process (e.g. two models/setup calls sharing one process, or a
+    # test harness building multiple models) captures the FIRST call's
+    # compat wrapper as "original" on the second call, nesting the
+    # tp_size-division in _update_head_counts_compat below twice
+    if getattr(_parallelizer, "_domyn_edge_head_sharding_patched", False):
+        return
+    _parallelizer._domyn_edge_head_sharding_patched = True
+
     original_is_head_sharded = _parallelizer._attention_is_head_sharded
 
     def _is_head_sharded_compat(model_parallel_plan):
@@ -245,52 +374,50 @@ def _maybe_patch_domyn_edge_attention_head_sharding(model_config) -> None:
     _parallelizer._update_attention_head_counts_for_tp = _update_head_counts_compat
 
 
-def get_domyn_edge_tp_plan() -> dict:
-    """Tensor-parallel plan for DomynEdge, referenced by import path from
-    policy.dtensor_cfg.custom_parallel_plan in the experiment YAML.
+def get_domyn_edge_tp_plan(sequence_parallel: bool = False) -> dict:
+    """Tensor-parallel plan for DomynEdge.
 
-    DomynEdge is a custom trust_remote_code architecture: not in Automodel's
-    optimized_tp_plans.py registry and no _tp_plan attribute on its modeling
-    code, so auto-select has nothing to resolve. `_get_parallel_plan`'s
-    explicit-dict path (nemo_automodel/components/distributed/parallelizer.py)
-    expects real ParallelStyle objects as values, not the simple style-name
-    strings used by the *other* (HF `_tp_plan`-attribute) fallback path —
-    passing strings here crashes downstream in translate_to_lora, which
-    tries an in-place `__class__` reassignment that only works on mutable
-    objects, not plain strings.
+    `model.embed_tokens`/`lm_head` are deliberately left OUT of the TP plan
+    proper (never given a Colwise/RowwiseParallel style, i.e. their weights
+    stay vocab-unsharded) rather than TP-sharded along the vocab dimension.
+    DomynEdge's vocab_size (115276) isn't evenly divisible by tp_size
 
-    Same colwise/rowwise strategy as the default template `_get_parallel_plan`
-    uses for any other unregistered model (and the one edgerunner's torchtitan
-    sharding.py uses for this same architecture), with DomynEdge's real
-    attribute names from modeling_domynedge.py (`attention`/`feedforward`,
-    not `self_attn`/`mlp`). q_norm/k_norm need no entry: pure per-head
-    elementwise ops that follow whichever local heads a rank gets after
-    q/k_proj's colwise split. Also requires
-    _maybe_patch_domyn_edge_attention_head_sharding (above) to recognize
-    these same attention.* keys.
-
-    `model.embed_tokens`/`lm_head` are deliberately left OUT of this plan
-    (unlisted keys stay fully replicated) rather than TP-sharded along the
-    vocab dimension. DomynEdge's vocab_size (115276) isn't evenly divisible
-    by tp_size, and — crucially — the per-TP-rank remainder is odd, so no
-    dp_shard size greater than 1 can ever split it further either. That
-    combination (TP-then-FSDP sharding the same, already-odd dimension)
-    hits a genuine gap in torch's `_StridedShard._shard_tensor`
-    (torch/distributed/tensor/placement_types.py): it calls
-    `_split_tensor(..., with_padding=True)` expecting padding to equalize
-    chunk sizes, but the resulting chunks are NOT actually equal-shaped,
-    so its own `assert all(first.shape == v.shape for v in it)` fires
-    during checkpoint loading — confirmed by reproducing this exact
-    AssertionError locally (CPU-only, tiny model, real vocab_size=115276)
-    and seeing it disappear once these two keys are dropped from the plan.
-    Leaving them replicated costs a modest fixed ~590MB (vocab_size *
-    hidden_size, bf16) duplicated across TP ranks on the same node — the
-    actual memory win from TP was always in attention/FFN activations,
-    which scale with sequence length, not the embedding table.
+    `sequence_parallel=True` adds Automodel's own generic SP overrides
+    (mirrors `_get_parallel_plan`'s `base_model_sp_plan` for stock
+    Llama-style models), adapted to DomynEdge.
     """
-    from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
+    from functools import partial
 
-    return {
+    from torch.distributed.tensor import DTensor, distribute_module
+    from torch.distributed.tensor.parallel import (
+        ColwiseParallel,
+        PrepareModuleOutput,
+        RowwiseParallel,
+        SequenceParallel,
+    )
+    from torch.distributed.tensor.placement_types import Replicate, Shard
+
+    class _SequenceParallelNormWithFullOutput(SequenceParallel):
+        """Custom SequenceParallel for DomynEdge.
+        
+        Like SequenceParallel, but the module's output is redistributed
+        to a genuine full (Replicate) tensor via an actual all-gather,
+        instead of SequenceParallel's own to_local().
+        """
+
+        def _apply(self, module, device_mesh):
+            def _prepare_full_output_fn(mod, outputs, device_mesh):
+                return outputs.full_tensor() if isinstance(outputs, DTensor) else outputs
+
+            return distribute_module(
+                module,
+                device_mesh,
+                self._replicate_module_fn,
+                partial(self._prepare_input_fn, self.sequence_sharding),
+                _prepare_full_output_fn,
+            )
+
+    plan: dict = {
         "model.layers.*.attention.q_proj": ColwiseParallel(),
         "model.layers.*.attention.k_proj": ColwiseParallel(),
         "model.layers.*.attention.v_proj": ColwiseParallel(),
@@ -299,6 +426,28 @@ def get_domyn_edge_tp_plan() -> dict:
         "model.layers.*.feedforward.up_proj": ColwiseParallel(),
         "model.layers.*.feedforward.down_proj": RowwiseParallel(),
     }
+    if sequence_parallel:
+        plan.update(
+            {
+                "model.embed_tokens": PrepareModuleOutput(
+                    output_layouts=Replicate(),
+                    desired_output_layouts=Shard(1),
+                    use_local_output=False,
+                ),
+                "model.layers.*.pre_attention_norm": SequenceParallel(),
+                "model.layers.*.attention.o_proj": RowwiseParallel(
+                    output_layouts=Shard(1), use_local_output=False
+                ),
+                "model.layers.*.post_attention_norm": SequenceParallel(),
+                "model.layers.*.pre_feedforward_norm": SequenceParallel(),
+                "model.layers.*.feedforward.down_proj": RowwiseParallel(
+                    output_layouts=Shard(1), use_local_output=False
+                ),
+                "model.layers.*.post_feedforward_norm": SequenceParallel(),
+                "model.norm": _SequenceParallelNormWithFullOutput(),
+            }
+        )
+    return plan
 
 
 def get_tokenizer(
@@ -602,6 +751,25 @@ def setup_distributed(
 
     # Build tp_plan from custom_parallel_plan config if set, else None (auto-select)
     tp_plan = config["dtensor_cfg"].get("custom_parallel_plan", None)
+    # TODO: improve this
+    # Automodel's own resolution of a custom_parallel_plan import-path string
+    # (nemo_automodel...parallelizer.py's `_get_parallel_plan`) always calls
+    # it as a zero-arg function (`plan_obj()`) -- there's no mechanism to
+    # forward `sequence_parallel` through that generic path. Special-case
+    # our own function here and pre-resolve to a literal dict (the other
+    # branch `_get_parallel_plan` already supports) so SP actually reaches
+    # it instead of always silently getting the `sequence_parallel=False`
+    # default.
+    if tp_plan == f"{get_domyn_edge_tp_plan.__module__}.{get_domyn_edge_tp_plan.__qualname__}":
+        tp_plan = get_domyn_edge_tp_plan(sequence_parallel=sequence_parallel_enabled)
+
+    # dtype each FSDP2-wrapped module's *output* gets cast to, on top of
+    # param_dtype's compute dtype -- YAML-configurable: None is the
+    # recommended default, no forced cast. The places that actually need fp32 
+    # (log_softmax/loss computation) already upcast explicitly themselves.
+    output_dtype_cfg = config["dtensor_cfg"].get("output_dtype", None)
+    if isinstance(output_dtype_cfg, str):
+        output_dtype_cfg = dtype_from_str(output_dtype_cfg, default=None)
 
     # Create FSDP2Config
     fsdp2_config = FSDP2Config(
@@ -610,7 +778,7 @@ def setup_distributed(
         mp_policy=MixedPrecisionPolicy(
             param_dtype=dtype,
             reduce_dtype=torch.float32,
-            output_dtype=torch.float32,
+            output_dtype=output_dtype_cfg,
         ),
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
         activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
@@ -838,6 +1006,10 @@ def setup_model_and_optimizer(
     )
 
     _maybe_patch_domyn_edge_varlen_attn(model_config)
+    _maybe_patch_domyn_edge_skip_lm_head_support(model)
+    _maybe_patch_domyn_edge_activation_checkpointing(
+        model, config["dtensor_cfg"]["activation_checkpointing"]
+    )
 
     print(model)
 
