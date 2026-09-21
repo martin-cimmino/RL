@@ -684,9 +684,13 @@ def setup(
             )
 
         ## make vllm hf overrides match the training policy
-        generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
-            "hf_config_overrides", {}
+        generation_config["vllm_kwargs"]["hf_overrides"] = dict(
+            policy_config.get("hf_config_overrides", {})
         )
+        if policy_config.get("trained_vocab_size") is not None:
+            generation_config["vllm_kwargs"]["hf_overrides"]["trained_vocab_size"] = (
+                policy_config["trained_vocab_size"]
+            )
 
         policy_generation, policy = initialize_generation_with_policy(
             init_generation_fn=init_vllm,
@@ -1307,6 +1311,43 @@ def compute_and_apply_seq_logprob_error_masking(
 # ===============================================================================
 
 
+def _add_decoded_rollout_text(log_data: dict[str, Any], tokenizer: Any) -> None:
+    """[CUSTOM] Give NemoGym training dumps readable text.
+
+    Adds ``prompt_text`` and ``generated_text``; leaves ``content`` untouched.
+    No-op when ``content`` already holds text (non-gym runs), so dumps that are
+    already readable don't pay for a second copy of every rollout.
+    """
+    if tokenizer is None or "token_ids" not in log_data:
+        return
+
+    def _is_empty(entry: Any) -> bool:
+        if isinstance(entry, str):
+            return not entry
+        if isinstance(entry, list):
+            return all(_is_empty(e) for e in entry)
+        if isinstance(entry, dict):
+            return not entry.get("content")
+        return entry is None
+
+    content = log_data.get("content") or []
+    if content and not all(_is_empty(c) for c in content):
+        return
+
+    prompts, generations = [], []
+    for ids, mask in zip(log_data["token_ids"], log_data["token_loss_mask"]):
+        gen_ids = [t for t, m in zip(ids, mask) if m]
+        prompt_ids = [t for t, m in zip(ids, mask) if not m]
+        try:
+            prompts.append(tokenizer.decode(prompt_ids, skip_special_tokens=False))
+            generations.append(tokenizer.decode(gen_ids, skip_special_tokens=False))
+        except Exception:  # noqa: BLE001 - a dump must never fail a training step
+            prompts.append("")
+            generations.append("")
+    log_data["prompt_text"] = prompts
+    log_data["generated_text"] = generations
+
+
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -1603,13 +1644,22 @@ def grpo_train(
                     #   Bypassed when NRL_ROLLOUT_LOG_MODE=wandb.  Never breaks the step.
                     try:
                         from nemo_rl.utils.logger import log_rollouts as _log_rollouts
+
                         _log_rollouts(
-                            repeated_batch["message_log"], rewards, tokenizer=tokenizer,
-                            num_print=master_config["logger"].get("num_val_samples_to_print", 3),
-                            step=total_steps + 1, tag="train",
+                            repeated_batch["message_log"],
+                            rewards,
+                            tokenizer=tokenizer,
+                            num_print=master_config["logger"].get(
+                                "num_val_samples_to_print", 3
+                            ),
+                            step=total_steps + 1,
+                            tag="train",
                         )
                     except Exception as _e:
-                        print(f"  \u26A0\uFE0F  per-step train rollout logging failed: {_e}", flush=True)
+                        print(
+                            f"  \u26a0\ufe0f  per-step train rollout logging failed: {_e}",
+                            flush=True,
+                        )
 
                     print("▶ Computing advantages...", flush=True)
                     if master_config["grpo"].get("calculate_advantages_on_gpu"):
@@ -2082,6 +2132,7 @@ def grpo_train(
                 ].tolist()
                 log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
 
+                _add_decoded_rollout_text(log_data, tokenizer)
                 logger.log_batched_dict_as_jsonl(
                     log_data, f"train_data_step{total_steps + 1}.jsonl"
                 )
@@ -2312,10 +2363,17 @@ def validate(
                 for _m in val_batch["message_log"][_i]:
                     _role = _m.get("role", "") if isinstance(_m, dict) else ""
                     _content = _m.get("content", "") if isinstance(_m, dict) else ""
-                    if not _content and isinstance(_m, dict) and "token_ids" in _m and tokenizer is not None:
+                    if (
+                        not _content
+                        and isinstance(_m, dict)
+                        and "token_ids" in _m
+                        and tokenizer is not None
+                    ):
                         try:
                             _tok = _m["token_ids"]
-                            _ids = _tok.tolist() if hasattr(_tok, "tolist") else list(_tok)
+                            _ids = (
+                                _tok.tolist() if hasattr(_tok, "tolist") else list(_tok)
+                            )
                             _content = tokenizer.decode(_ids, skip_special_tokens=False)
                         except Exception:
                             pass
@@ -2345,10 +2403,11 @@ def validate(
         # Print sample conversations only once at the end of validation
         try:
             from nemo_rl.utils.logger import log_rollouts as _log_rollouts
+
             _log_rollouts(
                 all_message_logs,
                 total_rewards,
-                tokenizer=None,   # already decoded inline
+                tokenizer=None,  # already decoded inline
                 num_print=master_config["logger"]["num_val_samples_to_print"],
                 step=step,
                 tag="val",
@@ -2484,7 +2543,10 @@ def async_grpo_train(
         steps_per_epoch = len(dataloader)
     except TypeError:
         steps_per_epoch = None
-    if master_config["data"].get("use_multiple_dataloader", False) or not steps_per_epoch:
+    if (
+        master_config["data"].get("use_multiple_dataloader", False)
+        or not steps_per_epoch
+    ):
         # Infinite / unknown-length dataloader: epoch boundary is undefined, so
         # fall back to the global step cap (matches the sync-loop behavior).
         effective_max_steps = max_num_steps
@@ -2801,6 +2863,27 @@ def async_grpo_train(
                     del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
+
+                    # [CUSTOM] per-step TRAINING rollout logging (decoded text):
+                    #   stdout: num_val_samples_to_print samples; jsonl: complete dump (train/)
+                    try:
+                        from nemo_rl.utils.logger import log_rollouts as _log_rollouts
+
+                        _log_rollouts(
+                            repeated_batch["message_log"],
+                            rewards,
+                            tokenizer=tokenizer,
+                            num_print=master_config["logger"].get(
+                                "num_val_samples_to_print", 3
+                            ),
+                            step=step + 1,
+                            tag="train",
+                        )
+                    except Exception as _e:
+                        print(
+                            f"  \u26a0\ufe0f  per-step train rollout logging failed: {_e}",
+                            flush=True,
+                        )
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
@@ -3157,6 +3240,7 @@ def async_grpo_train(
             log_data["advantages"] = train_data["advantages"].tolist()
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+            _add_decoded_rollout_text(log_data, tokenizer)
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{step + 1}.jsonl"
             )

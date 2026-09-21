@@ -143,12 +143,12 @@ def _maybe_patch_domyn_edge_activation_checkpointing(
     named `mlp`/`self_attn`/`input_layernorm`/`post_attention_layernorm`
     (Llama-style naming). DomynEdge's real attribute names are `attention`/
     `feedforward`/`pre_attention_norm`/`post_attention_norm`/
-    `pre_feedforward_norm`/`post_feedforward_norm` — silent no-op for this 
+    `pre_feedforward_norm`/`post_feedforward_norm` — silent no-op for this
     model.
 
     A property-based attribute-aliasing approach (making `layer.self_attn`
     resolve to `layer.attention`) does NOT work here. Patches `forward`
-    directly instead, wrapping the attention and feedforward sub-blocks 
+    directly instead, wrapping the attention and feedforward sub-blocks
     in `torch.utils.checkpoint.checkpoint`.
 
     Must run AFTER `from_pretrained`, on the model's ACTUAL runtime layer
@@ -224,13 +224,17 @@ def _maybe_patch_domyn_edge_varlen_attn(model_config) -> None:
 
     original_varlen_attn = torch.nn.attention.varlen.varlen_attn
 
-    def _varlen_attn_compat(query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, *args, **kwargs):
+    def _varlen_attn_compat(
+        query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, *args, **kwargs
+    ):
         if "scale" in kwargs or "window_size" in kwargs or "enable_gqa" in kwargs:
             import flash_attn
 
             scale = kwargs.pop("scale", None)
             window_size = kwargs.pop("window_size", (-1, -1))
-            kwargs.pop("enable_gqa", None)  # flash-attn auto-detects GQA from q/k head-count mismatch
+            kwargs.pop(
+                "enable_gqa", None
+            )  # flash-attn auto-detects GQA from q/k head-count mismatch
             return flash_attn.flash_attn_varlen_func(
                 query,
                 key,
@@ -244,7 +248,9 @@ def _maybe_patch_domyn_edge_varlen_attn(model_config) -> None:
                 causal=True,
                 **kwargs,
             )
-        return original_varlen_attn(query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, *args, **kwargs)
+        return original_varlen_attn(
+            query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, *args, **kwargs
+        )
 
     torch.nn.attention.varlen.varlen_attn = _varlen_attn_compat
 
@@ -349,7 +355,9 @@ def _maybe_patch_domyn_edge_attention_head_sharding(model_config) -> None:
     def _is_head_sharded_compat(model_parallel_plan):
         aliased = dict(model_parallel_plan)
         for key, style in model_parallel_plan.items():
-            if key.endswith(("attention.q_proj", "attention.k_proj", "attention.v_proj")):
+            if key.endswith(
+                ("attention.q_proj", "attention.k_proj", "attention.v_proj")
+            ):
                 aliased[key.replace("attention.", "self_attn.", 1)] = style
         return original_is_head_sharded(aliased)
 
@@ -399,7 +407,7 @@ def get_domyn_edge_tp_plan(sequence_parallel: bool = False) -> dict:
 
     class _SequenceParallelNormWithFullOutput(SequenceParallel):
         """Custom SequenceParallel for DomynEdge.
-        
+
         Like SequenceParallel, but the module's output is redistributed
         to a genuine full (Replicate) tensor via an actual all-gather,
         instead of SequenceParallel's own to_local().
@@ -407,7 +415,9 @@ def get_domyn_edge_tp_plan(sequence_parallel: bool = False) -> dict:
 
         def _apply(self, module, device_mesh):
             def _prepare_full_output_fn(mod, outputs, device_mesh):
-                return outputs.full_tensor() if isinstance(outputs, DTensor) else outputs
+                return (
+                    outputs.full_tensor() if isinstance(outputs, DTensor) else outputs
+                )
 
             return distribute_module(
                 module,
@@ -760,12 +770,15 @@ def setup_distributed(
     # branch `_get_parallel_plan` already supports) so SP actually reaches
     # it instead of always silently getting the `sequence_parallel=False`
     # default.
-    if tp_plan == f"{get_domyn_edge_tp_plan.__module__}.{get_domyn_edge_tp_plan.__qualname__}":
+    if (
+        tp_plan
+        == f"{get_domyn_edge_tp_plan.__module__}.{get_domyn_edge_tp_plan.__qualname__}"
+    ):
         tp_plan = get_domyn_edge_tp_plan(sequence_parallel=sequence_parallel_enabled)
 
     # dtype each FSDP2-wrapped module's *output* gets cast to, on top of
     # param_dtype's compute dtype -- YAML-configurable: None is the
-    # recommended default, no forced cast. The places that actually need fp32 
+    # recommended default, no forced cast. The places that actually need fp32
     # (log_softmax/loss computation) already upcast explicitly themselves.
     output_dtype_cfg = config["dtensor_cfg"].get("output_dtype", None)
     if isinstance(output_dtype_cfg, str):
@@ -1004,6 +1017,11 @@ def setup_model_and_optimizer(
         **from_pretrained_kwargs,
         **automodel_kwargs,
     )
+
+    # Width of the vocab the training loss covered
+    trained_vocab_size = config.get("trained_vocab_size")
+    if trained_vocab_size is not None:
+        model.config.trained_vocab_size = trained_vocab_size
 
     _maybe_patch_domyn_edge_varlen_attn(model_config)
     _maybe_patch_domyn_edge_skip_lm_head_support(model)

@@ -78,7 +78,7 @@ def model_forward(
         allow_flash_attn_args: Whether to pass flash_attn_kwargs to model
         skip_lm_head: If True, run the model's normal (properly FSDP2-wrapped)
             forward but abort it via a forward-pre-hook on ``lm_head`` right
-            before its matmul, returning hidden states instead of logits. Only 
+            before its matmul, returning hidden states instead of logits. Only
             valid for models exposing a HF-style ``.model``/``.lm_head`` split.
 
     Returns:
@@ -227,6 +227,19 @@ def compute_fused_ce_next_token_logprobs(
     weight = lm_head.weight
     if isinstance(weight, DTensor):
         weight = weight.full_tensor()
+
+    # Keep the training-time softmax denominator identical to the one vLLM samples from.
+    # DomynEdgeForCausalLM masks generation logits to config.trained_vocab_size
+    trained_vocab_size = getattr(model.config, "trained_vocab_size", None)
+    if trained_vocab_size is not None and trained_vocab_size < weight.shape[0]:
+        if int(targets_max := input_ids.max()) >= trained_vocab_size:
+            raise ValueError(
+                f"Token id {targets_max} is at or beyond trained_vocab_size "
+                f"({trained_vocab_size}); it cannot be scored against the masked "
+                "vocab. This usually means the trajectory was generated before "
+                "the generation-side mask was in place."
+            )
+        weight = weight[:trained_vocab_size]
     bias = getattr(lm_head, "bias", None)
     if isinstance(bias, DTensor):
         bias = bias.full_tensor()
@@ -768,6 +781,8 @@ class LogprobsPostProcessor:
         self.use_linear_ce_fusion = bool(
             "dtensor_cfg" in cfg and cfg["dtensor_cfg"].get("use_linear_ce_fusion_loss")
         )
+        # Width of the vocab the training loss covered; None = no masking.
+        self.trained_vocab_size = cfg.get("trained_vocab_size")
 
     def __call__(
         self,
@@ -799,9 +814,18 @@ class LogprobsPostProcessor:
                 "linear CE fusion does not support context parallelism."
             )
 
+        if not self.use_linear_ce_fusion and self.trained_vocab_size is not None:
+            # Same masking the fused path applies by slicing lm_head.weight, and
+            # that DomynEdgeForCausalLM applies to generation via
+            # LogitsProcessor(org_vocab_size=...). Here the full [B, S, V] logits
+            # already exist, so the slice is direct. Keeping all three in sync is
+            # what keeps the training and sampling softmax denominators equal.
+            if logits.shape[-1] > self.trained_vocab_size:
+                logits = logits[..., : self.trained_vocab_size]
+
         if self.use_linear_ce_fusion:
             # `logits` already holds precomputed next-token logprobs, shape
-            # [B, S-1] -- the full [B, S, V] logits tensor was never materialized, 
+            # [B, S-1] -- the full [B, S, V] logits tensor was never materialized,
             # so there is nothing left to gather/chunk here. Skip straight to the
             # shared zero-prepend + packing/masking tail below.
             token_logprobs = logits

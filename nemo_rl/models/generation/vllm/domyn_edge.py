@@ -306,9 +306,13 @@ class DomynEdgeForCausalLM(
         else:
             self.lm_head = vllm.model_executor.models.utils.PPMissingLayer()
 
+        # org_vocab_size truncates gathered logits to the vocab the training actually covered
+        trained_vocab_size = (
+            getattr(config, "trained_vocab_size", None) or config.vocab_size
+        )
         self.logits_processor = (
             vllm.model_executor.layers.logits_processor.LogitsProcessor(
-                config.vocab_size
+                config.vocab_size, org_vocab_size=trained_vocab_size
             )
         )
 
