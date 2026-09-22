@@ -205,6 +205,64 @@ def _maybe_patch_domyn_edge_activation_checkpointing(
         layer_cls._activation_checkpointing_patched = True
 
 
+def _maybe_patch_domyn_edge_rope_autocast(model) -> None:
+    """Forces DomynEdge's RoPE frequency computation to run outside autocast.
+
+    DomynEdgeRotaryEmbedding.forward computes
+
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+
+    The `.float()` calls do NOT survive autocast: torch.autocast overrides the input dtypes
+    of matmul, so under a bf16 autocast region this product is evaluated in bf16. bf16 has
+    8 mantissa bits, so position ids above 255 are not exactly representable -- the ulp
+    doubles at every power of two, reaching 64 at position 16384 and 128 near 32767. The
+    RoPE angles are therefore quantized progressively harder the deeper into a sequence you
+    go, and the model's attention degrades with position.
+
+    Upstream transformers guards against exactly this; see modeling_llama.py, which wraps
+    the same three lines in `maybe_autocast(device_type=..., enabled=False)  # Force
+    float32`. DomynEdge's trust_remote_code modeling file simply omits that guard, so the
+    bug only appears where the model is run under autocast -- which is the training path
+    (fp32 master weights + bf16 autocast) and not vLLM (pure bf16).
+
+    Impact before this patch: the policy's own logprobs were wrong by ~2 nats on average,
+    worsening from -1.25 in the first decile of a sequence to -3.58 in the last against a
+    true value flat at -0.60. That is what drove gen_kl_error to ~2.0-2.5 against the ~1e-3
+    that docs/guides/grpo.md calls acceptable, and it made every importance-sampling ratio
+    in GRPO wrong (run 58360729 reached losses of -127 by step 15).
+
+    Verified by replaying a real training step's inputs: fp32+autocast reproduces the
+    worker to within 0.0008, while pure bf16 and pure fp32 both reproduce vLLM. No-op for
+    every other model.
+    """
+    architectures = (
+        getattr(getattr(model, "config", None), "architectures", None) or []
+    )
+    if not architectures or architectures[0] != "DomynEdgeForCausalLM":
+        return
+
+    rotary = getattr(getattr(model, "model", None), "rotary_emb", None)
+    if rotary is None:
+        return
+
+    rotary_cls = type(rotary)
+    if getattr(rotary_cls, "_domyn_edge_rope_autocast_patched", False):
+        return
+
+    original_forward = rotary_cls.forward
+
+    @torch.no_grad()
+    def _forward_no_autocast(self, x, position_ids):
+        device_type = x.device.type
+        if not isinstance(device_type, str) or device_type == "mps":
+            device_type = "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            return original_forward(self, x, position_ids)
+
+    rotary_cls.forward = _forward_no_autocast
+    rotary_cls._domyn_edge_rope_autocast_patched = True
+
+
 def _maybe_patch_domyn_edge_varlen_attn(model_config) -> None:
     """Monkeypatches torch.nn.attention.varlen.varlen_attn for DomynEdge.
 
@@ -1024,6 +1082,7 @@ def setup_model_and_optimizer(
         model.config.trained_vocab_size = trained_vocab_size
 
     _maybe_patch_domyn_edge_varlen_attn(model_config)
+    _maybe_patch_domyn_edge_rope_autocast(model)
     _maybe_patch_domyn_edge_skip_lm_head_support(model)
     _maybe_patch_domyn_edge_activation_checkpointing(
         model, config["dtensor_cfg"]["activation_checkpointing"]
