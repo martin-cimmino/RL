@@ -224,20 +224,8 @@ def _maybe_patch_domyn_edge_rope_autocast(model) -> None:
     float32`. DomynEdge's trust_remote_code modeling file simply omits that guard, so the
     bug only appears where the model is run under autocast -- which is the training path
     (fp32 master weights + bf16 autocast) and not vLLM (pure bf16).
-
-    Impact before this patch: the policy's own logprobs were wrong by ~2 nats on average,
-    worsening from -1.25 in the first decile of a sequence to -3.58 in the last against a
-    true value flat at -0.60. That is what drove gen_kl_error to ~2.0-2.5 against the ~1e-3
-    that docs/guides/grpo.md calls acceptable, and it made every importance-sampling ratio
-    in GRPO wrong (run 58360729 reached losses of -127 by step 15).
-
-    Verified by replaying a real training step's inputs: fp32+autocast reproduces the
-    worker to within 0.0008, while pure bf16 and pure fp32 both reproduce vLLM. No-op for
-    every other model.
     """
-    architectures = (
-        getattr(getattr(model, "config", None), "architectures", None) or []
-    )
+    architectures = getattr(getattr(model, "config", None), "architectures", None) or []
     if not architectures or architectures[0] != "DomynEdgeForCausalLM":
         return
 
