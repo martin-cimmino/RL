@@ -106,7 +106,6 @@ def calculate_baseline_and_std_per_prompt(
     unique_prompts = torch.unique(prompts, dim=0)
 
     baseline = torch.zeros_like(rewards)
-    sq_baseline = torch.zeros_like(rewards)
     std = torch.zeros_like(rewards)
     device_ordinal = rewards.get_device()
     if device_ordinal == -1:
@@ -141,24 +140,34 @@ def calculate_baseline_and_std_per_prompt(
                 )
                 / num_valid
             )
-            prompt_baseline_square = (
-                torch.matmul(
-                    baseline_mask_matrix,
-                    torch.pow(rewards[prompt_idx], 2) * valid_mask[prompt_idx],
+            # Two-pass variance: centre each baseline set on its OWN mean before
+            # squaring. The algebraically equivalent E[r^2] - E[r]^2 form used
+            # previously is not numerically stable
+            deviations = rewards[prompt_idx].unsqueeze(0) - prompt_baseline.unsqueeze(1)
+            weighted_sq_deviations = (
+                deviations.square()
+                * valid_mask[prompt_idx].unsqueeze(0)
+                * baseline_mask_matrix
+            )
+            bessel_denominator = num_valid - 1
+            if bessel_denominator > 0:
+                prompt_std = (
+                    (weighted_sq_deviations.sum(dim=1) / bessel_denominator)
+                    .clamp(min=0)
+                    .sqrt()
+                    .nan_to_num(0)
                 )
-                / num_valid
+            else:
+                prompt_std = torch.zeros_like(prompt_baseline)
+            reward_scale = rewards[prompt_idx].abs().max()
+            prompt_std = torch.where(
+                prompt_std < 1e-5 * reward_scale,
+                torch.zeros_like(prompt_std),
+                prompt_std,
             )
 
             baseline[prompt_idx] = prompt_baseline
-            sq_baseline[prompt_idx] = prompt_baseline_square
-            std[prompt_idx] = (
-                (
-                    (prompt_baseline_square - prompt_baseline.square())
-                    * (num_valid / (num_valid - 1))
-                )
-                .sqrt()
-                .nan_to_num(0)
-            )
+            std[prompt_idx] = prompt_std
 
     return baseline, std
 
