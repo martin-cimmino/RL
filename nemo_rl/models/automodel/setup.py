@@ -301,6 +301,96 @@ def _maybe_patch_domyn_edge_varlen_attn(model_config) -> None:
     torch.nn.attention.varlen.varlen_attn = _varlen_attn_compat
 
 
+def _maybe_patch_domyn_edge_packed_attention(model) -> None:
+    """Makes DomynEdge's attention honour flash_attn_kwargs, enabling sequence packing.
+
+    Without this, the packed row is attended as ONE contiguous sequence and tokens
+    from one rollout attend causally to a different rollout's tokens.
+    """
+    architectures = getattr(getattr(model, "config", None), "architectures", None) or []
+    if not architectures or architectures[0] != "DomynEdgeForCausalLM":
+        return
+
+    layers = model.model.layers
+    if isinstance(layers, torch.nn.ModuleDict):
+        layers = list(layers.values())
+    layers = list(layers)
+    if not layers:
+        return
+    cls = type(layers[0].attention)
+    if getattr(cls, "_packed_attention_patched", False):
+        return
+
+    original_forward = cls.forward
+
+    def _packed_forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        attention_mask=None,
+        past_key_values=None,
+        **kwargs,
+    ):
+        flash_attn_kwargs = kwargs.pop("flash_attn_kwargs", None)
+        if flash_attn_kwargs is None:
+            return original_forward(
+                self,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values,
+                **kwargs,
+            )
+
+        if hasattr(flash_attn_kwargs, "cu_seqlens_q"):
+            cu_source = flash_attn_kwargs.cu_seqlens_q
+        else:
+            cu_source = flash_attn_kwargs["cu_seqlens_q"]
+
+        import torch.nn.attention.varlen as _varlen
+
+        current = _varlen.varlen_attn
+
+        def _segmented_varlen_attn(
+            query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, *args, **kw
+        ):
+            total = query.shape[0]
+            cu = cu_source.to(device=query.device, dtype=torch.int32)
+            covered = int(cu[-1].item())
+            assert covered <= total, (
+                f"cu_seqlens cover {covered} tokens but the attention input has "
+                f"only {total}. The packed row and flash_attn_kwargs disagree."
+            )
+            if covered < total:
+                cu = torch.cat(
+                    [
+                        cu,
+                        torch.tensor([total], device=cu.device, dtype=torch.int32),
+                    ]
+                )
+            max_seqlen = int((cu[1:] - cu[:-1]).max().item())
+            return current(
+                query, key, value, cu, cu, max_seqlen, max_seqlen, *args, **kw
+            )
+
+        _varlen.varlen_attn = _segmented_varlen_attn
+        try:
+            # attention_mask is passed through untouched.
+            return original_forward(
+                self,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values,
+                **kwargs,
+            )
+        finally:
+            _varlen.varlen_attn = current
+
+    cls.forward = _packed_forward
+    cls._packed_attention_patched = True
+
+
 class _SkipLMHeadSignal(Exception):
     """Raised from a lm_head forward-pre-hook to abort a forward pass early.
 
@@ -1070,6 +1160,7 @@ def setup_model_and_optimizer(
         model.config.trained_vocab_size = trained_vocab_size
 
     _maybe_patch_domyn_edge_varlen_attn(model_config)
+    _maybe_patch_domyn_edge_packed_attention(model)
     _maybe_patch_domyn_edge_rope_autocast(model)
     _maybe_patch_domyn_edge_skip_lm_head_support(model)
     _maybe_patch_domyn_edge_activation_checkpointing(
