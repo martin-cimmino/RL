@@ -47,16 +47,27 @@ class DomynEdgeConfig(PretrainedConfig):
         pad_token_id: int | None = None,
         bos_token_id: int | None = None,
         eos_token_id: int | None = None,
+        trained_vocab_size: int | None = None,
         **kwargs,
     ):
         if position_layers is None:
-            position_layers = ["nope", "nope"] + ["rope", "rope", "rope", "nope"] * 8 + ["nope", "nope"]
+            position_layers = (
+                ["nope", "nope"]
+                + ["rope", "rope", "rope", "nope"] * 8
+                + ["nope", "nope"]
+            )
         if window_sizes is None:
-            window_sizes = [(-1, 0), (-1, 0)] + [(1024, 0), (1024, 0), (1024, 0), (-1, 0)] * 8 + [(-1, 0), (-1, 0)]
+            window_sizes = (
+                [(-1, 0), (-1, 0)]
+                + [(1024, 0), (1024, 0), (1024, 0), (-1, 0)] * 8
+                + [(-1, 0), (-1, 0)]
+            )
         if head_sizes is None:
             head_sizes = [256, 256] + [64, 64, 64, 256] * 8 + [256, 256]
 
         self.vocab_size = vocab_size
+        # Number of vocab entries the training loss actually covered.
+        self.trained_vocab_size = trained_vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -84,7 +95,9 @@ class DomynEdgeConfig(PretrainedConfig):
                 f"Length of position_layers ({len(self.position_layers)}) must equal num_hidden_layers ({self.num_hidden_layers})"
             )
         if any(pl not in ("rope", "nope") for pl in self.position_layers):
-            raise ValueError(f"position_layers must be one of 'rope', 'nope'. Got {self.position_layers}")
+            raise ValueError(
+                f"position_layers must be one of 'rope', 'nope'. Got {self.position_layers}"
+            )
         if len(self.window_sizes) != self.num_hidden_layers:
             raise ValueError(
                 f"Length of window_sizes ({len(self.window_sizes)}) must equal num_hidden_layers ({self.num_hidden_layers})"
@@ -97,9 +110,13 @@ class DomynEdgeConfig(PretrainedConfig):
             raise ValueError(f"head_sizes must be a list of integers. Got {head_sizes}")
 
         # All RoPE layers must share a single head size (the rotary dimension).
-        rope_dims = [hs for pl, hs in zip(self.position_layers, self.head_sizes) if pl == "rope"]
+        rope_dims = [
+            hs for pl, hs in zip(self.position_layers, self.head_sizes) if pl == "rope"
+        ]
         if len(set(rope_dims)) > 1:
-            raise ValueError(f"All rope layers must have the same head size. Got {rope_dims}")
+            raise ValueError(
+                f"All rope layers must have the same head size. Got {rope_dims}"
+            )
         self.rope_dim = rope_dims[0] if rope_dims else None
 
         # Normalize rope_parameters to a plain dict. vLLM's get_rope() reads

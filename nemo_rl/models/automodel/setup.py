@@ -143,12 +143,12 @@ def _maybe_patch_domyn_edge_activation_checkpointing(
     named `mlp`/`self_attn`/`input_layernorm`/`post_attention_layernorm`
     (Llama-style naming). DomynEdge's real attribute names are `attention`/
     `feedforward`/`pre_attention_norm`/`post_attention_norm`/
-    `pre_feedforward_norm`/`post_feedforward_norm` — silent no-op for this 
+    `pre_feedforward_norm`/`post_feedforward_norm` — silent no-op for this
     model.
 
     A property-based attribute-aliasing approach (making `layer.self_attn`
     resolve to `layer.attention`) does NOT work here. Patches `forward`
-    directly instead, wrapping the attention and feedforward sub-blocks 
+    directly instead, wrapping the attention and feedforward sub-blocks
     in `torch.utils.checkpoint.checkpoint`.
 
     Must run AFTER `from_pretrained`, on the model's ACTUAL runtime layer
@@ -205,6 +205,52 @@ def _maybe_patch_domyn_edge_activation_checkpointing(
         layer_cls._activation_checkpointing_patched = True
 
 
+def _maybe_patch_domyn_edge_rope_autocast(model) -> None:
+    """Forces DomynEdge's RoPE frequency computation to run outside autocast.
+
+    DomynEdgeRotaryEmbedding.forward computes
+
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+
+    The `.float()` calls do NOT survive autocast: torch.autocast overrides the input dtypes
+    of matmul, so under a bf16 autocast region this product is evaluated in bf16. bf16 has
+    8 mantissa bits, so position ids above 255 are not exactly representable -- the ulp
+    doubles at every power of two, reaching 64 at position 16384 and 128 near 32767. The
+    RoPE angles are therefore quantized progressively harder the deeper into a sequence you
+    go, and the model's attention degrades with position.
+
+    Upstream transformers guards against exactly this; see modeling_llama.py, which wraps
+    the same three lines in `maybe_autocast(device_type=..., enabled=False)  # Force
+    float32`. DomynEdge's trust_remote_code modeling file simply omits that guard, so the
+    bug only appears where the model is run under autocast -- which is the training path
+    (fp32 master weights + bf16 autocast) and not vLLM (pure bf16).
+    """
+    architectures = getattr(getattr(model, "config", None), "architectures", None) or []
+    if not architectures or architectures[0] != "DomynEdgeForCausalLM":
+        return
+
+    rotary = getattr(getattr(model, "model", None), "rotary_emb", None)
+    if rotary is None:
+        return
+
+    rotary_cls = type(rotary)
+    if getattr(rotary_cls, "_domyn_edge_rope_autocast_patched", False):
+        return
+
+    original_forward = rotary_cls.forward
+
+    @torch.no_grad()
+    def _forward_no_autocast(self, x, position_ids):
+        device_type = x.device.type
+        if not isinstance(device_type, str) or device_type == "mps":
+            device_type = "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            return original_forward(self, x, position_ids)
+
+    rotary_cls.forward = _forward_no_autocast
+    rotary_cls._domyn_edge_rope_autocast_patched = True
+
+
 def _maybe_patch_domyn_edge_varlen_attn(model_config) -> None:
     """Monkeypatches torch.nn.attention.varlen.varlen_attn for DomynEdge.
 
@@ -224,13 +270,17 @@ def _maybe_patch_domyn_edge_varlen_attn(model_config) -> None:
 
     original_varlen_attn = torch.nn.attention.varlen.varlen_attn
 
-    def _varlen_attn_compat(query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, *args, **kwargs):
+    def _varlen_attn_compat(
+        query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, *args, **kwargs
+    ):
         if "scale" in kwargs or "window_size" in kwargs or "enable_gqa" in kwargs:
             import flash_attn
 
             scale = kwargs.pop("scale", None)
             window_size = kwargs.pop("window_size", (-1, -1))
-            kwargs.pop("enable_gqa", None)  # flash-attn auto-detects GQA from q/k head-count mismatch
+            kwargs.pop(
+                "enable_gqa", None
+            )  # flash-attn auto-detects GQA from q/k head-count mismatch
             return flash_attn.flash_attn_varlen_func(
                 query,
                 key,
@@ -244,9 +294,101 @@ def _maybe_patch_domyn_edge_varlen_attn(model_config) -> None:
                 causal=True,
                 **kwargs,
             )
-        return original_varlen_attn(query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, *args, **kwargs)
+        return original_varlen_attn(
+            query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, *args, **kwargs
+        )
 
     torch.nn.attention.varlen.varlen_attn = _varlen_attn_compat
+
+
+def _maybe_patch_domyn_edge_packed_attention(model) -> None:
+    """Makes DomynEdge's attention honour flash_attn_kwargs, enabling sequence packing.
+
+    Without this, the packed row is attended as ONE contiguous sequence and tokens
+    from one rollout attend causally to a different rollout's tokens.
+    """
+    architectures = getattr(getattr(model, "config", None), "architectures", None) or []
+    if not architectures or architectures[0] != "DomynEdgeForCausalLM":
+        return
+
+    layers = model.model.layers
+    if isinstance(layers, torch.nn.ModuleDict):
+        layers = list(layers.values())
+    layers = list(layers)
+    if not layers:
+        return
+    cls = type(layers[0].attention)
+    if getattr(cls, "_packed_attention_patched", False):
+        return
+
+    original_forward = cls.forward
+
+    def _packed_forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        attention_mask=None,
+        past_key_values=None,
+        **kwargs,
+    ):
+        flash_attn_kwargs = kwargs.pop("flash_attn_kwargs", None)
+        if flash_attn_kwargs is None:
+            return original_forward(
+                self,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values,
+                **kwargs,
+            )
+
+        if hasattr(flash_attn_kwargs, "cu_seqlens_q"):
+            cu_source = flash_attn_kwargs.cu_seqlens_q
+        else:
+            cu_source = flash_attn_kwargs["cu_seqlens_q"]
+
+        import torch.nn.attention.varlen as _varlen
+
+        current = _varlen.varlen_attn
+
+        def _segmented_varlen_attn(
+            query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, *args, **kw
+        ):
+            total = query.shape[0]
+            cu = cu_source.to(device=query.device, dtype=torch.int32)
+            covered = int(cu[-1].item())
+            assert covered <= total, (
+                f"cu_seqlens cover {covered} tokens but the attention input has "
+                f"only {total}. The packed row and flash_attn_kwargs disagree."
+            )
+            if covered < total:
+                cu = torch.cat(
+                    [
+                        cu,
+                        torch.tensor([total], device=cu.device, dtype=torch.int32),
+                    ]
+                )
+            max_seqlen = int((cu[1:] - cu[:-1]).max().item())
+            return current(
+                query, key, value, cu, cu, max_seqlen, max_seqlen, *args, **kw
+            )
+
+        _varlen.varlen_attn = _segmented_varlen_attn
+        try:
+            # attention_mask is passed through untouched.
+            return original_forward(
+                self,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values,
+                **kwargs,
+            )
+        finally:
+            _varlen.varlen_attn = current
+
+    cls.forward = _packed_forward
+    cls._packed_attention_patched = True
 
 
 class _SkipLMHeadSignal(Exception):
@@ -349,7 +491,9 @@ def _maybe_patch_domyn_edge_attention_head_sharding(model_config) -> None:
     def _is_head_sharded_compat(model_parallel_plan):
         aliased = dict(model_parallel_plan)
         for key, style in model_parallel_plan.items():
-            if key.endswith(("attention.q_proj", "attention.k_proj", "attention.v_proj")):
+            if key.endswith(
+                ("attention.q_proj", "attention.k_proj", "attention.v_proj")
+            ):
                 aliased[key.replace("attention.", "self_attn.", 1)] = style
         return original_is_head_sharded(aliased)
 
@@ -399,7 +543,7 @@ def get_domyn_edge_tp_plan(sequence_parallel: bool = False) -> dict:
 
     class _SequenceParallelNormWithFullOutput(SequenceParallel):
         """Custom SequenceParallel for DomynEdge.
-        
+
         Like SequenceParallel, but the module's output is redistributed
         to a genuine full (Replicate) tensor via an actual all-gather,
         instead of SequenceParallel's own to_local().
@@ -407,7 +551,9 @@ def get_domyn_edge_tp_plan(sequence_parallel: bool = False) -> dict:
 
         def _apply(self, module, device_mesh):
             def _prepare_full_output_fn(mod, outputs, device_mesh):
-                return outputs.full_tensor() if isinstance(outputs, DTensor) else outputs
+                return (
+                    outputs.full_tensor() if isinstance(outputs, DTensor) else outputs
+                )
 
             return distribute_module(
                 module,
@@ -760,12 +906,15 @@ def setup_distributed(
     # branch `_get_parallel_plan` already supports) so SP actually reaches
     # it instead of always silently getting the `sequence_parallel=False`
     # default.
-    if tp_plan == f"{get_domyn_edge_tp_plan.__module__}.{get_domyn_edge_tp_plan.__qualname__}":
+    if (
+        tp_plan
+        == f"{get_domyn_edge_tp_plan.__module__}.{get_domyn_edge_tp_plan.__qualname__}"
+    ):
         tp_plan = get_domyn_edge_tp_plan(sequence_parallel=sequence_parallel_enabled)
 
     # dtype each FSDP2-wrapped module's *output* gets cast to, on top of
     # param_dtype's compute dtype -- YAML-configurable: None is the
-    # recommended default, no forced cast. The places that actually need fp32 
+    # recommended default, no forced cast. The places that actually need fp32
     # (log_softmax/loss computation) already upcast explicitly themselves.
     output_dtype_cfg = config["dtensor_cfg"].get("output_dtype", None)
     if isinstance(output_dtype_cfg, str):
@@ -1005,7 +1154,14 @@ def setup_model_and_optimizer(
         **automodel_kwargs,
     )
 
+    # Width of the vocab the training loss covered
+    trained_vocab_size = config.get("trained_vocab_size")
+    if trained_vocab_size is not None:
+        model.config.trained_vocab_size = trained_vocab_size
+
     _maybe_patch_domyn_edge_varlen_attn(model_config)
+    _maybe_patch_domyn_edge_packed_attention(model)
+    _maybe_patch_domyn_edge_rope_autocast(model)
     _maybe_patch_domyn_edge_skip_lm_head_support(model)
     _maybe_patch_domyn_edge_activation_checkpointing(
         model, config["dtensor_cfg"]["activation_checkpointing"]
