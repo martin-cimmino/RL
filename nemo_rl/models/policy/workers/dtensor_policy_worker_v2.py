@@ -1062,6 +1062,22 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
     def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
         model = self.move_buffer_to_device(model, device)
+        device = torch.device(device)
+        # Skip the (redundant) model.to(device) call when parameters are
+        # already on the target device. FSDP2's reset_sharded_param() fails
+        # on tied, DTensor-sharded parameters (e.g. DomynEdge's tied
+        # lm_head.weight/embed_tokens.weight under tensor_parallel_size > 1)
+        # even when the .to() call is a genuine no-op (pytorch/pytorch#151085).
+        # Automodel's apply_model_infrastructure has an analogous skip for its
+        # one-time post-checkpoint-load call; this covers this worker's own
+        # recurring runtime call sites (prepare_for_training/
+        # prepare_for_lp_inference), which Automodel's fix doesn't reach.
+        # Buffers are already moved above via swap_tensors, which doesn't hit
+        # this bug, so a real cross-device transfer (offload_after_refit,
+        # cpu_offload=true paths) still needs the .to() call below.
+        first_param = next(model.parameters(), None)
+        if first_param is not None and first_param.device.type == device.type:
+            return model
         return model.to(device)
 
     def move_buffer_to_device(
