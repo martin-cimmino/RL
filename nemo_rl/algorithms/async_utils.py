@@ -21,6 +21,7 @@
 
 import threading as _threading
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import ray
@@ -38,6 +39,24 @@ from nemo_rl.experience.rollouts import (
 from nemo_rl.models.generation.interfaces import GenerationInterface
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+@dataclass
+class _TargetSlots:
+    """Per-target-weight bookkeeping of prompt-group slots in the collector.
+
+    A target weight version needs exactly num_prompts_per_step accepted groups.
+    A slot is taken when a prompt group is launched for the target and settled
+    when the group is either pushed to the replay buffer (accepted) or dropped
+    by dynamic sampling (discarded), which re-opens the slot for a new prompt.
+    """
+
+    accepted: int = 0
+    inflight: int = 0
+    launched: int = 0
+    discarded: int = 0
+    generated_samples: int = 0
+    generated_reward_sum: float = 0.0
 
 
 @ray.remote  # pragma: no cover
@@ -278,10 +297,6 @@ class AsyncTrajectoryCollector:
         # Track when generation limits cause collection to pause
         self._last_limit_warning_version = None
 
-        # Event to signal when generation limits are cleared (more efficient than polling)
-        self._generation_limit_cleared = _threading.Event()
-        self._generation_limit_cleared.set()  # Start in cleared state
-
         # Track threads
         self._inflight_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
@@ -296,8 +311,25 @@ class AsyncTrajectoryCollector:
 
         # Simple lock to prevent race conditions when checking/spawning workers
         self._generation_check_lock: _threading.Lock = _threading.Lock()
-        # Track which target weights are currently being generated (globally)
-        self._generating_targets: set[int] = set()
+        # Signalled whenever a slot may have opened: a group settled, the weight
+        # version advanced, or collection stopped.
+        self._slot_cv = _threading.Condition(self._generation_check_lock)
+        # Slot bookkeeping per target weight version, guarded by _slot_cv.
+        self._target_slots: dict[int, _TargetSlots] = {}
+
+        grpo_cfg = self.master_config["grpo"]
+        self._groups_per_target = int(grpo_cfg["num_prompts_per_step"])
+        # Dynamic sampling (DAPO): drop prompt groups whose rewards are all
+        # equal, since they carry zero advantage, and generate a replacement
+        # prompt for the same target. After dynamic_sampling_max_gen_batches *
+        # num_prompts_per_step launches for one target, remaining groups are
+        # accepted unfiltered so training cannot stall on a hard/easy stretch.
+        self._use_dynamic_sampling = bool(grpo_cfg["use_dynamic_sampling"])
+        self._max_filtered_launches_per_target = (
+            self._groups_per_target * int(grpo_cfg["dynamic_sampling_max_gen_batches"])
+            if self._use_dynamic_sampling
+            else 0
+        )
 
         # Track current epoch for checkpointing (0 means not started)
         self.current_epoch: int = 0
@@ -331,61 +363,104 @@ class AsyncTrajectoryCollector:
 
         return [generation_weight_version + i for i in range(1, max_trajectory_age + 1)]
 
-    def _get_next_target_for_generation(
-        self, generation_weight_version: int
-    ) -> Optional[int]:
-        """Get the next target weight that needs generation (if any)."""
-        target_weights = self._calculate_target_weights(generation_weight_version)
-        last_target_weight_already_generated = ray.get(
-            self.replay_buffer.get_last_target_weight_already_generated.remote()
+    def _find_open_target(self) -> Optional[int]:
+        """Return the lowest target weight with an open slot, or None.
+
+        Caller must hold self._slot_cv. Candidates are the targets reachable from
+        the current weight version plus any not-yet-consumed target that is still
+        short of groups (e.g. after dynamic sampling discarded some of them, the
+        trainer may already be waiting on that target).
+        """
+        candidates = set(self._calculate_target_weights(self.current_weight_version))
+        candidates.update(
+            t for t in self._target_slots if t >= self.current_weight_version
         )
-
-        with self._generation_check_lock:
-            for target_weight in target_weights:
-                if (
-                    target_weight > last_target_weight_already_generated
-                    and target_weight not in self._generating_targets
-                ):
-                    self._generating_targets.add(target_weight)
-                    print(f"🎯 Reserved target weight {target_weight} for generation")
-                    return target_weight
-
+        for target_weight in sorted(candidates):
+            slots = self._target_slots.get(target_weight)
+            if slots is None or (
+                slots.accepted + slots.inflight < self._groups_per_target
+            ):
+                return target_weight
         return None
 
+    def _reserve_slot(self) -> Optional[tuple[int, bool]]:
+        """Block until some target weight has an open slot, then take it.
+
+        Returns:
+            (target_weight, filterable), where filterable says whether dynamic
+            sampling may discard this group, or None if collection stopped.
+        """
+        with self._slot_cv:
+            while self.running:
+                target_weight = self._find_open_target()
+                if target_weight is not None:
+                    slots = self._target_slots.setdefault(target_weight, _TargetSlots())
+                    slots.inflight += 1
+                    slots.launched += 1
+                    filterable = (
+                        self._use_dynamic_sampling
+                        and slots.launched <= self._max_filtered_launches_per_target
+                    )
+                    return target_weight, filterable
+
+                if self._last_limit_warning_version != self.current_weight_version:
+                    print(
+                        f"⏸️ Pausing collection: all target weights reachable from weight version "
+                        f"{self.current_weight_version} are fully generated or in progress. Waiting..."
+                    )
+                    self._last_limit_warning_version = self.current_weight_version
+                # Timeout so a stop request is noticed even without a notify.
+                self._slot_cv.wait(timeout=1.0)
+        return None
+
+    def _settle_slot(
+        self, target_weight: int, *, accepted: bool, discarded: bool
+    ) -> None:
+        """Release an in-flight slot of target_weight and wake waiting launchers."""
+        with self._slot_cv:
+            slots = self._target_slots.get(target_weight)
+            if slots is None:
+                # Already consumed and forgotten: the push landed and the trainer
+                # moved past this target before the slot was settled.
+                return
+            slots.inflight -= 1
+            if accepted:
+                slots.accepted += 1
+            if discarded:
+                slots.discarded += 1
+            self._slot_cv.notify_all()
+
+    def get_target_stats(self, target_weight: int) -> dict[str, float]:
+        """Return generation statistics for a consumed target weight.
+
+        Called by the trainer after it sampled the groups of target_weight, when
+        no more generation for that target can happen. The entry itself is kept
+        until the weight version moves past it (see set_weight_version), so the
+        target is never mistaken for a new, ungenerated one.
+        """
+        with self._slot_cv:
+            slots = self._target_slots.get(target_weight)
+        if slots is None:
+            return {}
+        stats = {
+            "dynamic_sampling_num_gen_batches": slots.launched / self._groups_per_target,
+            "dynamic_sampling_num_discarded_groups": float(slots.discarded),
+        }
+        if slots.generated_samples > 0:
+            stats["unfiltered_reward"] = (
+                slots.generated_reward_sum / slots.generated_samples
+            )
+        return stats
+
     def set_weight_version(self, version: int) -> None:
-        self.current_weight_version = version
-
-        # Resume collection if it was paused due to generation limits
-        was_paused = not self._generation_limit_cleared.is_set()
-        if was_paused:
-            self._generation_limit_cleared.set()  # Signal that collection can resume
-            print(f"🔄 Updated weight version to {version}, resuming collection")
-        else:
-            print(f"🔄 Updated weight version to {version}")
-
-    def _should_pause_for_generation_limits(self) -> bool:
-        """Check if collection should be paused due to generation limits."""
-        try:
-            target_weights = self._calculate_target_weights(self.current_weight_version)
-            last_target_weight_already_generated = ray.get(
-                self.replay_buffer.get_last_target_weight_already_generated.remote()
-            )
-
-            # Check if any target weight in our range needs generation
-            with self._generation_check_lock:
-                for target_weight in target_weights:
-                    if (
-                        target_weight > last_target_weight_already_generated
-                        and target_weight not in self._generating_targets
-                    ):
-                        return False  # Found a target that needs generation
-
-            print(
-                f"⏸️ All target weights {target_weights} already generated or in progress, pausing"
-            )
-            return True
-        except Exception:
-            return False
+        with self._slot_cv:
+            self.current_weight_version = version
+            # Targets below the new version were consumed and can never be
+            # candidates again (see _find_open_target), so forget them.
+            for consumed_target in [t for t in self._target_slots if t < version]:
+                del self._target_slots[consumed_target]
+            self._slot_cv.notify_all()
+        print(f"🔄 Updated weight version to {version}")
 
     def start_collection(self, dataloader: StatefulDataLoader) -> None:
         """Start collecting trajectories from dataloader."""
@@ -440,37 +515,10 @@ class AsyncTrajectoryCollector:
                         self._refit_pause_cleared.wait()
                         print("▶️ Refit completed, resuming collection")
 
-                    # Check if generation limits require pausing collection
-                    if self._should_pause_for_generation_limits() and self.running:
-                        # Only log warning once per weight version
-                        if self._last_limit_warning_version != self.current_weight_version:
-                            async_cfg = self.master_config.get("grpo", {}).get(
-                                "async_grpo", {}
-                            )
-                            max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-                            target_weights = [
-                                self.current_weight_version + i
-                                for i in range(max_trajectory_age)
-                            ]
-
-                            print(
-                                f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
-                                f"already exist in buffer. Waiting for weight update..."
-                            )
-                            self._last_limit_warning_version = self.current_weight_version
-
-                            self._generation_limit_cleared.clear()  # Clear the event to pause
-
-                        # Efficiently wait for generation limits to be cleared (no polling!)
-                        self._generation_limit_cleared.wait()
-
-                        # Double-check we're still running after being woken up
-                        if not self.running:
-                            break
-
                     if not self.running:
                         break
 
+                    # Blocks per prompt until a target weight has an open slot.
                     self._process_batch(batch)
 
                 if self.running:
@@ -488,29 +536,30 @@ class AsyncTrajectoryCollector:
             print("🛑 Trajectory collection stopped")
 
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
-        """Process a single batch and generate for one target weight."""
+        """Launch one prompt group per prompt in batch, each for an open target slot.
+
+        Each prompt reserves a slot of the lowest target weight that still needs
+        groups, so one dataloader batch may feed several targets, and a target
+        whose groups were discarded by dynamic sampling gets refilled first.
+        """
         try:
-            generation_weight_version = self.current_weight_version
             num_generations = self.master_config["grpo"]["num_generations_per_prompt"]
-            num_prompts = batch.size
 
-            # Get the next target weight that needs generation
-            target_weight = self._get_next_target_for_generation(
-                generation_weight_version
-            )
+            for prompt_idx in range(batch.size):
+                # Validation pauses collection; don't start new groups meanwhile.
+                if not self._manual_pause_cleared.is_set() and self.running:
+                    self._manual_pause_cleared.wait()
 
-            if target_weight is None:
-                print(
-                    f"🔄 No targets need generation for weight {generation_weight_version}"
-                )
-                return
+                single_prompt_batch = batch.slice(prompt_idx, prompt_idx + 1)
+                repeated_batch = single_prompt_batch.repeat_interleave(num_generations)
 
-            print(
-                f"🎯 Generating for target weight {target_weight} from generation_weight_version {generation_weight_version}"
-            )
+                # A reserved slot is only released by the worker, so keep the
+                # code between here and worker.start() free of fallible work.
+                reservation = self._reserve_slot()
+                if reservation is None:
+                    return
+                target_weight, filterable = reservation
 
-            # Generate for all prompts in this batch for the target weight
-            for prompt_idx in range(num_prompts):
                 # Wait for refit to complete if in progress
                 if not self._refit_pause_cleared.is_set() and self.running:
                     with self._threads_lock:
@@ -523,11 +572,13 @@ class AsyncTrajectoryCollector:
                     )
                     self._refit_pause_cleared.wait()
 
-                    # After refit finishes if weight version has updated, reflect that in the new trajectories
-                    generation_weight_version = self.current_weight_version
-
-                single_prompt_batch = batch.slice(prompt_idx, prompt_idx + 1)
-                repeated_batch = single_prompt_batch.repeat_interleave(num_generations)
+                # Read after any refit wait so trajectories carry the weights that
+                # actually generate them. The reserved target stays valid: it is
+                # still unconsumed because this slot keeps it short of groups.
+                generation_weight_version = self.current_weight_version
+                print(
+                    f"🎯 Generating for target weight {target_weight} from generation_weight_version {generation_weight_version}"
+                )
 
                 self._inflight_sema.acquire()
                 worker = _threading.Thread(
@@ -537,6 +588,7 @@ class AsyncTrajectoryCollector:
                         generation_weight_version,
                         target_weight,
                         prompt_idx,
+                        filterable,
                     ),
                     daemon=True,
                 )
@@ -719,7 +771,11 @@ class AsyncTrajectoryCollector:
         generation_weight_version: int,
         target_weight_version: int,
         prompt_idx: int,
+        filterable: bool,
     ) -> None:
+        # Whether this worker's slot was accepted/discarded; if neither happens
+        # (error, shutdown) the slot is re-opened so the target is not starved.
+        slot_settled = False
         try:
             # Check if NemoGym should be used
             env_config = self.master_config.get("env", {})
@@ -753,6 +809,25 @@ class AsyncTrajectoryCollector:
             final_batch_cpu = final_batch.to("cpu")
             del final_batch
 
+            # Dynamic sampling decides at group level: a group whose rewards are
+            # all equal has zero advantage for every sample. (A per-sample
+            # leave-one-out std would also be zero for the lone success in a
+            # 1-of-N group, which must be kept.)
+            rewards = final_batch_cpu["total_reward"]
+            with self._slot_cv:
+                slots = self._target_slots.get(target_weight_version)
+                if slots is not None:
+                    slots.generated_samples += rewards.numel()
+                    slots.generated_reward_sum += float(rewards.sum())
+            if filterable and bool((rewards == rewards[0]).all()):
+                print(
+                    f"🗑️ Dynamic sampling: discarded zero-variance group (prompt_idx {prompt_idx}, "
+                    f"target_weight {target_weight_version}, reward {float(rewards[0]):.3f})"
+                )
+                self._settle_slot(target_weight_version, accepted=False, discarded=True)
+                slot_settled = True
+                return
+
             trajectory_group = {
                 "batch": final_batch_cpu,
                 "rollout_metrics": rollout_metrics,
@@ -774,17 +849,10 @@ class AsyncTrajectoryCollector:
                         print(
                             f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, target_weight {target_weight_version})"
                         )
-
-                        # Release reservation when FIRST prompt group for this target is successfully buffered
-                        if prompt_idx == 0:
-                            with self._generation_check_lock:
-                                if target_weight_version in self._generating_targets:
-                                    self._generating_targets.discard(
-                                        target_weight_version
-                                    )
-                                    print(
-                                        f"🧹 Released reservation for target weight {target_weight_version} (first prompt buffered)"
-                                    )
+                        self._settle_slot(
+                            target_weight_version, accepted=True, discarded=False
+                        )
+                        slot_settled = True
                         break
                     elif status == "full":
                         # Exponential backoff up to 0.5 second
@@ -804,13 +872,12 @@ class AsyncTrajectoryCollector:
 
             traceback.print_exc()
         finally:
-            # Clean up reservation in case of error (if not already cleaned up)
-            with self._generation_check_lock:
-                if target_weight_version in self._generating_targets:
-                    self._generating_targets.discard(target_weight_version)
-                    print(
-                        f"🧹 Emergency cleanup: Released reservation for target weight {target_weight_version}"
-                    )
+            # Re-open the slot on error or shutdown so another prompt fills it.
+            if not slot_settled:
+                self._settle_slot(target_weight_version, accepted=False, discarded=False)
+                print(
+                    f"🧹 Released unfilled slot for target weight {target_weight_version} (prompt_idx {prompt_idx})"
+                )
 
             # Detach thread record when finished
             with self._threads_lock:

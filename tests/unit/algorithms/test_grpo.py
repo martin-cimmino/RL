@@ -26,6 +26,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     _default_grpo_save_state,
+    apply_overlong_filtering,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
@@ -649,6 +650,26 @@ def test_dapo_dynamic_sampling_batch_caching():
     )  # All samples from the single prompt with non-zero std
     assert is_batch_complete == True
     assert batch_cache is not None
+
+
+@pytest.mark.parametrize("truncated_as_list", [False, True])
+def test_apply_overlong_filtering_zeroes_truncated_samples(truncated_as_list):
+    truncated = [False, True, False, True]
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([1.0, 1.0, 0.0, 1.0]),
+            "truncated": truncated
+            if truncated_as_list
+            else torch.tensor(truncated, dtype=torch.bool),
+        }
+    )
+    original_multiplier = repeated_batch["loss_multiplier"]
+
+    filtered = apply_overlong_filtering(repeated_batch)
+
+    assert filtered["loss_multiplier"].tolist() == [1.0, 0.0, 0.0, 0.0]
+    # The caller's tensor is not modified in place.
+    assert original_multiplier.tolist() == [1.0, 1.0, 0.0, 1.0]
 
 
 def test_dapo_dynamic_sampling_disabled():

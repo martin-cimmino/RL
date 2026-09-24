@@ -384,6 +384,7 @@ class TestAsyncTrajectoryCollector:
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 3,
                 "max_rollout_turns": 1,
+                "use_dynamic_sampling": False,
                 "async_grpo": {"max_trajectory_age_steps": 2},
             },
             "policy": {"max_total_sequence_length": 512},
@@ -576,6 +577,7 @@ class TestAsyncUtilsIntegration:
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 2,
                 "max_rollout_turns": 1,
+                "use_dynamic_sampling": False,
                 "async_grpo": {"max_trajectory_age_steps": 1},
             },
             "policy": {"max_total_sequence_length": 512},
@@ -698,3 +700,163 @@ class TestAsyncUtilsIntegration:
         assert sample_result is None
 
         ray.kill(buffer)
+
+
+class TestCollectorSlotScheduling:
+    """Slot scheduling and dynamic sampling in AsyncTrajectoryCollector.
+
+    Exercises the plain (non-actor) class so the scheduling state can be driven
+    and inspected directly; rollouts and replay-buffer pushes are mocked.
+    """
+
+    def make_collector(
+        self,
+        *,
+        use_dynamic_sampling: bool,
+        num_prompts_per_step: int = 2,
+        max_gen_batches: int = 3,
+        max_age: int = 1,
+    ):
+        grpo_cfg = {
+            "num_prompts_per_step": num_prompts_per_step,
+            "num_generations_per_prompt": 4,
+            "max_rollout_turns": 1,
+            "use_dynamic_sampling": use_dynamic_sampling,
+            "async_grpo": {"max_trajectory_age_steps": max_age},
+        }
+        if use_dynamic_sampling:
+            grpo_cfg["dynamic_sampling_max_gen_batches"] = max_gen_batches
+        master_config = {
+            "grpo": grpo_cfg,
+            "policy": {"max_total_sequence_length": 512},
+        }
+        replay_buffer = mock.MagicMock()
+        replay_buffer.push_with_wait_signal.remote.return_value = "success"
+        collector = AsyncTrajectoryCollector.__ray_actor_class__(
+            policy_generation=MockGenerationInterface(),
+            tokenizer=mock.MagicMock(),
+            task_to_env={},
+            master_config=master_config,
+            replay_buffer=replay_buffer,
+            start_step=0,
+        )
+        collector.running = True
+        return collector, replay_buffer
+
+    def run_group(self, collector, *, target, filterable, rewards):
+        """Run one prompt-group worker whose rollout returns the given rewards."""
+        final_batch = BatchedDataDict({"total_reward": torch.tensor(rewards)})
+        collector._inflight_sema.acquire()
+        with (
+            mock.patch(
+                "nemo_rl.algorithms.async_utils.run_async_multi_turn_rollout",
+                return_value=(final_batch, {}),
+            ),
+            mock.patch("nemo_rl.algorithms.async_utils.ray.get", side_effect=lambda x: x),
+        ):
+            collector._run_prompt_group_worker(
+                BatchedDataDict({}), 0, target, 0, filterable
+            )
+
+    def test_without_dynamic_sampling_each_target_gets_exactly_its_groups(self):
+        collector, buffer = self.make_collector(use_dynamic_sampling=False)
+
+        reservations = [collector._reserve_slot() for _ in range(4)]
+
+        # Initial window is targets [0, 1]; two groups each, never filterable.
+        assert reservations == [(0, False), (0, False), (1, False), (1, False)]
+        with collector._slot_cv:
+            assert collector._find_open_target() is None
+
+        self.run_group(collector, target=0, filterable=False, rewards=[1.0] * 4)
+        assert buffer.push_with_wait_signal.remote.call_count == 1
+        assert collector._target_slots[0].accepted == 1
+        # An accepted group does not re-open the slot.
+        with collector._slot_cv:
+            assert collector._find_open_target() is None
+
+    def test_zero_variance_group_is_discarded_and_slot_reopened(self):
+        collector, buffer = self.make_collector(use_dynamic_sampling=True)
+        for _ in range(4):
+            collector._reserve_slot()
+
+        self.run_group(collector, target=0, filterable=True, rewards=[0.0] * 4)
+
+        buffer.push_with_wait_signal.remote.assert_not_called()
+        assert collector._target_slots[0].discarded == 1
+        # Target 0 is short again and is refilled before any later target.
+        assert collector._reserve_slot() == (0, True)
+
+    def test_lone_success_group_is_kept(self):
+        # Leave-one-out std is zero for the lone success; the group-level test
+        # must still keep the group.
+        collector, buffer = self.make_collector(use_dynamic_sampling=True)
+        collector._reserve_slot()
+
+        self.run_group(collector, target=0, filterable=True, rewards=[1.0, 0.0, 0.0, 0.0])
+
+        assert buffer.push_with_wait_signal.remote.call_count == 1
+        assert collector._target_slots[0].accepted == 1
+        assert collector._target_slots[0].discarded == 0
+
+    def test_launch_cap_turns_filtering_off(self):
+        collector, _ = self.make_collector(
+            use_dynamic_sampling=True, num_prompts_per_step=1, max_gen_batches=2
+        )
+
+        first = collector._reserve_slot()
+        self.run_group(collector, target=0, filterable=first[1], rewards=[0.0] * 4)
+        second = collector._reserve_slot()
+        self.run_group(collector, target=0, filterable=second[1], rewards=[0.0] * 4)
+        third = collector._reserve_slot()
+
+        # 2 launches x 1 prompt per step may be filtered; the 3rd is accepted as is.
+        assert first == (0, True)
+        assert second == (0, True)
+        assert third == (0, False)
+        self.run_group(collector, target=0, filterable=third[1], rewards=[0.0] * 4)
+        assert collector._target_slots[0].accepted == 1
+
+    def test_short_current_target_stays_open_after_version_advances(self):
+        collector, _ = self.make_collector(use_dynamic_sampling=True, max_age=1)
+        for _ in range(4):
+            collector._reserve_slot()
+        self.run_group(collector, target=1, filterable=True, rewards=[1.0, 0.0, 1.0, 0.0])
+        self.run_group(collector, target=1, filterable=True, rewards=[1.0] * 4)
+
+        collector.set_weight_version(1)
+
+        # Target 0 is forgotten; target 1 is outside the window [2] of version 1
+        # but still short of one group, so it is refilled first.
+        assert 0 not in collector._target_slots
+        assert collector._reserve_slot() == (1, True)
+
+    def test_target_stats_report_all_generated_groups(self):
+        collector, _ = self.make_collector(use_dynamic_sampling=True)
+        for _ in range(2):
+            collector._reserve_slot()
+        self.run_group(collector, target=0, filterable=True, rewards=[0.0] * 4)
+        collector._reserve_slot()
+        self.run_group(collector, target=0, filterable=True, rewards=[1.0, 0.0, 0.0, 0.0])
+        self.run_group(collector, target=0, filterable=True, rewards=[1.0, 1.0, 0.0, 0.0])
+
+        stats = collector.get_target_stats(0)
+
+        assert stats["dynamic_sampling_num_gen_batches"] == 1.5
+        assert stats["dynamic_sampling_num_discarded_groups"] == 1.0
+        assert stats["unfiltered_reward"] == pytest.approx(3.0 / 12.0)
+
+    def test_failed_worker_reopens_slot(self):
+        collector, buffer = self.make_collector(use_dynamic_sampling=False)
+        for _ in range(4):
+            collector._reserve_slot()
+
+        collector._inflight_sema.acquire()
+        with mock.patch(
+            "nemo_rl.algorithms.async_utils.run_async_multi_turn_rollout",
+            side_effect=RuntimeError("rollout failed"),
+        ):
+            collector._run_prompt_group_worker(BatchedDataDict({}), 0, 0, 0, False)
+
+        buffer.push_with_wait_signal.remote.assert_not_called()
+        assert collector._reserve_slot() == (0, False)
