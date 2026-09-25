@@ -16,5 +16,5 @@
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
 	url = https://github.com/nicolo-domyn/Gym.git
-	branch = bare-metal
+	branch = bare-metal-gym-94ad8ff
 	shallow = true
