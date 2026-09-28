@@ -87,6 +87,8 @@ domyn_edge = "nemo_rl.models.generation.vllm.vllm_worker:_register_domyn_edge_pl
 # (nvcc errors like "namespace std has no member string_view", missing -std=c++17).
 # Re-add if that gets fixed or Mamba-style models are ever needed.
 fsdp = ["flash-attn==2.8.3"]
+# bare-metal: opt-in Squid forward-proxy
+proxy = ["squidward"]
 automodel = [
   # bare-metal: dropped [moe] (pulls in nemo_automodel[cuda], which is where
   # mamba-ssm/causal-conv1d actually come from, plus its own
@@ -245,6 +247,7 @@ nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = t
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace", editable = true }
 nemo_gym = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
+squidward = { git = "ssh://git@github.com/igeniusai/squidward.git" }
 # bare-metal: torch/torchvision/torchaudio are NOT routed via [tool.uv.sources] here
 # (unlike upstream, and unlike triton below) — 3rdparty/Automodel-workspace/Automodel's
 # own vendored pyproject.toml unconditionally hardcodes its own torch/torchvision

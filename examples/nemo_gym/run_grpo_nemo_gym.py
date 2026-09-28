@@ -41,10 +41,7 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.nemo_gym import (
-    NemoGymConfig,
-    setup_nemo_gym_config,
-)
+from nemo_rl.environments.nemo_gym import NemoGymConfig, setup_nemo_gym_config
 from nemo_rl.environments.utils import create_env
 from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
 from nemo_rl.models.generation import configure_generation_config
@@ -54,6 +51,8 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.proxy import maybe_start_proxy  # [CUSTOM]
+from nemo_rl.utils.redis_job import maybe_start_redis_job  # [CUSTOM]
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -138,6 +137,19 @@ def main() -> None:
 
     config: MasterConfig = OmegaConf.to_container(config, resolve=True)
     print("Applied CLI overrides")
+
+    # [CUSTOM] Opt-in (config["proxy"]["enabled"]): keeps a squidward forward-proxy alive for
+    # this process's whole lifetime, for environments that need real internet access
+    # (e.g. web-search tool servers). No-op if the config has no `proxy` block or
+    # `proxy.enabled` is false. Started before anything below that might itself want
+    # outbound internet.
+    maybe_start_proxy(config)
+
+    # [CUSTOM] Opt-in (config["redis"]["enabled"]): submits the shared Redis SLURM job used as
+    # the backing store for rate-limited Gym resources servers (e.g. brave_search). No-op if
+    # the config has no `redis` block or `redis.enabled` is false. Started before init_ray() so
+    # the discovered host is captured in Ray's runtime_env env var snapshot.
+    maybe_start_redis_job(config)
 
     # Get the next experiment directory with incremented ID
     config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
