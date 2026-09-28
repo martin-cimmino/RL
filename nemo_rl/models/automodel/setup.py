@@ -205,6 +205,52 @@ def _maybe_patch_domyn_edge_activation_checkpointing(
         layer_cls._activation_checkpointing_patched = True
 
 
+def _maybe_patch_domyn_edge_rope_autocast(model) -> None:
+    """Forces DomynEdge's RoPE frequency computation to run outside autocast.
+
+    DomynEdgeRotaryEmbedding.forward computes
+
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+
+    The `.float()` calls do NOT survive autocast: torch.autocast overrides the input dtypes
+    of matmul, so under a bf16 autocast region this product is evaluated in bf16. bf16 has
+    8 mantissa bits, so position ids above 255 are not exactly representable -- the ulp
+    doubles at every power of two, reaching 64 at position 16384 and 128 near 32767. The
+    RoPE angles are therefore quantized progressively harder the deeper into a sequence you
+    go, and the model's attention degrades with position.
+
+    Upstream transformers guards against exactly this; see modeling_llama.py, which wraps
+    the same three lines in `maybe_autocast(device_type=..., enabled=False)  # Force
+    float32`. DomynEdge's trust_remote_code modeling file simply omits that guard, so the
+    bug only appears where the model is run under autocast -- which is the training path
+    (fp32 master weights + bf16 autocast) and not vLLM (pure bf16).
+    """
+    architectures = getattr(getattr(model, "config", None), "architectures", None) or []
+    if not architectures or architectures[0] != "DomynEdgeForCausalLM":
+        return
+
+    rotary = getattr(getattr(model, "model", None), "rotary_emb", None)
+    if rotary is None:
+        return
+
+    rotary_cls = type(rotary)
+    if getattr(rotary_cls, "_domyn_edge_rope_autocast_patched", False):
+        return
+
+    original_forward = rotary_cls.forward
+
+    @torch.no_grad()
+    def _forward_no_autocast(self, x, position_ids):
+        device_type = x.device.type
+        if not isinstance(device_type, str) or device_type == "mps":
+            device_type = "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            return original_forward(self, x, position_ids)
+
+    rotary_cls.forward = _forward_no_autocast
+    rotary_cls._domyn_edge_rope_autocast_patched = True
+
+
 def _maybe_patch_domyn_edge_varlen_attn(model_config) -> None:
     """Monkeypatches torch.nn.attention.varlen.varlen_attn for DomynEdge.
 
@@ -253,6 +299,96 @@ def _maybe_patch_domyn_edge_varlen_attn(model_config) -> None:
         )
 
     torch.nn.attention.varlen.varlen_attn = _varlen_attn_compat
+
+
+def _maybe_patch_domyn_edge_packed_attention(model) -> None:
+    """Makes DomynEdge's attention honour flash_attn_kwargs, enabling sequence packing.
+
+    Without this, the packed row is attended as ONE contiguous sequence and tokens
+    from one rollout attend causally to a different rollout's tokens.
+    """
+    architectures = getattr(getattr(model, "config", None), "architectures", None) or []
+    if not architectures or architectures[0] != "DomynEdgeForCausalLM":
+        return
+
+    layers = model.model.layers
+    if isinstance(layers, torch.nn.ModuleDict):
+        layers = list(layers.values())
+    layers = list(layers)
+    if not layers:
+        return
+    cls = type(layers[0].attention)
+    if getattr(cls, "_packed_attention_patched", False):
+        return
+
+    original_forward = cls.forward
+
+    def _packed_forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        attention_mask=None,
+        past_key_values=None,
+        **kwargs,
+    ):
+        flash_attn_kwargs = kwargs.pop("flash_attn_kwargs", None)
+        if flash_attn_kwargs is None:
+            return original_forward(
+                self,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values,
+                **kwargs,
+            )
+
+        if hasattr(flash_attn_kwargs, "cu_seqlens_q"):
+            cu_source = flash_attn_kwargs.cu_seqlens_q
+        else:
+            cu_source = flash_attn_kwargs["cu_seqlens_q"]
+
+        import torch.nn.attention.varlen as _varlen
+
+        current = _varlen.varlen_attn
+
+        def _segmented_varlen_attn(
+            query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, *args, **kw
+        ):
+            total = query.shape[0]
+            cu = cu_source.to(device=query.device, dtype=torch.int32)
+            covered = int(cu[-1].item())
+            assert covered <= total, (
+                f"cu_seqlens cover {covered} tokens but the attention input has "
+                f"only {total}. The packed row and flash_attn_kwargs disagree."
+            )
+            if covered < total:
+                cu = torch.cat(
+                    [
+                        cu,
+                        torch.tensor([total], device=cu.device, dtype=torch.int32),
+                    ]
+                )
+            max_seqlen = int((cu[1:] - cu[:-1]).max().item())
+            return current(
+                query, key, value, cu, cu, max_seqlen, max_seqlen, *args, **kw
+            )
+
+        _varlen.varlen_attn = _segmented_varlen_attn
+        try:
+            # attention_mask is passed through untouched.
+            return original_forward(
+                self,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values,
+                **kwargs,
+            )
+        finally:
+            _varlen.varlen_attn = current
+
+    cls.forward = _packed_forward
+    cls._packed_attention_patched = True
 
 
 class _SkipLMHeadSignal(Exception):
@@ -1024,6 +1160,8 @@ def setup_model_and_optimizer(
         model.config.trained_vocab_size = trained_vocab_size
 
     _maybe_patch_domyn_edge_varlen_attn(model_config)
+    _maybe_patch_domyn_edge_packed_attention(model)
+    _maybe_patch_domyn_edge_rope_autocast(model)
     _maybe_patch_domyn_edge_skip_lm_head_support(model)
     _maybe_patch_domyn_edge_activation_checkpointing(
         model, config["dtensor_cfg"]["activation_checkpointing"]
