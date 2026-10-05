@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from datasets import Dataset
+from datasets import Dataset, Features, Value
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 
@@ -36,11 +36,19 @@ class NemoGymDataset(RawDataset):
             self.dataset = [raw_line for raw_line in f]
 
         # format the dataset
+        # large_string: a plain string column overflows Arrow's int32 offsets once the
+        # file passes 2 GiB ("offset overflow while concatenating arrays")
         self.dataset = Dataset.from_dict(
             {
                 "extra_env_info": self.dataset,
                 "task_name": [self.task_name] * len(self.dataset),
-            }
+            },
+            features=Features(
+                {
+                    "extra_env_info": Value("large_string"),
+                    "task_name": Value("string"),
+                }
+            ),
         )
 
         # repeat the dataset
