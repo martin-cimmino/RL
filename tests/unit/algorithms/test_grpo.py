@@ -151,6 +151,13 @@ class StubAsyncTrajectoryCollector:
         return mock
 
     @property
+    def get_target_stats(self):
+        """Per-target generation stats - {} like the real collector for an unknown target"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={})  # ray.get is patched to pass dicts through
+        return mock
+
+    @property
     def wait_for_stop(self):
         """Wait for stop - returns a remote-callable mock"""
         mock = MagicMock()
