@@ -15,6 +15,8 @@
 import asyncio
 import copy
 import gc
+import json
+import os
 import threading
 import time
 import uuid
@@ -25,16 +27,16 @@ import ray
 import torch
 import uvicorn
 from fastapi import FastAPI
-
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
-from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
-from nemo_rl.models.generation.interfaces import (
-    GenerationDatumSpec,
-    GenerationOutputSpec,
-    verify_right_padding,
-)
-from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
+from nemo_rl.distributed.virtual_cluster import (_get_free_port_local,
+                                                 _get_node_ip_local)
+from nemo_rl.distributed.worker_group_utils import \
+    get_nsight_config_if_pattern_matches
+from nemo_rl.models.generation.interfaces import (GenerationDatumSpec,
+                                                  GenerationOutputSpec,
+                                                  verify_right_padding)
+from nemo_rl.models.generation.vllm.utils import \
+    format_prompt_for_vllm_generation
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 
@@ -144,11 +146,81 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
     )
 
 
+def _normalize_tool_call_arguments(messages: list[dict]) -> None:
+    """Normalize each tool_call's arguments from a JSON-encoded string (the standard
+    OpenAI/vLLM wire format -- see vllm.entrypoints.openai.engine.protocol.FunctionCall.
+    arguments: str) into an actual dict, in place.
+
+    DomynEdge's chat_template.jinja (copied from Qwen3-Coder's own official template)
+    renders a dict-valued tool_call.arguments as one `<parameter=NAME>...</parameter>`
+    block per argument, but falls back to embedding the raw string verbatim when
+    arguments is still a string -- these two renderings are NOT the same length. Every
+    caller that tokenizes `messages` to reason about prompt length (e.g. the pre-flight
+    length guard) MUST apply this same normalization first, or it will measure the
+    shorter string-form render while the real request (after this normalization runs
+    inside _preprocess_chat) sends the longer dict-form render -- silently
+    under-counting the true prompt length.
+    """
+    for message in messages:
+        for tool_call in message.get("tool_calls") or []:
+            target = tool_call.get("function", tool_call)
+            arguments = target.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    target["arguments"] = json.loads(arguments)
+                except (json.JSONDecodeError, TypeError):
+                    # [CUSTOM] Coerce to {} rather than leaving the raw string in place.
+                    # A malformed `arguments` string can end up in conversation history
+                    # whenever the model's own tool-call generation is imperfect (e.g. cut
+                    # off mid-argument) -- and it gets replayed back on every later turn of
+                    # the same multi-turn trajectory. If left as a string here, vLLM's own
+                    # stock `_postprocess_messages` (vllm/entrypoints/chat_utils.py) re-parses
+                    # it with an *unguarded* `json.loads`, which raises uncaught and turns
+                    # into a hard 400 that kills the whole rollout -- confirmed via isolated
+                    # repro against the actual installed vLLM package. This exact fix (coerce
+                    # to {} with a warning) is already upstream in vLLM's current main branch
+                    # ("A malformed `arguments` string lives in conversation history, so
+                    # failing the request here would fail every subsequent turn too... Coerce
+                    # to an empty object so the turn can proceed.") -- confirmed via bisection
+                    # that it lands between v0.28.0 and v0.29.0, i.e. AFTER v0.20.0, the
+                    # version RL's own v0.7.0 tag pins. Upgrading to RL v0.7.0 alone will NOT
+                    # make this obsolete -- vLLM would need to be bumped past v0.29.0 on top of
+                    # that. TODO: remove this once whatever vLLM version we're on by then
+                    # includes the upstream fix (check for `chat_utils.py`'s own "coercing to
+                    # an empty object" log message before removing).
+                    target["arguments"] = {}
+
+
 @ray.remote(
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
 )  # pragma: no cover
 class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
+        # [CUSTOM] Give this actor its own TORCHINDUCTOR_CACHE_DIR, keyed by PID (each vLLM
+        # actor is its own OS process, so PID is unique per-node without needing any
+        # cross-actor coordination). Without this, every actor on a node shares the same
+        # default cache dir (keyed only by OS username) -- with enforce_eager=false and
+        # multiple actors torch.compile-ing concurrently at startup, they race on the same
+        # cache files, truncating/corrupting each other's pickled compiled graphs. Symptom:
+        # every engine on the affected node becomes permanently broken (500s on every
+        # request) with `_pickle.UnpicklingError: pickle data was truncated` /
+        # `AttributeError: 'CompiledFxGraph' object has no attribute 'compiled_fn_runner'` in
+        # its startup log. Must be set before any vllm/torch import below touches
+        # torch._inductor's config module, which reads this env var lazily on first use.
+        #
+        # NOT .setdefault(): confirmed via a live actor's /proc/<pid>/environ that
+        # TORCHINDUCTOR_CACHE_DIR is already present (set to the generic, shared, per-user
+        # default -- almost certainly a side effect of `import torch` itself, or something it
+        # pulls in, setting its own process-wide fallback) by the time this method runs.
+        # .setdefault() against an already-set key is a silent no-op, which is exactly why the
+        # first version of this fix only protected SOME actors (whichever ones happened not to
+        # have the generic default populated yet) and not others. Direct assignment always
+        # overrides it, regardless of when/how that default got set -- safe here since there's
+        # no legitimate reason for actors to intentionally share one inductor cache dir.
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = (
+            f"/tmp/torchinductor_{os.environ.get('USER', 'nemo_rl')}_{os.getpid()}"
+        )
+
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
@@ -203,7 +275,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         Controlled by vllm_metrics_logger_interval (default: 0.5) in vllm_cfg.
         Runs only on the model-owner actor.
         """
-        from vllm.v1.metrics.reader import Gauge, Counter, get_metrics_snapshot
+        from vllm.v1.metrics.reader import Counter, Gauge, get_metrics_snapshot
 
         assert self.cfg["vllm_cfg"].get("async_engine", False), (
             "vLLM metrics logger is only supported with async engine enabled"
@@ -307,23 +379,16 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         from fastapi.responses import JSONResponse, StreamingResponse
         from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
-            ChatCompletionRequest,
-            ChatCompletionResponse,
-        )
-        from vllm.entrypoints.openai.chat_completion.serving import (
-            OpenAIServingChat,
-        )
+            ChatCompletionRequest, ChatCompletionResponse)
+        from vllm.entrypoints.openai.chat_completion.serving import \
+            OpenAIServingChat
         from vllm.entrypoints.openai.engine.protocol import ErrorResponse
         from vllm.entrypoints.openai.models.protocol import BaseModelPath
         from vllm.entrypoints.openai.models.serving import OpenAIServingModels
         from vllm.entrypoints.serve.tokenize.protocol import (
-            TokenizeChatRequest,
-            TokenizeCompletionRequest,
-            TokenizeResponse,
-        )
-        from vllm.entrypoints.serve.tokenize.serving import (
-            OpenAIServingTokenization,
-        )
+            TokenizeChatRequest, TokenizeCompletionRequest, TokenizeResponse)
+        from vllm.entrypoints.serve.tokenize.serving import \
+            OpenAIServingTokenization
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
@@ -377,6 +442,18 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     if message.get("tool_calls"):
                         message["tool_calls"] = list(message["tool_calls"])
 
+                # [CUSTOM] Normalize tool_call.arguments from a JSON-encoded string into an
+                # actual dict before these messages reach the chat template -- see
+                # _normalize_tool_call_arguments's docstring. Without this, every multi-turn
+                # conversation that replays a prior tool call crashes with `TypeError: Can
+                # only get item pairs from a mapping` the moment the model actually produces
+                # a tool call (invisible before enable_auto_tools was on, since every
+                # tool_choice="auto" request 400'd before generation ever happened). The
+                # pre-flight length guard in create_chat_completion below applies this exact
+                # same normalization before tokenizing for its own length check -- keep both
+                # call sites using this shared helper so their token counts never diverge.
+                _normalize_tool_call_arguments(messages)
+
                 # Deepcopy messages here since _preprocess_chat may be destructive.
                 messages_for_replace_prefix_tokens = deepcopy(messages)
 
@@ -392,7 +469,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                         tool_parser=tool_parser,
                     )
                 except ValueError as e:
-                    if "maximum context length" in str(e):
+                    # [CUSTOM] Match "context length" (not "maximum context length") -- this vLLM
+                    # version's actual VLLMValidationError text reads "...the model's context
+                    # length is only N tokens, resulting in a maximum input length of N
+                    # tokens...", which doesn't contain the older "maximum context length"
+                    # phrasing this filter originally targeted, so it never matched and always
+                    # fell through to a noisy full traceback instead of the clean warning below.
+                    if "context length" in str(e):
                         import logging
 
                         # Print a clean one-liner warning that max model length has been exceeded
@@ -514,8 +597,23 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             # The request sampling params need to exactly match those as are set in NeMo RL.
             # If they do not match, the inference will be off policy and destroy training stability.
-            assert request.temperature == generation_config["temperature"]
-            assert request.top_p == generation_config["top_p"]
+            # [CUSTOM] This server is shared by every caller of `policy_model` (rollouts, but also e.g. any
+            # LLM-judge resources server pointed at the same model server) - a mismatch here usually
+            # means such a caller isn't setting temperature/top_p to match the training run's config.
+            assert request.temperature == generation_config["temperature"], (
+                f"Request temperature ({request.temperature}) must exactly match the training "
+                f"generation config's temperature ({generation_config['temperature']}). This server "
+                "only accepts on-policy sampling params; if this request comes from something other "
+                "than the policy's own rollout collection (e.g. an LLM-judge sharing this model "
+                "server), set its temperature to match the training config."
+            )
+            assert request.top_p == generation_config["top_p"], (
+                f"Request top_p ({request.top_p}) must exactly match the training generation "
+                f"config's top_p ({generation_config['top_p']}). This server only accepts on-policy "
+                "sampling params; if this request comes from something other than the policy's own "
+                "rollout collection (e.g. an LLM-judge sharing this model server), set its top_p to "
+                "match the training config."
+            )
 
             generator = await openai_serving_chat.create_chat_completion(
                 request, raw_request
@@ -609,7 +707,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         class MaxContextLengthFilter(LoggingFilter):
             def filter(self, record: LogRecord) -> bool:
                 if record.exc_info and record.exc_info[1]:
-                    if "maximum context length" in str(record.exc_info[1]):
+                    # [CUSTOM] See the matching comment in _preprocess_chat's except block above --
+                    # this must match the same substring that check uses.
+                    if "context length" in str(record.exc_info[1]):
                         return False
                 return True
 
