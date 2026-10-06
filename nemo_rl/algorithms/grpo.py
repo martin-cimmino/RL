@@ -1106,23 +1106,32 @@ def _create_advantage_estimator(master_config: MasterConfig):
 
 
 def _extract_prompt_only_messages(message_logs: list) -> list:
-    """Extract only prompt messages (user/system) from message logs.
+    """Extract the initial prompt (messages before the first assistant turn).
 
     This is used to get prompt IDs for advantage estimation, excluding
     any assistant responses.
+
+    [CUSTOM] Stops at the first assistant message instead of keeping every user/system
+    message. NeMo-Gym maps tool outputs (and any other non-generated span) to "user", so
+    keeping all of them made every multi-call rollout's "prompt" include its own tool
+    results: the 4 rollouts of a group no longer matched, each became a group of one,
+    and calculate_baseline_and_std_per_prompt set baseline = reward, i.e. advantage 0.
+    In job 59411826 this zeroed 48 of the 59 xlam_fc rollouts that were in groups with
+    a real reward spread.
 
     Args:
         message_logs: List of message logs, where each log is a list of messages.
 
     Returns:
-        List of message logs containing only user and system messages.
+        List of message logs containing only the messages before the first assistant turn.
     """
     prompt_only_message_logs = []
     for message_log in message_logs:
         prompt_only_log = []
         for message in message_log:
-            if message["role"] == "user" or message["role"] == "system":
-                prompt_only_log.append(message)
+            if message["role"] == "assistant":
+                break
+            prompt_only_log.append(message)
         prompt_only_message_logs.append(prompt_only_log)
     return prompt_only_message_logs
 
@@ -2411,6 +2420,14 @@ def validate(
             sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
         )
 
+        # [CUSTOM] See the full_result opt-in in async_grpo_train: same for validation.
+        if not _should_log_nemo_gym_responses(master_config):
+            additional_metrics_to_report = {
+                k: v
+                for k, v in additional_metrics_to_report.items()
+                if "full_result" not in k
+            }
+
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
@@ -2848,6 +2865,14 @@ def async_grpo_train(
                     target_stats = ray.get(
                         trajectory_collector.get_target_stats.remote(weight_version)
                     )
+                    # [CUSTOM] Same opt-in as the sync path: per-agent full_result Tables
+                    # hold every rollout's whole NeMo-Gym response (~200MB/step at 1024
+                    # rollouts, job 59486588), which made offline wandb dirs huge to sync.
+                    # The rollouts/ and train_data_step*.jsonl dumps keep the content.
+                    if not _should_log_nemo_gym_responses(master_config):
+                        for key in list(rollout_metrics):
+                            if "full_result" in key:
+                                rollout_metrics.pop(key)
 
                 # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
                 expected_batch_size = (
