@@ -245,9 +245,10 @@ The validation set you pass in will directly be used for validation with no addi
         )
     # Check if async mode is enabled
     elif "async_grpo" in config["grpo"] and config["grpo"]["async_grpo"]["enabled"]:
-        # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
+        # Async GRPO does not support reward scaling or reward shaping (DAPO
+        # features). Dynamic sampling is supported: the trajectory collector
+        # drops zero-variance groups before they reach the replay buffer.
         unsupported_features = [
-            "use_dynamic_sampling",
             "reward_scaling",
             "reward_shaping",
         ]
@@ -256,16 +257,10 @@ The validation set you pass in will directly be used for validation with no addi
             if feature not in config["grpo"]:
                 continue
 
-            if feature == "use_dynamic_sampling":
-                if config["grpo"][feature]:
-                    raise NotImplementedError(
-                        f"{feature} is not supported with async GRPO"
-                    )
-            else:
-                if config["grpo"][feature]["enabled"]:
-                    raise NotImplementedError(
-                        f"{feature} is not supported with async GRPO"
-                    )
+            if config["grpo"][feature]["enabled"]:
+                raise NotImplementedError(
+                    f"{feature} is not supported with async GRPO"
+                )
 
         # Async GRPO does not support multiple dataloaders
         if config["data"]["use_multiple_dataloader"]:

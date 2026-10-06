@@ -937,6 +937,31 @@ def dynamic_sampling(
     return batch_to_return, is_batch_complete, batch_cache, dynamic_sampling_metrics
 
 
+def apply_overlong_filtering(
+    repeated_batch: BatchedDataDict[DatumSpec],
+) -> BatchedDataDict[DatumSpec]:
+    """Zero the loss multiplier of truncated samples (DAPO overlong filtering).
+
+    Truncated samples still count toward their group's reward baseline; they are
+    only excluded from the policy-gradient loss.
+
+    Args:
+        repeated_batch: Rollout batch with "loss_multiplier" and "truncated".
+
+    Returns:
+        The same batch with "loss_multiplier" replaced by the filtered copy.
+    """
+    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+    truncated = repeated_batch["truncated"]
+
+    if isinstance(truncated, list):
+        truncated = torch.tensor(truncated, dtype=torch.bool)
+
+    loss_multiplier[truncated] = 0
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    return repeated_batch
+
+
 def scale_rewards(
     repeated_batch: BatchedDataDict[DatumSpec], reward_scaling_cfg: RewardScalingConfig
 ) -> BatchedDataDict[DatumSpec]:
@@ -1738,16 +1763,8 @@ def grpo_train(
                     del std
 
                 with timer.time("data_processing"):
-                    use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
-                    if use_overlong_filtering:
-                        loss_multiplier = repeated_batch["loss_multiplier"].clone()
-                        truncated = repeated_batch["truncated"]
-
-                        if isinstance(truncated, list):
-                            truncated = torch.tensor(truncated, dtype=torch.bool)
-
-                        loss_multiplier[truncated] = 0
-                        repeated_batch["loss_multiplier"] = loss_multiplier
+                    if master_config["grpo"]["overlong_filtering"]:
+                        repeated_batch = apply_overlong_filtering(repeated_batch)
                     # Add loss mask to each message in LLMMessageLogType
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
@@ -2826,6 +2843,11 @@ def async_grpo_train(
                         k: (sum(v) / len(v) if isinstance(v[0], (int, float)) else v)
                         for k, v in rollout_metrics.items()
                     }
+                    # Generation stats of this step's target weight, covering
+                    # groups dropped by dynamic sampling as well.
+                    target_stats = ray.get(
+                        trajectory_collector.get_target_stats.remote(weight_version)
+                    )
 
                 # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
                 expected_batch_size = (
@@ -2891,6 +2913,8 @@ def async_grpo_train(
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
+                    if master_config["grpo"]["overlong_filtering"]:
+                        repeated_batch = apply_overlong_filtering(repeated_batch)
                     # Add loss mask to each message
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
@@ -3130,6 +3154,18 @@ def async_grpo_train(
                     else:
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
+                if master_config["grpo"]["use_dynamic_sampling"]:
+                    # Match sync GRPO: "reward" is the mean over every generated
+                    # group, "filtered_reward" the mean of the trained groups.
+                    metrics["filtered_reward"] = metrics["reward"]
+                    if "unfiltered_reward" in target_stats:
+                        metrics["reward"] = target_stats["unfiltered_reward"]
+                    metrics["dynamic_sampling_num_gen_batches"] = target_stats.get(
+                        "dynamic_sampling_num_gen_batches", 1.0
+                    )
+                    metrics["dynamic_sampling_num_discarded_groups"] = (
+                        target_stats.get("dynamic_sampling_num_discarded_groups", 0.0)
+                    )
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
