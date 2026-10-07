@@ -1263,6 +1263,18 @@ def run_async_nemo_gym_rollout(
         {
             "agent_ref": [r["agent_ref"] for r in results],
             "message_log": [r["message_log"] for r in results],
+            # [CUSTOM] Carry the real pre-rollout prompt through to grpo.py's advantage
+            # calculation (both the sync and async/replay-buffer call sites -- this
+            # BatchedDataDict is what ends up stored in the replay buffer for the async
+            # path, so no further plumbing is needed there). Without this, grpo.py has to
+            # reconstruct "the prompt" after the fact from message_log's role pattern,
+            # which breaks for NeMo-Gym multi-call rollouts: tool outputs get tagged
+            # role="user" too, so a role-based heuristic can't distinguish "the original
+            # prompt" from "this rollout's own accumulated history". input_message_log is
+            # captured before any generation happens, so it's correct regardless of what
+            # the rollout produces afterward (tool outputs, retries, etc.) or of whether
+            # the original prompt itself happens to be a multi-turn conversation.
+            "input_message_log": [r["input_message_log"] for r in results],
             # length is used downstream for mean_prompt_length
             "length": torch.tensor(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]
