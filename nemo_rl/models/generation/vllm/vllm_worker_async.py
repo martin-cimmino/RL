@@ -95,6 +95,30 @@ def _replace_prefix_tokens(
         _replace_prefix_tokens keeps the exact prior model tokens up to EOS and
         resumes from the template after that EOS:
             output => [11,12,13,40,41,220,17,2,21,22,40,41]
+
+    [CUSTOM 2026-10-06] Splice-boundary algorithm cherry-picked from upstream
+    NVIDIA-NeMo/RL commit a4e21a8afd6c04eaeb7f46f24a43cd20418295de ("feat(trtllm):
+    support agentic training for SWE rollout (#3130)",
+    nemo_rl/models/generation/openai_server_utils.py::splice_prefix_tokens, as of
+    origin/main 2026-10-06).
+
+    Root cause this replaces: the OLD algorithm here located the splice boundary
+    by comparing raw lengths (asserting len(template_token_ids) >
+    len(template_prefix_token_ids)), then searched backward from the end of the
+    prefix-length window for an EOS token. That assumption breaks for any chat
+    template that strips reasoning (<think>) blocks from a now-stale assistant
+    turn once a new turn is appended on top of it -- re-rendering the FULL
+    trajectory from scratch can come out literally SHORTER than the cached prefix
+    that turn was actually generated under, firing a false "non-monotonically
+    increasing trajectory" assertion.
+
+    The fix: locate the splice boundary by EOS *count* instead of raw
+    length/position. Count how many EOS tokens appear in
+    template_prefix_token_ids, then walk template_token_ids and cut right after
+    the same Nth EOS. EOS count per message is invariant to whether that
+    message's reasoning got stripped on re-render (only token *position* shifts,
+    not EOS *count*), so this reduces to the same boundary the old position-based
+    search found when nothing was stripped, and stays correct when it was.
     """
     if not model_prefix_token_ids:
         return template_token_ids
@@ -109,30 +133,21 @@ def _replace_prefix_tokens(
         if model_prefix_token_ids[-1] == eos_token_id:
             model_cut_end -= 1
 
-    # Assert here to prepare for the logic below
-    assert len(template_token_ids) > len(
-        template_prefix_token_ids
-    ), f"""Found possibly non-monotonically increasing trajectory!
-Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
-
-Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
-
-Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
-
-Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
-"""
-
-    # We take everything starting with the EOS token ID.
+    # [CUSTOM 2026-10-06] EOS-count-based boundary search (see docstring note above),
+    # replacing the old length-assert + backward-position-search pair.
+    count_needed = template_prefix_token_ids.count(eos_token_id)
+    count_seen = 0
     template_cut_start = -1
-    for pos in reversed(range(len(template_prefix_token_ids))):
-        if template_token_ids[pos] == eos_token_id:
-            template_cut_start = pos
-            break
+    for pos, tid in enumerate(template_token_ids):
+        if tid == eos_token_id:
+            count_seen += 1
+            if count_seen == count_needed:
+                template_cut_start = pos
+                break
 
-    # This should never be the case, but
     assert (
         template_cut_start >= 0
-    ), f"""No EOS token ID found in the chat-templated messages!
+    ), f"""EOS token #{count_needed} not found in template_token_ids (only found {count_seen} EOS tokens total)!
 Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
 
 Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
@@ -457,11 +472,28 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 # Deepcopy messages here since _preprocess_chat may be destructive.
                 messages_for_replace_prefix_tokens = deepcopy(messages)
 
+                # [CUSTOM 2026-10-06] Hardening fix, found while investigating the real
+                # non-monotonic-trajectory root cause below (see _replace_prefix_tokens'
+                # docstring for that one -- it was the actual crash cause, not this).
+                # The deepcopy above exists because the comment already acknowledges
+                # "_preprocess_chat may be destructive" -- but that protection was only
+                # ever applied to the PREFIX call below, not to this FULL-render call,
+                # which was still passed the original, shared `messages` reference. If
+                # the base _preprocess_chat ever mutates message dicts in-place as a
+                # side effect of rendering, the prefix call below (which runs SECOND,
+                # against the untouched `messages_for_replace_prefix_tokens` snapshot
+                # taken BEFORE this call) would see the original content while this
+                # call's own effect on `messages` could leave the FULL render
+                # inconsistent with it. Keeping this independent deepcopy closes that
+                # gap regardless of whether it was ever actually triggering in
+                # practice.
+                messages_for_full_render = deepcopy(messages)
+
                 # res is (conversation, [engine_prompt])
                 try:
                     res = await super()._preprocess_chat(
                         request=request,
-                        messages=messages,
+                        messages=messages_for_full_render,
                         default_template=default_template,
                         default_template_content_format=default_template_content_format,
                         default_template_kwargs=default_template_kwargs,
@@ -661,6 +693,24 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
             **serving_tokenization_kwargs
         )
+        # [CUSTOM] vLLM's own OpenAIServingTokenization.__init__ has no
+        # default_chat_template_kwargs parameter at all (unlike OpenAIServingChat, which sets
+        # self.default_chat_template_kwargs = default_chat_template_kwargs or {} internally) --
+        # confirmed by reading its signature directly. But NeMoRLOpenAIServingMixin's own
+        # _preprocess_chat (shared by both serving classes) reads self.default_chat_template_kwargs
+        # unconditionally, and clients that call /tokenize for multi-turn token accounting (e.g.
+        # OpenHands/litellm) exercise this SAME mixin code, including the prefix-continuity
+        # monotonicity check. Without this, /tokenize silently renders without our configured
+        # http_server_serving_chat_kwargs.default_chat_template_kwargs (e.g. preserve_thinking),
+        # while /v1/chat/completions renders WITH it -- confirmed via a real crash: the same
+        # worker PID logged self.default_chat_template_kwargs as both the correct dict AND
+        # '<missing>' across different calls, and "AssertionError: Found possibly
+        # non-monotonically increasing trajectory!" in vllm_worker_async.py's own prefix-check
+        # logic. Set directly as an attribute (mirroring what OpenAIServingChat does internally)
+        # since there's no constructor parameter for it on this class.
+        openai_serving_tokenization.default_chat_template_kwargs = serving_chat_kwargs.get(
+            "default_chat_template_kwargs"
+        ) or {}
 
         @app.post("/tokenize")
         async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):
