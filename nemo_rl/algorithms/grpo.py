@@ -147,6 +147,8 @@ class GRPOConfig(TypedDict):
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     max_val_samples: int
+    # [CUSTOM] Per-call generation cap for NeMo-Gym validation rollouts; None = up to max_model_len.
+    val_max_new_tokens: NotRequired[int | None]
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
@@ -1111,6 +1113,27 @@ def _extract_prompt_only_messages(message_logs: list) -> list:
     This is used to get prompt IDs for advantage estimation, excluding
     any assistant responses.
 
+    [CUSTOM] This is a fallback heuristic only, used when a rollout's batch doesn't carry
+    an explicit "input_message_log" (see the call sites in grpo_train/async_grpo_train).
+    Native multi-turn rollouts (role="environment" for intermediate turns, never "user")
+    are unaffected by this heuristic's limitations and are the only expected caller of
+    this fallback today.
+
+    This function was briefly changed (stop at the first assistant message instead of
+    keeping every user/system message) to fix a real bug: NeMo-Gym maps tool outputs
+    (and any other non-generated span) to "user", so for NeMo-Gym's multi-call rollouts,
+    keeping all of them made every rollout's "prompt" include its own tool results, the
+    rollouts of a group no longer matched, each became a group of one, and
+    calculate_baseline_and_std_per_prompt set baseline = reward (advantage 0). That fix
+    is real but incomplete: it silently assumes no dataset's actual input prompt itself
+    contains assistant turns (e.g. a multi-turn conversation dataset where the model must
+    generate the final reply) -- for such a dataset it would truncate the real prompt
+    early, and two genuinely different tasks that happen to share their opening messages
+    would be incorrectly grouped together. Superseded for NeMo-Gym rollouts by
+    "input_message_log" (the actual pre-rollout prompt, captured before generation
+    starts, carried through final_batch by rollouts.py) -- see the call sites' own
+    comments.
+
     Args:
         message_logs: List of message logs, where each log is a list of messages.
 
@@ -1747,16 +1770,37 @@ def grpo_train(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Extract prompt-only messages for advantage estimation
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
-                    )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        prompt_only_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
+                    # Extract the real prompt identity for advantage estimation.
+                    # [CUSTOM] Prefer "input_message_log" (threaded through final_batch in
+                    # rollouts.py) when present -- it's the actual pre-rollout prompt,
+                    # captured before generation started, so it's correct no matter what
+                    # message_log later contains (tool outputs, a dataset whose own input
+                    # happens to be a multi-turn conversation, etc.). Falls back to the
+                    # role-based heuristic for rollout paths that don't produce
+                    # input_message_log (native multi-turn rollouts, which tag
+                    # intermediate turns role="environment" and so were never exposed to
+                    # this bug class). See _extract_prompt_only_messages's own docstring
+                    # for the full history, including github.com/martin-cimmino/RL/pull/4,
+                    # which fixed the same underlying bug via a role-pattern heuristic
+                    # ("stop at the first assistant message") -- simpler, but silently
+                    # breaks for any dataset whose real input prompt contains its own
+                    # assistant turns. input_message_log has no such assumption since it's
+                    # captured directly, not inferred after the fact.
+                    if "input_message_log" in repeated_batch:
+                        prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                            repeated_batch["input_message_log"],
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        )
+                    else:
+                        prompt_only_message_logs = _extract_prompt_only_messages(
+                            repeated_batch["message_log"]
+                        )
+                        prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                            prompt_only_message_logs,
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        )
+                        del prompt_only_message_logs
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del prompt_only_message_logs
                     del prompt_batched_flat
                     del input_ids
                     del baseline
@@ -2343,6 +2387,8 @@ def validate(
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
+                    # [CUSTOM] Caps validation calls only; see run_async_nemo_gym_rollout.
+                    max_output_tokens=master_config["grpo"].get("val_max_new_tokens"),
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
@@ -2410,6 +2456,14 @@ def validate(
         avg_length = (
             sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
         )
+
+        # [CUSTOM] See the full_result opt-in in async_grpo_train: same for validation.
+        if not _should_log_nemo_gym_responses(master_config):
+            additional_metrics_to_report = {
+                k: v
+                for k, v in additional_metrics_to_report.items()
+                if "full_result" not in k
+            }
 
         val_metrics = {
             "accuracy": accuracy,
@@ -2848,6 +2902,14 @@ def async_grpo_train(
                     target_stats = ray.get(
                         trajectory_collector.get_target_stats.remote(weight_version)
                     )
+                    # [CUSTOM] Same opt-in as the sync path: per-agent full_result Tables
+                    # hold every rollout's whole NeMo-Gym response (~200MB/step at 1024
+                    # rollouts, job 59486588), which made offline wandb dirs huge to sync.
+                    # The rollouts/ and train_data_step*.jsonl dumps keep the content.
+                    if not _should_log_nemo_gym_responses(master_config):
+                        for key in list(rollout_metrics):
+                            if "full_result" in key:
+                                rollout_metrics.pop(key)
 
                 # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
                 expected_batch_size = (
@@ -2872,16 +2934,25 @@ def async_grpo_train(
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
-                    # Extract prompt-only messages for advantage estimation
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
-                    )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        prompt_only_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
+                    # Extract the real prompt identity for advantage estimation.
+                    # [CUSTOM] See the identical comment at the sync call site in
+                    # grpo_train -- same fix, same rationale. This is the call site
+                    # Harbor's async_grpo.enabled=true config actually goes through.
+                    if "input_message_log" in repeated_batch:
+                        prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                            repeated_batch["input_message_log"],
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        )
+                    else:
+                        prompt_only_message_logs = _extract_prompt_only_messages(
+                            repeated_batch["message_log"]
+                        )
+                        prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                            prompt_only_message_logs,
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        )
+                        del prompt_only_message_logs
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del prompt_only_message_logs
                     del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]

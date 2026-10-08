@@ -1090,8 +1090,14 @@ def run_async_nemo_gym_rollout(
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
+    max_output_tokens: Optional[int] = None,
 ) -> AsyncNemoGymRolloutResult:
-    """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
+    """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters.
+
+    [CUSTOM] max_output_tokens: per model call, sent as responses_create_params.max_output_tokens
+    (Gym's vllm_model maps it to vLLM's max_tokens). generation_config["max_new_tokens"] is
+    NOT applied on this path, so without it a call can run to max_model_len.
+    """
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
     nemo_gym_rows = input_batch["extra_env_info"]
 
@@ -1126,6 +1132,8 @@ def run_async_nemo_gym_rollout(
         responses_create_params = row["responses_create_params"]
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
+        if max_output_tokens is not None:
+            responses_create_params["max_output_tokens"] = max_output_tokens
 
         # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
         # generation_config["max_new_tokens"]
@@ -1263,6 +1271,18 @@ def run_async_nemo_gym_rollout(
         {
             "agent_ref": [r["agent_ref"] for r in results],
             "message_log": [r["message_log"] for r in results],
+            # [CUSTOM] Carry the real pre-rollout prompt through to grpo.py's advantage
+            # calculation (both the sync and async/replay-buffer call sites -- this
+            # BatchedDataDict is what ends up stored in the replay buffer for the async
+            # path, so no further plumbing is needed there). Without this, grpo.py has to
+            # reconstruct "the prompt" after the fact from message_log's role pattern,
+            # which breaks for NeMo-Gym multi-call rollouts: tool outputs get tagged
+            # role="user" too, so a role-based heuristic can't distinguish "the original
+            # prompt" from "this rollout's own accumulated history". input_message_log is
+            # captured before any generation happens, so it's correct regardless of what
+            # the rollout produces afterward (tool outputs, retries, etc.) or of whether
+            # the original prompt itself happens to be a multi-turn conversation.
+            "input_message_log": [r["input_message_log"] for r in results],
             # length is used downstream for mean_prompt_length
             "length": torch.tensor(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]
