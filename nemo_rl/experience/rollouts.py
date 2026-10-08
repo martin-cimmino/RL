@@ -1090,8 +1090,14 @@ def run_async_nemo_gym_rollout(
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
+    max_output_tokens: Optional[int] = None,
 ) -> AsyncNemoGymRolloutResult:
-    """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
+    """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters.
+
+    [CUSTOM] max_output_tokens: per model call, sent as responses_create_params.max_output_tokens
+    (Gym's vllm_model maps it to vLLM's max_tokens). generation_config["max_new_tokens"] is
+    NOT applied on this path, so without it a call can run to max_model_len.
+    """
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
     nemo_gym_rows = input_batch["extra_env_info"]
 
@@ -1126,6 +1132,8 @@ def run_async_nemo_gym_rollout(
         responses_create_params = row["responses_create_params"]
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
+        if max_output_tokens is not None:
+            responses_create_params["max_output_tokens"] = max_output_tokens
 
         # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
         # generation_config["max_new_tokens"]

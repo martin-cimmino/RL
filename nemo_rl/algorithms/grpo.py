@@ -147,6 +147,8 @@ class GRPOConfig(TypedDict):
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     max_val_samples: int
+    # [CUSTOM] Per-call generation cap for NeMo-Gym validation rollouts; None = up to max_model_len.
+    val_max_new_tokens: NotRequired[int | None]
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
@@ -2385,6 +2387,8 @@ def validate(
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
+                    # [CUSTOM] Caps validation calls only; see run_async_nemo_gym_rollout.
+                    max_output_tokens=master_config["grpo"].get("val_max_new_tokens"),
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
