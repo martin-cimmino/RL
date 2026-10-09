@@ -275,7 +275,10 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             },
         )
 
-        # Set up model and optimizer
+        # [CUSTOM] On resume, build the model from the base weights first and load the
+        # checkpoint only after the reference snapshot below. Passing weights_path into
+        # setup_model_and_optimizer loaded the checkpoint before the snapshot, so every
+        # resume re-anchored the KL reference to the resumed policy
         model_and_optimizer_state = setup_model_and_optimizer(
             config=config,
             tokenizer=self.tokenizer,
@@ -284,8 +287,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             checkpoint_manager=self.checkpoint_manager,
             is_vlm=self.is_vlm,
             init_optimizer=init_optimizer,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
+            weights_path=None if init_reference_model else weights_path,
+            optimizer_path=None if init_reference_model else optimizer_path,
         )
 
         # Set instance attributes from model and optimizer state (tuple unpacking)
@@ -306,6 +309,16 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         self.reference_model_state_dict = None
         if init_reference_model:
             self.reference_model_state_dict = setup_reference_model_state(self.model)
+            if weights_path:
+                # Same call setup_model_and_optimizer makes when given weights_path.
+                print(f"Resuming policy from {weights_path} (KL reference: base weights)")
+                self.checkpoint_manager.load_checkpoint(
+                    model=self.model,
+                    weights_path=weights_path,
+                    optimizer=self.optimizer,
+                    optimizer_path=optimizer_path,
+                    scheduler=self.scheduler,
+                )
 
         # Set instance attributes from runtime config (tuple unpacking)
         (
