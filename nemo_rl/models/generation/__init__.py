@@ -14,6 +14,7 @@
 import warnings
 from typing import cast
 
+from transformers import GenerationConfig as HFGenerationConfig
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
@@ -69,4 +70,43 @@ def configure_generation_config(
             else:
                 config["vllm_cfg"]["skip_tokenizer_init"] = True
 
+        if config["vllm_cfg"].get("expose_http_server", None):
+            _check_eos_ends_assistant_turn(tokenizer)
+
     return config
+
+
+def _check_eos_ends_assistant_turn(tokenizer: TokenizerType) -> None:
+    """[CUSTOM] Fail fast when the tokenizer EOS is not the token that ends a chat turn.
+
+    _replace_prefix_tokens (vllm_worker_async.py) finds turn boundaries by counting
+    tokenizer.eos_token_id in the rendered chat template, and vLLM stops generation on
+    generation_config.json's eos_token_id.
+    """
+    eos = tokenizer.eos_token_id
+    rendered = tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": "ping"},
+            {"role": "assistant", "content": "pong"},
+        ],
+        tokenize=False,
+    )
+    if eos not in tokenizer.encode(rendered, add_special_tokens=False):
+        raise ValueError(
+            f"Tokenizer EOS {tokenizer.eos_token!r} ({eos}) never appears in a rendered "
+            f"assistant turn, so multi-call rollouts cannot be spliced. Stale tokenizer "
+            f"files in {tokenizer.name_or_path}? Rendered: {rendered!r}"
+        )
+
+    try:
+        gen_eos = HFGenerationConfig.from_pretrained(tokenizer.name_or_path).eos_token_id
+    except OSError:
+        # No generation_config.json: vLLM stops on the tokenizer EOS alone.
+        return
+    gen_eos_ids = {gen_eos} if isinstance(gen_eos, int) else set(gen_eos or [])
+    if gen_eos_ids and gen_eos_ids != {eos}:
+        raise ValueError(
+            f"generation_config.json eos_token_id {sorted(gen_eos_ids)} != tokenizer EOS "
+            f"{tokenizer.eos_token!r} ({eos}) in {tokenizer.name_or_path}; vLLM would end "
+            f"turns on tokens the prefix splicing does not recognize. Stale assets?"
+        )
