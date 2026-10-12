@@ -36,6 +36,16 @@ class TeacherResourceConfig(BaseModel, extra="allow"):
 
     ``extra="allow"`` keeps the escape hatch for arbitrary megatron settings:
     any unknown top-level key is folded into ``megatron_cfg_overrides``.
+
+    # [CUSTOM] The teacher backend following the student (Megatron vs DTensor) is a
+    # fork-specific extension -- upstream's non-colocated teachers are Megatron-only.
+    The teacher backend follows the student: a Megatron policy gets Megatron
+    teachers (``tensor_model_parallel_size`` / ``pipeline_model_parallel_size`` /
+    ``context_parallel_size`` / ``megatron_cfg_overrides``), a DTensor policy gets
+    DTensor (FSDP2 + TP) teachers, where ``tensor_model_parallel_size`` and
+    ``context_parallel_size`` map to ``dtensor_cfg.tensor_parallel_size`` /
+    ``context_parallel_size``, ``pipeline_model_parallel_size`` must be 1, and
+    ``dtensor_cfg_overrides`` is applied on top of the student's ``dtensor_cfg``.
     """
 
     tensor_model_parallel_size: int = 1
@@ -47,6 +57,8 @@ class TeacherResourceConfig(BaseModel, extra="allow"):
     precision: str = "bf16"
     micro_batch_size: int = 4
     megatron_cfg_overrides: dict[str, Any] = Field(default_factory=dict)
+    # [CUSTOM] DTensor-teacher-only overrides, applied on top of the student's dtensor_cfg.
+    dtensor_cfg_overrides: dict[str, Any] = Field(default_factory=dict)
 
 
 class NonColocatedTeachersConfig(BaseModel, extra="allow"):
@@ -336,8 +348,8 @@ def create_teacher_worker_groups(
         except Exception as e:
             raise RuntimeError(
                 f"Teacher '{alias}' worker(s) failed during initialization. "
-                f"This often means a stale cached mcore checkpoint — try deleting "
-                f"the cached checkpoint under $HF_HOME/nemo_rl/ and rerunning.\n"
+                f"For Megatron teachers this often means a stale cached mcore checkpoint — "
+                f"try deleting the cached checkpoint under $HF_HOME/nemo_rl/ and rerunning.\n"
                 f"Original error: {e}"
             ) from e
     print("  ✓ All teacher workers healthy", flush=True)
