@@ -171,6 +171,11 @@ automodel = [
   # internode kernels hard-require Hopper TMA/cp.async.bulk PTX instructions (sm_90+) -- they
   # don't even compile for Leonardo's A100s (sm_80), confirmed via a real compile attempt under
   # the v0.6.0 setup.
+  # [CUSTOM] bare-metal: nemo-automodel only declares this in its own "dev" 
+  # dependency group (not in our default-groups, so not installed), used 
+  # here for a chunked/fused linear-CE loss. Made a direct dep of this extra
+  # so our [tool.uv.sources].cut-cross-entropy wheel route actually applies.
+  "cut-cross-entropy",
 ]
 vllm = [
   "cuda-python",

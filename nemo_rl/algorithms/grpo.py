@@ -423,7 +423,12 @@ def setup(
     # ==========================
     #        Loss Function
     # ==========================
-    loss_fn = ClippedPGLossFn(loss_config)
+    loss_fn = ClippedPGLossFn(
+        loss_config,
+        # [CUSTOM]
+        use_linear_ce_fusion="dtensor_cfg" in policy_config
+        and bool(policy_config["dtensor_cfg"].get("use_linear_ce_fusion_loss")),
+    )
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:

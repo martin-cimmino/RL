@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import json
 import logging
 import threading
 import time
@@ -106,6 +107,30 @@ def _replace_prefix_tokens(
         _replace_prefix_tokens keeps the exact prior model tokens up to EOS and
         resumes from the template after that EOS:
             output => [11,12,13,40,41,220,17,2,21,22,40,41]
+
+    [CUSTOM 2026-10-06] Splice-boundary algorithm cherry-picked from upstream
+    NVIDIA-NeMo/RL commit a4e21a8afd6c04eaeb7f46f24a43cd20418295de ("feat(trtllm):
+    support agentic training for SWE rollout (#3130)",
+    nemo_rl/models/generation/openai_server_utils.py::splice_prefix_tokens, as of
+    origin/main 2026-10-06) -- not present on the r0.7.0 release branch as of this port.
+
+    Root cause this replaces: the OLD algorithm here located the splice boundary
+    by comparing raw lengths (asserting len(template_token_ids) >
+    len(template_prefix_token_ids)), then searched backward from the end of the
+    prefix-length window for an EOS token. That assumption breaks for any chat
+    template that strips reasoning (<think>) blocks from a now-stale assistant
+    turn once a new turn is appended on top of it (e.g. DomynEdge's own chat
+    template) -- re-rendering the FULL trajectory from scratch can come out
+    literally SHORTER than the cached prefix that turn was actually generated
+    under, firing a false "non-monotonically increasing trajectory" assertion.
+
+    The fix: locate the splice boundary by EOS *count* instead of raw
+    length/position. Count how many EOS tokens appear in
+    template_prefix_token_ids, then walk template_token_ids and cut right after
+    the same Nth EOS. EOS count per message is invariant to whether that
+    message's reasoning got stripped on re-render (only token *position* shifts,
+    not EOS *count*), so this reduces to the same boundary the old position-based
+    search found when nothing was stripped, and stays correct when it was.
     """
     if not model_prefix_token_ids:
         return template_token_ids
@@ -120,30 +145,21 @@ def _replace_prefix_tokens(
         if model_prefix_token_ids[-1] == eos_token_id:
             model_cut_end -= 1
 
-    # Assert here to prepare for the logic below
-    assert len(template_token_ids) > len(
-        template_prefix_token_ids
-    ), f"""Found possibly non-monotonically increasing trajectory!
-Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
-
-Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
-
-Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
-
-Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
-"""
-
-    # We take everything starting with the EOS token ID.
+    # [CUSTOM 2026-10-06] EOS-count-based boundary search (see docstring note above),
+    # replacing the old length-assert + backward-position-search pair.
+    count_needed = template_prefix_token_ids.count(eos_token_id)
+    count_seen = 0
     template_cut_start = -1
-    for pos in reversed(range(len(template_prefix_token_ids))):
-        if template_token_ids[pos] == eos_token_id:
-            template_cut_start = pos
-            break
+    for pos, tid in enumerate(template_token_ids):
+        if tid == eos_token_id:
+            count_seen += 1
+            if count_seen == count_needed:
+                template_cut_start = pos
+                break
 
-    # This should never be the case, but
     assert (
         template_cut_start >= 0
-    ), f"""No EOS token ID found in the chat-templated messages!
+    ), f"""EOS token #{count_needed} not found in template_token_ids (only found {count_seen} EOS tokens total)!
 Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
 
 Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
@@ -155,6 +171,45 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
     return (
         model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
     )
+
+
+def _normalize_tool_call_arguments(messages: list[dict]) -> None:
+    """[CUSTOM] Normalize each tool_call's arguments from a JSON-encoded string (the standard
+    OpenAI/vLLM wire format -- see vllm.entrypoints.openai.engine.protocol.FunctionCall.
+    arguments: str) into an actual dict, in place.
+
+    DomynEdge's chat_template.jinja (copied from Qwen3-Coder's own official template)
+    renders a dict-valued tool_call.arguments as one `<parameter=NAME>...</parameter>`
+    block per argument, but falls back to embedding the raw string verbatim when
+    arguments is still a string -- these two renderings are NOT the same length. Every
+    caller that tokenizes `messages` to reason about prompt length (e.g. the pre-flight
+    length guard) MUST apply this same normalization first, or it will measure the
+    shorter string-form render while the real request (after this normalization runs
+    inside preprocess_chat) sends the longer dict-form render -- silently
+    under-counting the true prompt length.
+    """
+    for message in messages:
+        for tool_call in message.get("tool_calls") or []:
+            target = tool_call.get("function", tool_call)
+            arguments = target.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    target["arguments"] = json.loads(arguments)
+                except (json.JSONDecodeError, TypeError):
+                    # [CUSTOM] Coerce to {} rather than leaving the raw string in place.
+                    # A malformed `arguments` string can end up in conversation history
+                    # whenever the model's own tool-call generation is imperfect (e.g. cut
+                    # off mid-argument) -- and it gets replayed back on every later turn of
+                    # the same multi-turn trajectory. If left as a string here, vLLM's own
+                    # stock message postprocessing re-parses it with an *unguarded*
+                    # `json.loads`, which raises uncaught and turns into a hard 400 that
+                    # kills the whole rollout -- confirmed via isolated repro against the
+                    # actual installed vLLM package. This exact fix (coerce to {} with a
+                    # warning) is already upstream in vLLM's current main branch, confirmed
+                    # via bisection to land between v0.28.0 and v0.29.0 -- i.e. AFTER
+                    # v0.20.0, the version this project's RL pin uses. Bumping vLLM alone
+                    # will not make this obsolete until it crosses that version.
+                    target["arguments"] = {}
 
 
 class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
@@ -563,6 +618,15 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     if message.get("tool_calls"):
                         message["tool_calls"] = list(message["tool_calls"])
 
+                # [CUSTOM] Normalize tool_call.arguments from a JSON-encoded string into an
+                # actual dict before these messages reach the chat template -- see
+                # _normalize_tool_call_arguments's docstring. Without this, every multi-turn
+                # conversation that replays a prior tool call crashes with `TypeError: Can
+                # only get item pairs from a mapping` the moment the model actually produces
+                # a tool call (invisible before enable_auto_tools was on, since every
+                # tool_choice="auto" request 400'd before generation ever happened).
+                _normalize_tool_call_arguments(messages)
+
                 messages_for_replace_prefix_tokens = deepcopy(messages)
 
                 # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
@@ -837,6 +901,21 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             engine_client=serving_chat_kwargs["engine_client"],
             models=serving_chat_kwargs["models"],
             openai_serving_render=openai_serving_render,
+            # [CUSTOM] OpenAIServingChat already receives this via serving_chat_kwargs
+            # (sourced from http_server_serving_chat_kwargs.default_chat_template_kwargs,
+            # e.g. preserve_thinking for reasoning models like DomynEdge) and stores it as
+            # self.default_chat_template_kwargs -- but create_tokenize() independently reads
+            # its OWN self.default_chat_template_kwargs to pass down to
+            # openai_serving_render.preprocess_chat(), and this dict never forwarded that key,
+            # so /tokenize silently rendered without it while /v1/chat/completions rendered
+            # WITH it. Clients that call /tokenize for multi-turn token accounting (e.g.
+            # OpenHands/litellm) hit the same prefix-continuity monotonicity check in
+            # preprocess_chat, so a mismatch here can produce "Found possibly
+            # non-monotonically increasing trajectory!" even when the two endpoints are
+            # otherwise consistent.
+            default_chat_template_kwargs=serving_chat_kwargs.get(
+                "default_chat_template_kwargs"
+            ),
         )
         openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
             **serving_tokenization_kwargs

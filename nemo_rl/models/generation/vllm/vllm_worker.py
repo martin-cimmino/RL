@@ -48,6 +48,18 @@ from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 logger = logging.getLogger(__name__)
 
 
+def _register_domyn_edge_plugin() -> None:
+    """[CUSTOM] Registers DomynEdge with vLLM's model/config registries."""
+    import vllm
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
+
+    from nemo_rl.models.generation.vllm.domyn_edge import DomynEdgeForCausalLM
+    from nemo_rl.models.generation.vllm.domyn_edge_config import DomynEdgeConfig
+
+    vllm.ModelRegistry.register_model("DomynEdgeForCausalLM", DomynEdgeForCausalLM)
+    _CONFIG_REGISTRY["domynedge"] = DomynEdgeConfig
+
+
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     enable_prefix_caching = vllm_cfg.get("enable_prefix_caching", None)
     if enable_prefix_caching is None:
@@ -449,13 +461,16 @@ class BaseVllmGenerationWorker:
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
             trust_remote_code=True,
             worker_extension_cls="nemo_rl.models.generation.vllm.vllm_backend.VllmInternalWorkerExtension",
-            enable_sleep_mode=True,
+            # [CUSTOM] Config-driven instead of hardcoded True: non-colocated deployments
+            # don't need sleep mode and can disable it to avoid vLLM's cumem-based allocator.
+            enable_sleep_mode=self.cfg["vllm_cfg"].get("enable_sleep_mode", True),
             # Set disable_log_stats=False so that self.llm.get_metrics() works.
             disable_log_stats=False,
             logprobs_mode="processed_logprobs",
             **vllm_kwargs,
         )
 
+        _register_domyn_edge_plugin()  # [CUSTOM]
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
             label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0

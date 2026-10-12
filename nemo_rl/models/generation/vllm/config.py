@@ -30,6 +30,12 @@ class VllmSpecificArgs(TypedDict):
     precision: NotRequired[str]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
     enforce_eager: NotRequired[bool]
+    # [CUSTOM] Whether to construct the vLLM engine with sleep mode support 
+    # (lets the engine release/restore GPU memory between phases in colocated
+    # training). Defaults to True if unset. Non-colocated deployments (dedicated
+    # generation nodes) don't need this and can set it to False to avoid vLLM's
+    # cumem-based allocator entirely.
+    enable_sleep_mode: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
     use_tqdm: NotRequired[bool]

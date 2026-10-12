@@ -90,6 +90,7 @@ def model_forward(
     is_reward_model: bool = False,
     allow_flash_attn_args: bool = True,
     use_cache: bool = False,
+    skip_lm_head: bool = False,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -101,9 +102,16 @@ def model_forward(
         use_cache: Whether to use KV cache. Must be True for inference on models
             with KV sharing (num_kv_shared_layers > 0). Must be False for training
             (backward pass / gradient checkpointing).
+        skip_lm_head: [CUSTOM] If True, run the model's normal (properly FSDP2-wrapped)
+            forward but abort it via a forward-pre-hook on ``lm_head`` right
+            before its matmul, returning hidden states instead of logits. Only
+            valid for models exposing a HF-style ``.model``/``.lm_head`` split.
+            Mutually exclusive with use_cache (fused-CE path never needs KV
+            sharing's inference-only use_cache=True).
 
     Returns:
-        torch.Tensor: Output tensor from the model (logits)
+        torch.Tensor: Output tensor from the model (logits, or hidden states
+        if skip_lm_head is True)
     """
     model_args = dict(
         input_ids=processed_inputs.input_ids,
@@ -145,7 +153,38 @@ def model_forward(
     if not allow_flash_attn_args and "flash_attn_kwargs" in model_args:
         del model_args["flash_attn_kwargs"]
 
-    outputs = model(**model_args)
+    # [CUSTOM] fused linear-CE path, see compute_fused_ce_next_token_logprobs
+    if skip_lm_head:
+        if not hasattr(model, "model") or not hasattr(model, "lm_head"):
+            raise NotImplementedError(
+                f"skip_lm_head=True requires a model with `.model`/`.lm_head` "
+                f"(HF-style causal-LM split); got {type(model)}."
+            )
+        if not getattr(model.lm_head, "_skip_lm_head_hook_registered", False):
+            from nemo_rl.models.automodel.domyn_edge_patches import (
+                _maybe_patch_domyn_edge_skip_lm_head_support,
+            )
+
+            _maybe_patch_domyn_edge_skip_lm_head_support(model)
+        if not getattr(model.lm_head, "_skip_lm_head_hook_registered", False):
+            raise NotImplementedError(
+                f"skip_lm_head=True requires a model whose lm_head has the "
+                f"hidden-state-capture hook registered (see "
+                f"nemo_rl.models.automodel.domyn_edge_patches._maybe_patch_domyn_edge_skip_lm_head_support); "
+                f"got {type(model)}."
+            )
+        from nemo_rl.models.automodel.domyn_edge_patches import _SkipLMHeadSignal
+
+        state = model._nemo_rl_skip_lm_head_state
+        state["value"] = True
+        try:
+            model(**model_args)
+        except _SkipLMHeadSignal as signal:
+            outputs = signal.hidden_states
+        finally:
+            state["value"] = False
+    else:
+        outputs = model(**model_args)
     return outputs
 
 
@@ -169,6 +208,97 @@ def extract_logits(
         return model.lm_head(outputs.last_hidden_state)
     else:
         return outputs.logits
+
+
+def extract_hidden_states(outputs: Any) -> torch.Tensor:
+    """[CUSTOM] Extract pre-lm_head hidden states captured by the skip_lm_head path.
+
+    Args:
+        outputs: Output of the skip_lm_head=True forward pass.
+
+    Returns:
+        torch.Tensor: Hidden states tensor (pre-lm_head).
+    """
+    if isinstance(outputs, (torch.Tensor, DTensor)):
+        return outputs
+    return outputs.last_hidden_state
+
+
+def compute_fused_ce_next_token_logprobs(
+    model: nn.Module,
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+    sampling_params: Optional[TrainingSamplingParams],
+) -> torch.Tensor:
+    """[CUSTOM] Compute next-token logprobs via a fused linear-CE kernel.
+
+    Applies `model.lm_head` and cross-entropy together through
+    `cut_cross_entropy.linear_cross_entropy` (chunked/tiled internally),
+    never materializing the full [seq_len, vocab_size] logits tensor.
+
+    Args:
+        model: The model (used to access `model.lm_head`).
+        hidden_states: Pre-lm_head hidden states, shape [B, S, D]. May be a
+            DTensor (e.g. under sequence_parallel/FSDP); gathered to a plain
+            tensor before the kernel call.
+        input_ids: Input token IDs, shape [B, S].
+        sampling_params: Sampling parameters. Only temperature=1.0 and no
+            top-k/top-p filtering are supported by the fused path.
+
+    Returns:
+        torch.Tensor: Next-token logprobs, shape [B, S - 1], float32.
+    """
+    if sampling_params is not None and sampling_params.temperature != 1.0:
+        raise NotImplementedError(
+            "linear CE fusion does not support temperature scaling != 1.0."
+        )
+    if need_top_k_or_top_p_filtering(sampling_params):
+        raise NotImplementedError(
+            "linear CE fusion does not support top-k/top-p logit filtering."
+        )
+
+    from cut_cross_entropy import linear_cross_entropy
+
+    lm_head = model.lm_head
+    weight = lm_head.weight
+    if isinstance(weight, DTensor):
+        weight = weight.full_tensor()
+
+    # [CUSTOM] Keep the training-time softmax denominator identical to the one vLLM samples
+    # from. DomynEdgeForCausalLM masks generation logits to config.trained_vocab_size
+    trained_vocab_size = getattr(model.config, "trained_vocab_size", None)
+    if trained_vocab_size is not None and trained_vocab_size < weight.shape[0]:
+        if int(targets_max := input_ids.max()) >= trained_vocab_size:
+            raise ValueError(
+                f"Token id {targets_max} is at or beyond trained_vocab_size "
+                f"({trained_vocab_size}); it cannot be scored against the masked "
+                "vocab. This usually means the trajectory was generated before "
+                "the generation-side mask was in place."
+            )
+        weight = weight[:trained_vocab_size]
+    bias = getattr(lm_head, "bias", None)
+    if isinstance(bias, DTensor):
+        bias = bias.full_tensor()
+
+    if isinstance(hidden_states, DTensor):
+        hidden_states = hidden_states.full_tensor()
+
+    # cut_cross_entropy's Triton kernel requires matching dtypes for the
+    # embedding/classifier operands, and its backward requires bf16/fp16
+    # (fp32 unsupported).
+    if hidden_states.dtype != weight.dtype:
+        hidden_states = hidden_states.to(weight.dtype)
+
+    targets = input_ids.roll(shifts=-1, dims=-1)
+    nll = linear_cross_entropy(
+        hidden_states,
+        weight,
+        targets=targets,
+        bias=bias,
+        reduction="none",
+    )
+    next_token_logprobs = -nll.to(torch.float32)
+    return next_token_logprobs[:, :-1]
 
 
 def apply_temperature_scaling(
@@ -340,43 +470,71 @@ def forward_with_post_processing_fn(
     data_dict = processed_mb.data_dict
     processed_inputs = processed_mb.processed_inputs
 
-    # Models with KV sharing (num_kv_shared_layers > 0, e.g. Gemma4 E2B) need
-    # use_cache=True so that DynamicCache is created and shared layers can
-    # retrieve K/V from anchor layers. Without it, shared layers fall back to
-    # untrained K/V projections and produce garbage.
-    # This is compatible with activation checkpointing: Automodel's parallelizer
-    # keeps use_cache=True for KV-sharing models under activation checkpointing
-    # (NVIDIA-NeMo/Automodel#1705).
-    use_cache = _needs_kv_cache_for_shared_layers(model)
-
-    # Model forward pass
-    outputs = model_forward(
-        model,
-        processed_inputs,
-        is_reward_model=is_reward_model,
-        allow_flash_attn_args=allow_flash_attn_args,
-        use_cache=use_cache,
+    # [CUSTOM] linear-CE fusion branch: see compute_fused_ce_next_token_logprobs.
+    use_fused_ce = (
+        isinstance(post_processing_fn, LossPostProcessor)
+        and getattr(post_processing_fn.loss_fn, "use_linear_ce_fusion", False)
+    ) or (
+        isinstance(post_processing_fn, LogprobsPostProcessor)
+        and post_processing_fn.use_linear_ce_fusion
     )
 
-    # Extract logits from model outputs
-    logits = extract_logits(model, outputs)
-    del outputs
+    if use_fused_ce:
+        # Skip the model's own lm_head call entirely: get hidden states and
+        # apply lm_head+cross-entropy together via a fused kernel, so the
+        # full [seq_len, vocab_size] logits tensor is never materialized.
+        # `logits` here already holds precomputed next-token logprobs.
+        outputs = model_forward(
+            model,
+            processed_inputs,
+            is_reward_model=is_reward_model,
+            allow_flash_attn_args=allow_flash_attn_args,
+            skip_lm_head=True,
+        )
+        hidden_states = extract_hidden_states(outputs)
+        del outputs
+        logits = compute_fused_ce_next_token_logprobs(
+            model, hidden_states, processed_inputs.input_ids, sampling_params
+        )
+        del hidden_states
+    else:
+        # Models with KV sharing (num_kv_shared_layers > 0, e.g. Gemma4 E2B) need
+        # use_cache=True so that DynamicCache is created and shared layers can
+        # retrieve K/V from anchor layers. Without it, shared layers fall back to
+        # untrained K/V projections and produce garbage.
+        # This is compatible with activation checkpointing: Automodel's parallelizer
+        # keeps use_cache=True for KV-sharing models under activation checkpointing
+        # (NVIDIA-NeMo/Automodel#1705).
+        use_cache = _needs_kv_cache_for_shared_layers(model)
 
-    # Apply temperature scaling only for sampling-oriented post-processors
-    # Score computations should use unscaled logits
-    if isinstance(
-        post_processing_fn,
-        (
-            LossPostProcessor,
-            LogprobsPostProcessor,
-            TopkLogitsPostProcessor,
-            FullLogitsPostProcessor,
-        ),
-    ):
-        # Temperature scaling is element-wise, directly applying it here.
-        # Other sampling parameters like top-k and top-p need the logits from whole vocabulary,
-        # so applying them when gathering logits from vocab parallel (called in LossPostProcessor and LogprobsPostProcessor).
-        logits = apply_temperature_scaling(logits, sampling_params)
+        # Model forward pass
+        outputs = model_forward(
+            model,
+            processed_inputs,
+            is_reward_model=is_reward_model,
+            allow_flash_attn_args=allow_flash_attn_args,
+            use_cache=use_cache,
+        )
+
+        # Extract logits from model outputs
+        logits = extract_logits(model, outputs)
+        del outputs
+
+        # Apply temperature scaling only for sampling-oriented post-processors
+        # Score computations should use unscaled logits
+        if isinstance(
+            post_processing_fn,
+            (
+                LossPostProcessor,
+                LogprobsPostProcessor,
+                TopkLogitsPostProcessor,
+                FullLogitsPostProcessor,
+            ),
+        ):
+            # Temperature scaling is element-wise, directly applying it here.
+            # Other sampling parameters like top-k and top-p need the logits from whole vocabulary,
+            # so applying them when gathering logits from vocab parallel (called in LossPostProcessor and LogprobsPostProcessor).
+            logits = apply_temperature_scaling(logits, sampling_params)
 
     # Apply the post-processing function directly based on type
     if isinstance(post_processing_fn, LossPostProcessor):
@@ -606,6 +764,11 @@ class LossPostProcessor:
         Returns:
             Tuple of (loss, metrics)
         """
+        # [CUSTOM]
+        if self.cp_size > 1 and getattr(self.loss_fn, "use_linear_ce_fusion", False):
+            raise NotImplementedError(
+                "linear CE fusion does not support context parallelism."
+            )
         # Handle CP redistribution
         if self.cp_size > 1:
             _, data_dict = prepare_data_for_cp(
@@ -679,6 +842,12 @@ class LogprobsPostProcessor:
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
         self.logprob_chunk_size = cfg.get("logprob_chunk_size", None)
+        # [CUSTOM]
+        self.use_linear_ce_fusion = bool(
+            "dtensor_cfg" in cfg and cfg["dtensor_cfg"].get("use_linear_ce_fusion_loss")
+        )
+        # [CUSTOM] Width of the vocab the training loss covered; None = no masking.
+        self.trained_vocab_size = cfg.get("trained_vocab_size")
 
     def __call__(
         self,
@@ -705,7 +874,29 @@ class LogprobsPostProcessor:
         seq_len = processed_inputs.seq_len
         input_lengths = data_dict["input_lengths"]
 
-        if self.cp_size > 1:
+        # [CUSTOM] linear-CE fusion + trained_vocab_size masking block below.
+        if self.cp_size > 1 and self.use_linear_ce_fusion:
+            raise NotImplementedError(
+                "linear CE fusion does not support context parallelism."
+            )
+
+        if not self.use_linear_ce_fusion and self.trained_vocab_size is not None:
+            # Same masking the fused path applies by slicing lm_head.weight, and
+            # that DomynEdgeForCausalLM applies to generation via
+            # LogitsProcessor(org_vocab_size=...). Here the full [B, S, V] logits
+            # already exist, so the slice is direct. Keeping all three in sync is
+            # what keeps the training and sampling softmax denominators equal.
+            if logits.shape[-1] > self.trained_vocab_size:
+                logits = logits[..., : self.trained_vocab_size]
+
+        if self.use_linear_ce_fusion:
+            # `logits` already holds precomputed next-token logprobs, shape
+            # [B, S-1] -- the full [B, S, V] logits tensor was never materialized,
+            # so there is nothing left to gather/chunk here. Skip straight to the
+            # shared zero-prepend + packing/masking tail below.
+            token_logprobs = logits
+            assert token_logprobs.shape[1] == seq_len - 1
+        elif self.cp_size > 1:
             seq_index_tensor = (
                 DTensor.from_local(
                     processed_inputs.seq_index,

@@ -923,6 +923,43 @@ nvtx = [
 ]
 
 [[package]]
+name = "cut-cross-entropy"
+version = "25.3.2"
+source = { path = "../../wheelyard/nemo-RL-v0.7.0-cu12.6/cut_cross_entropy-25.3.2-py3-none-any.whl" }
+dependencies = [
+    { name = "setuptools", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "triton", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
+wheels = [
+    { filename = "cut_cross_entropy-25.3.2-py3-none-any.whl", hash = "sha256:f57b633c60dfed137d835f9541ccaa2dd1c237bd2d984d82affaa3ffb1b48821" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "accelerate", marker = "extra == 'all'", specifier = ">=0.34.2" },
+    { name = "build", marker = "extra == 'dev'" },
+    { name = "cut-cross-entropy", extras = ["all", "test"], marker = "extra == 'dev'" },
+    { name = "cut-cross-entropy", extras = ["transformers"], marker = "extra == 'all'" },
+    { name = "datasets", marker = "extra == 'all'", specifier = ">=3.1.0" },
+    { name = "deepspeed", marker = "sys_platform != 'darwin' and extra == 'all'", specifier = ">=0.15.1" },
+    { name = "fire", marker = "extra == 'all'" },
+    { name = "huggingface-hub", marker = "extra == 'all'", specifier = ">=0.26.2" },
+    { name = "pandas", marker = "extra == 'all'" },
+    { name = "pre-commit", marker = "extra == 'dev'" },
+    { name = "pytest", marker = "extra == 'test'" },
+    { name = "pytest-sugar", marker = "extra == 'test'" },
+    { name = "pytest-xdist", marker = "extra == 'dev'" },
+    { name = "setuptools", specifier = ">=77.0.3" },
+    { name = "torch", specifier = ">=2.4" },
+    { name = "tqdm", marker = "extra == 'all'" },
+    { name = "transformers", marker = "extra == 'transformers'", specifier = ">=4.48.2" },
+    { name = "triton", marker = "sys_platform != 'darwin'", specifier = ">=3.0.0" },
+    { name = "twine", marker = "extra == 'dev'" },
+]
+provides-extras = ["test", "transformers", "all", "dev"]
+
+[[package]]
 name = "cycler"
 version = "0.12.1"
 source = { registry = "https://pypi.org/simple" }
@@ -3335,6 +3372,7 @@ dependencies = [
 [package.optional-dependencies]
 automodel = [
     { name = "causal-conv1d", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "cut-cross-entropy", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "mamba-ssm", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "mistral-common", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -3445,6 +3483,7 @@ requires-dist = [
     { name = "cuda-bindings", marker = "sys_platform != 'darwin'" },
     { name = "cuda-python", marker = "extra == 'vllm'" },
     { name = "cupy-cuda13x", marker = "python_full_version != '3.13.*' and extra == 'mcore'" },
+    { name = "cut-cross-entropy", marker = "extra == 'automodel'", path = "../../wheelyard/nemo-RL-v0.7.0-cu12.6/cut_cross_entropy-25.3.2-py3-none-any.whl" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "debugpy" },
     { name = "deep-ep", marker = "platform_machine == 'aarch64' and extra == 'mcore'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" },

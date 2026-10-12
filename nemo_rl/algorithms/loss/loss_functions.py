@@ -216,7 +216,10 @@ class ClippedPGLossFn(LossFunction):
 
     input_type = LossInputType.LOGPROB
 
-    def __init__(self, cfg: ClippedPGLossConfig):
+    def __init__(self, cfg: ClippedPGLossConfig, use_linear_ce_fusion: bool = False):
+        # [CUSTOM] NLLLossFn/DPOLossFn already accept this upstream; ClippedPGLossFn (used by GRPO) never got the parameter,
+        # added here to match.
+        self.use_linear_ce_fusion = use_linear_ce_fusion
         self.disable_ppo_ratio = cfg.disable_ppo_ratio
         self.ratio_clip_min = cfg.ratio_clip_min
         self.ratio_clip_max = cfg.ratio_clip_max

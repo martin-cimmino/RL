@@ -56,6 +56,7 @@ from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
 from nemo_automodel.components.moe.config import MoEParallelizerConfig
+from nemo_automodel.shared.utils import dtype_from_str
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from transformers import (
     AutoConfig,
@@ -70,6 +71,16 @@ from nemo_rl.models.automodel.config import (
     DistributedContext,
     ModelAndOptimizerState,
     RuntimeConfig,
+)
+# [CUSTOM] DomynEdge-specific patches and TP plan -- see that module's own header.
+from nemo_rl.models.automodel.domyn_edge_patches import (
+    _maybe_patch_domyn_edge_activation_checkpointing,
+    _maybe_patch_domyn_edge_attention_head_sharding,
+    _maybe_patch_domyn_edge_packed_attention,
+    _maybe_patch_domyn_edge_rope_autocast,
+    _maybe_patch_domyn_edge_skip_lm_head_support,
+    _maybe_patch_domyn_edge_varlen_attn,
+    get_domyn_edge_tp_plan,
 )
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
@@ -477,6 +488,29 @@ def setup_distributed(
     # Build tp_plan from custom_parallel_plan config if set, else None (auto-select)
     tp_plan = config["dtensor_cfg"].get("custom_parallel_plan", None)
 
+    # [CUSTOM] TODO: improve this
+    # Automodel's own resolution of a custom_parallel_plan import-path string
+    # (nemo_automodel...parallelizer.py's `_get_parallel_plan`) always calls
+    # it as a zero-arg function (`plan_obj()`) -- there's no mechanism to
+    # forward `sequence_parallel` through that generic path. Special-case
+    # our own function here and pre-resolve to a literal dict (the other
+    # branch `_get_parallel_plan` already supports) so SP actually reaches
+    # it instead of always silently getting the `sequence_parallel=False`
+    # default.
+    if (
+        tp_plan
+        == f"{get_domyn_edge_tp_plan.__module__}.{get_domyn_edge_tp_plan.__qualname__}"
+    ):
+        tp_plan = get_domyn_edge_tp_plan(sequence_parallel=sequence_parallel_enabled)
+
+    # [CUSTOM] dtype each FSDP2-wrapped module's *output* gets cast to, on top of
+    # param_dtype's compute dtype -- YAML-configurable: None is the
+    # recommended default, no forced cast. The places that actually need fp32
+    # (log_softmax/loss computation) already upcast explicitly themselves.
+    output_dtype_cfg = config["dtensor_cfg"].get("output_dtype", None)
+    if isinstance(output_dtype_cfg, str):
+        output_dtype_cfg = dtype_from_str(output_dtype_cfg, default=None)
+
     # Create FSDP2Config
     fsdp2_config = FSDP2Config(
         sequence_parallel=sequence_parallel_enabled,
@@ -484,7 +518,7 @@ def setup_distributed(
         mp_policy=MixedPrecisionPolicy(
             param_dtype=dtype,
             reduce_dtype=torch.float32,
-            output_dtype=torch.float32,
+            output_dtype=output_dtype_cfg,  # [CUSTOM] was hardcoded torch.float32 upstream
         ),
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
         activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
@@ -752,6 +786,10 @@ def setup_model_and_optimizer(
     # checkpoint dtype, which would break optimizer master-weight precision (see helper).
     _disable_automodel_checkpoint_dtype_restore()
 
+    # [CUSTOM] Must run before from_pretrained, which applies the TP plan (and the
+    # head-count patch this gates) internally.
+    _maybe_patch_domyn_edge_attention_head_sharding(model_config)
+
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
     model = model_class.from_pretrained(
@@ -768,6 +806,20 @@ def setup_model_and_optimizer(
         sdpa_method=sdpa_method,
         **from_pretrained_kwargs,
         **automodel_kwargs,
+    )
+
+    # [CUSTOM] Width of the vocab the training loss covered
+    trained_vocab_size = config.get("trained_vocab_size")
+    if trained_vocab_size is not None:
+        model.config.trained_vocab_size = trained_vocab_size
+
+    # [CUSTOM] DomynEdge-specific patches -- no-ops for every other model.
+    _maybe_patch_domyn_edge_varlen_attn(model_config)
+    _maybe_patch_domyn_edge_packed_attention(model)
+    _maybe_patch_domyn_edge_rope_autocast(model)
+    _maybe_patch_domyn_edge_skip_lm_head_support(model)
+    _maybe_patch_domyn_edge_activation_checkpointing(
+        model, config["dtensor_cfg"]["activation_checkpointing"]
     )
 
     print(model)
