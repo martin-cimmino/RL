@@ -37,6 +37,8 @@ class TeacherResourceConfig(BaseModel, extra="allow"):
     ``extra="allow"`` keeps the escape hatch for arbitrary megatron settings:
     any unknown top-level key is folded into ``megatron_cfg_overrides``.
 
+    # [CUSTOM] The teacher backend following the student (Megatron vs DTensor) is a
+    # fork-specific extension -- upstream's non-colocated teachers are Megatron-only.
     The teacher backend follows the student: a Megatron policy gets Megatron
     teachers (``tensor_model_parallel_size`` / ``pipeline_model_parallel_size`` /
     ``context_parallel_size`` / ``megatron_cfg_overrides``), a DTensor policy gets
@@ -55,6 +57,7 @@ class TeacherResourceConfig(BaseModel, extra="allow"):
     precision: str = "bf16"
     micro_batch_size: int = 4
     megatron_cfg_overrides: dict[str, Any] = Field(default_factory=dict)
+    # [CUSTOM] DTensor-teacher-only overrides, applied on top of the student's dtensor_cfg.
     dtensor_cfg_overrides: dict[str, Any] = Field(default_factory=dict)
 
 

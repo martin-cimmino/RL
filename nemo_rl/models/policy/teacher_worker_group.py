@@ -18,6 +18,10 @@ Each TeacherWorkerGroup wraps a RayWorkerGroup running an inference-only policy
 worker for a single teacher model checkpoint. The backend follows the student
 policy: MegatronPolicyWorker when ``policy.megatron_cfg`` is enabled, otherwise
 DTensorPolicyWorkerV2 (``policy.dtensor_cfg``, FSDP2 + TP).
+
+[CUSTOM] The DTensor teacher backend (``_build_dtensor_cfg``, ``self.backend``
+dispatch, ``dynamic_batching`` support below) is a fork-specific extension --
+upstream non-colocated teachers only support Megatron.
 """
 
 from __future__ import annotations
@@ -57,6 +61,7 @@ class TeacherConfig:
     precision: str
     micro_batch_size: int
     megatron_cfg_overrides: dict[str, Any]
+    # [CUSTOM]
     dtensor_cfg_overrides: dict[str, Any] = field(default_factory=dict)
 
 
@@ -105,7 +110,7 @@ def create_teacher_configs_from_opd_config(
                 precision=res.precision,
                 micro_batch_size=res.micro_batch_size,
                 megatron_cfg_overrides=all_overrides,
-                dtensor_cfg_overrides=dict(res.dtensor_cfg_overrides),
+                dtensor_cfg_overrides=dict(res.dtensor_cfg_overrides),  # [CUSTOM]
             )
         )
 
@@ -133,8 +138,9 @@ class TeacherWorkerGroup:
         self.model_name = teacher_cfg.model_name
         self.teacher_cfg = teacher_cfg
 
-        # Build a policy config for inference-only use. The teacher backend
+        # [CUSTOM] Build a policy config for inference-only use. The teacher backend
         # follows the student: DTensor student -> DTensor teacher, else Megatron.
+        # Upstream only ever built the Megatron cfg inline here.
         self.backend = (
             "dtensor"
             if policy_config.get("dtensor_cfg", {}).get("enabled", False)
@@ -169,6 +175,8 @@ class TeacherWorkerGroup:
 
         from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 
+        # [CUSTOM] backend-conditional worker class/kwargs; upstream always built the
+        # Megatron worker_cls_fqn/worker_kwargs unconditionally here.
         if self.backend == "dtensor":
             worker_cls_fqn = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
             env_vars = cfg["dtensor_cfg"].get("env_vars", {})
@@ -203,6 +211,7 @@ class TeacherWorkerGroup:
 
         # Set up sequence packing / dynamic batching (mirrors lm_policy.py)
         self.use_sequence_packing = cfg["sequence_packing"]["enabled"]
+        # [CUSTOM] dynamic batching support for teacher workers (DTensor-only path).
         self.use_dynamic_batches = cfg["dynamic_batching"]["enabled"]
         # SP-forward divisor; the collector reads it to pre-pad non-packed inputs.
         self.sequence_length_pad_multiple = cp * 2 * tp if cp > 1 else tp
@@ -214,7 +223,7 @@ class TeacherWorkerGroup:
                 "sequence_length_pad_multiple": self.sequence_length_pad_multiple,
             }
         if self.use_dynamic_batches:
-            # DTensor workers read dynamic_batching from cfg and expect micro_batch_indices on the shards
+            # [CUSTOM] DTensor workers read dynamic_batching from cfg and expect micro_batch_indices on the shards
             self.dynamic_batching_args: DynamicBatchingArgs = {
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
@@ -273,7 +282,7 @@ class TeacherWorkerGroup:
     def _build_dtensor_cfg(
         self, teacher_cfg: TeacherConfig, policy_config: dict[str, Any]
     ) -> tuple[dict[str, Any], int, int, int]:
-        """Policy config for a DTensor (FSDP2 + TP) inference-only teacher.
+        """[CUSTOM] Policy config for a DTensor (FSDP2 + TP) inference-only teacher.
 
         Returns (cfg, tp, pp, cp). The student's dtensor_cfg is the base; the
         teacher only changes parallelism and drops training-only features. The
@@ -336,7 +345,7 @@ class TeacherWorkerGroup:
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         mbs = micro_batch_size or self._micro_batch_size
 
-        if self.use_dynamic_batches:
+        if self.use_dynamic_batches:  # [CUSTOM]
             sharded_data, unsorted_data_indices = data.shard_by_batch_size(
                 dp_size,
                 batch_size=None,

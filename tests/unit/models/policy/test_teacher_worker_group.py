@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [CUSTOM] Tests for the DTensor non-colocated teacher backend (see
+# nemo_rl/models/policy/teacher_worker_group.py) -- a fork-specific extension,
+# upstream teacher workers are Megatron-only.
+
 
 def test_teacher_resource_config_defaults():
     from nemo_rl.algorithms.opd import TeacherResourceConfig
