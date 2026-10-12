@@ -14,15 +14,17 @@
 
 """Non-colocated teacher worker group for MOPD async distillation.
 
-Each TeacherWorkerGroup wraps a RayWorkerGroup running MegatronPolicyWorker
-in inference-only mode for a single teacher model checkpoint.
+Each TeacherWorkerGroup wraps a RayWorkerGroup running an inference-only policy
+worker for a single teacher model checkpoint. The backend follows the student
+policy: MegatronPolicyWorker when ``policy.megatron_cfg`` is enabled, otherwise
+DTensorPolicyWorkerV2 (``policy.dtensor_cfg``, FSDP2 + TP).
 """
 
 from __future__ import annotations
 
 import warnings
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import numpy as np
@@ -31,6 +33,7 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.opd import TeacherResourceConfig
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
+    DynamicBatchingArgs,
     SequencePackingArgs,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -54,6 +57,7 @@ class TeacherConfig:
     precision: str
     micro_batch_size: int
     megatron_cfg_overrides: dict[str, Any]
+    dtensor_cfg_overrides: dict[str, Any] = field(default_factory=dict)
 
 
 def create_teacher_configs_from_opd_config(
@@ -101,6 +105,7 @@ def create_teacher_configs_from_opd_config(
                 precision=res.precision,
                 micro_batch_size=res.micro_batch_size,
                 megatron_cfg_overrides=all_overrides,
+                dtensor_cfg_overrides=dict(res.dtensor_cfg_overrides),
             )
         )
 
@@ -128,53 +133,17 @@ class TeacherWorkerGroup:
         self.model_name = teacher_cfg.model_name
         self.teacher_cfg = teacher_cfg
 
-        # Build a policy config for inference-only use.
-        cfg = deepcopy(policy_config)
-        cfg["model_name"] = self.model_name
-        # Override parallelism from teacher config.
-        if "megatron_cfg" not in cfg:
-            cfg["megatron_cfg"] = {}
-        cfg["megatron_cfg"]["enabled"] = True
-        cfg["megatron_cfg"]["tensor_model_parallel_size"] = (
-            teacher_cfg.tensor_model_parallel_size
+        # Build a policy config for inference-only use. The teacher backend
+        # follows the student: DTensor student -> DTensor teacher, else Megatron.
+        self.backend = (
+            "dtensor"
+            if policy_config.get("dtensor_cfg", {}).get("enabled", False)
+            else "megatron"
         )
-        cfg["megatron_cfg"]["pipeline_model_parallel_size"] = (
-            teacher_cfg.pipeline_model_parallel_size
-        )
-        cfg["megatron_cfg"]["context_parallel_size"] = teacher_cfg.context_parallel_size
-        cfg["megatron_cfg"]["expert_model_parallel_size"] = (
-            teacher_cfg.expert_model_parallel_size
-        )
-
-        # Apply any additional megatron config overrides from teacher config.
-        for key, value in teacher_cfg.megatron_cfg_overrides.items():
-            cfg["megatron_cfg"][key] = value
-
-        # Teachers run Megatron inference-only. Don't let the student's other
-        # backend or parameter-adding features leak onto the frozen teacher.
-        if cfg.get("dtensor_cfg", {}).get("enabled", False):
-            raise ValueError(
-                f"Teacher '{self.alias}': only the Megatron backend is supported "
-                "for teachers, but the policy config has dtensor_cfg.enabled=True."
-            )
-        if "dtensor_cfg" in cfg:
-            cfg["dtensor_cfg"]["enabled"] = False
-        if "peft" in cfg["megatron_cfg"]:
-            cfg["megatron_cfg"]["peft"]["enabled"] = False
-        if "draft" in cfg:
-            cfg["draft"]["enabled"] = False
-        # The teacher uses the plain Megatron worker, so a student-side quant_cfg
-        # would be silently ignored. Drop it explicitly and warn instead.
-        if cfg.get("quant_cfg") is not None:
-            warnings.warn(
-                f"Teacher '{self.alias}': quantization is not supported for teachers; "
-                "running the teacher unquantized (ignoring the policy's quant_cfg)."
-            )
-            cfg["quant_cfg"] = None
-
-        tp = teacher_cfg.tensor_model_parallel_size
-        pp = teacher_cfg.pipeline_model_parallel_size
-        cp = teacher_cfg.context_parallel_size
+        if self.backend == "dtensor":
+            cfg, tp, pp, cp = self._build_dtensor_cfg(teacher_cfg, policy_config)
+        else:
+            cfg, tp, pp, cp = self._build_megatron_cfg(teacher_cfg, policy_config)
 
         # Validate parallelism fits the cluster (matches lm_policy.py)
         world_size = cluster.world_size()
@@ -200,19 +169,26 @@ class TeacherWorkerGroup:
 
         from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 
+        if self.backend == "dtensor":
+            worker_cls_fqn = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+            env_vars = cfg["dtensor_cfg"].get("env_vars", {})
+            # DTensor v2 workers rebuild the tokenizer locally from cfg["tokenizer"].
+            worker_kwargs: dict[str, Any] = {}
+        else:
+            worker_cls_fqn = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
+            env_vars = cfg["megatron_cfg"].get("env_vars", {})
+            worker_kwargs = {"tokenizer": tokenizer, "processor": None}
+
         worker_builder = RayWorkerBuilder(
-            "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",
+            worker_cls_fqn,
             cfg,
-            tokenizer=tokenizer,
-            processor=None,
             init_optimizer=False,
             weights_path=None,
             optimizer_path=None,
             init_reference_model=False,
             worker_sharding_annotations=self.sharding_annotations,
+            **worker_kwargs,
         )
-
-        env_vars = cfg["megatron_cfg"].get("env_vars", {})
 
         self.worker_group = RayWorkerGroup(
             cluster,
@@ -237,6 +213,119 @@ class TeacherWorkerGroup:
                 "input_lengths_key": "input_lengths",
                 "sequence_length_pad_multiple": self.sequence_length_pad_multiple,
             }
+        if self.use_dynamic_batches:
+            # DTensor workers read dynamic_batching from cfg and expect micro_batch_indices on the shards
+            self.dynamic_batching_args: DynamicBatchingArgs = {
+                "input_key": "input_ids",
+                "input_lengths_key": "input_lengths",
+                "sequence_length_round": cfg["dynamic_batching"]["sequence_length_round"],
+                "max_tokens_per_microbatch": cfg["dynamic_batching"]["logprob_mb_tokens"],
+            }
+
+    def _build_megatron_cfg(
+        self, teacher_cfg: TeacherConfig, policy_config: dict[str, Any]
+    ) -> tuple[dict[str, Any], int, int, int]:
+        """Policy config for a Megatron inference-only teacher. Returns (cfg, tp, pp, cp)."""
+        cfg = deepcopy(policy_config)
+        cfg["model_name"] = self.model_name
+        # Override parallelism from teacher config.
+        if "megatron_cfg" not in cfg:
+            cfg["megatron_cfg"] = {}
+        cfg["megatron_cfg"]["enabled"] = True
+        cfg["megatron_cfg"]["tensor_model_parallel_size"] = (
+            teacher_cfg.tensor_model_parallel_size
+        )
+        cfg["megatron_cfg"]["pipeline_model_parallel_size"] = (
+            teacher_cfg.pipeline_model_parallel_size
+        )
+        cfg["megatron_cfg"]["context_parallel_size"] = teacher_cfg.context_parallel_size
+        cfg["megatron_cfg"]["expert_model_parallel_size"] = (
+            teacher_cfg.expert_model_parallel_size
+        )
+
+        # Apply any additional megatron config overrides from teacher config.
+        for key, value in teacher_cfg.megatron_cfg_overrides.items():
+            cfg["megatron_cfg"][key] = value
+
+        # Teachers run Megatron inference-only. Don't let the student's other
+        # backend or parameter-adding features leak onto the frozen teacher.
+        if "dtensor_cfg" in cfg:
+            cfg["dtensor_cfg"]["enabled"] = False
+        if "peft" in cfg["megatron_cfg"]:
+            cfg["megatron_cfg"]["peft"]["enabled"] = False
+        if "draft" in cfg:
+            cfg["draft"]["enabled"] = False
+        # The teacher uses the plain Megatron worker, so a student-side quant_cfg
+        # would be silently ignored. Drop it explicitly and warn instead.
+        if cfg.get("quant_cfg") is not None:
+            warnings.warn(
+                f"Teacher '{self.alias}': quantization is not supported for teachers; "
+                "running the teacher unquantized (ignoring the policy's quant_cfg)."
+            )
+            cfg["quant_cfg"] = None
+        return (
+            cfg,
+            teacher_cfg.tensor_model_parallel_size,
+            teacher_cfg.pipeline_model_parallel_size,
+            teacher_cfg.context_parallel_size,
+        )
+
+    def _build_dtensor_cfg(
+        self, teacher_cfg: TeacherConfig, policy_config: dict[str, Any]
+    ) -> tuple[dict[str, Any], int, int, int]:
+        """Policy config for a DTensor (FSDP2 + TP) inference-only teacher.
+
+        Returns (cfg, tp, pp, cp). The student's dtensor_cfg is the base; the
+        teacher only changes parallelism and drops training-only features. The
+        tokenizer stays the student's: teacher logprobs are computed over the
+        student's own token ids, so both models must share a vocabulary.
+        """
+        if not policy_config["dtensor_cfg"].get("_v2", False):
+            raise ValueError(
+                f"Teacher '{self.alias}': DTensor teachers require "
+                "policy.dtensor_cfg._v2=true (DTensorPolicyWorkerV2)."
+            )
+        if teacher_cfg.pipeline_model_parallel_size != 1:
+            raise ValueError(
+                f"Teacher '{self.alias}': DTensor teachers do not support pipeline "
+                f"parallelism (got pipeline_model_parallel_size="
+                f"{teacher_cfg.pipeline_model_parallel_size})."
+            )
+        cfg = deepcopy(policy_config)
+        cfg["model_name"] = self.model_name
+        tp = teacher_cfg.tensor_model_parallel_size
+        cp = teacher_cfg.context_parallel_size
+
+        dt = cfg["dtensor_cfg"]
+        dt["tensor_parallel_size"] = tp
+        dt["context_parallel_size"] = cp
+        # Frozen teacher on dedicated GPUs: CPU offload / activation checkpointing
+        # only slow inference down. dtensor_cfg_overrides can still re-enable them.
+        dt["cpu_offload"] = False
+        dt["activation_checkpointing"] = False
+        if "lora_cfg" in dt:
+            dt["lora_cfg"]["enabled"] = False
+        for key, value in teacher_cfg.dtensor_cfg_overrides.items():
+            dt[key] = value
+
+        precision = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}.get(
+            teacher_cfg.precision, teacher_cfg.precision
+        )
+        cfg["precision"] = precision
+        cfg["offload_optimizer_for_logprob"] = False
+        if "megatron_cfg" in cfg:
+            cfg["megatron_cfg"]["enabled"] = False
+        if "draft" in cfg:
+            cfg["draft"]["enabled"] = False
+        if cfg.get("quant_cfg") is not None:
+            warnings.warn(
+                f"Teacher '{self.alias}': quantization is not supported for teachers; "
+                "running the teacher unquantized (ignoring the policy's quant_cfg)."
+            )
+            cfg["quant_cfg"] = None
+        # The student's processor (VLM) flag does not apply to a text teacher.
+        cfg.setdefault("tokenizer", {})["use_processor"] = False
+        return cfg, tp, 1, cp
 
     def get_logprobs(
         self,
@@ -247,7 +336,13 @@ class TeacherWorkerGroup:
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         mbs = micro_batch_size or self._micro_batch_size
 
-        if self.use_sequence_packing:
+        if self.use_dynamic_batches:
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                dynamic_batching_args=self.dynamic_batching_args,
+            )
+        elif self.use_sequence_packing:
             self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
                 "sequence_packing"
             ]["logprob_mb_tokens"]
