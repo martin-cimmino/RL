@@ -32,10 +32,12 @@ dependencies = [
   "setuptools",
   "pip",                                                                                                 # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",                                                                                               # for flash-attn parallel build
-  # bare-metal: back to NeMo-RL v0.7.0's own upstream pin, routed to cu126 wheels instead of
-  # cu130 -- see [tool.uv].override-dependencies below (same reasoning as v0.6.0's own torch
-  # override: Automodel's own vendored pyproject.toml hardcodes its own torch/torchvision index,
-  # so a [tool.uv.sources] index route here would conflict; direct wheel URLs sidestep it).
+  # cuda-13: matches NeMo-RL v0.7.0's own upstream pin exactly -- routed to real cu130 wheels via
+  # direct URLs in [tool.uv].override-dependencies below, not a [tool.uv.sources] index route
+  # (Automodel's own vendored pyproject.toml hardcodes its own pytorch-cu129 index for
+  # torch/torchvision, so declaring any index here for these two packages would conflict --
+  # "Requirements contain conflicting indexes for package torch"; same reasoning as v0.6.0 and
+  # this fork's own cu126 branch).
   "torch==2.11.0",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
@@ -70,21 +72,18 @@ dependencies = [
   "timm",
   "open-clip-torch>=3.2.0",
   "mlflow>=3.13.0",
-  # bare-metal: cu13 -> cu12 suffix swap only, version floor kept exactly as upstream wrote it.
+  # cuda-13: matches upstream's own pin exactly
   # deep_ep (the only consumer) is dropped entirely below (Hopper-only, confirmed unbuildable on
   # Leonardo's A100s/sm_80 via a real compile attempt in the v0.6.0 setup), so this package is
   # never actually exercised; kept importable/harmless rather than dropped outright.
-  "nvidia-nvshmem-cu12>=3.6.5; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
+  "nvidia-nvshmem-cu13>=3.6.5; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
   "soundfile>=0.13.1",
   "nccl4py; sys_platform != 'darwin'",                                                                                       # for non-colocated refit
   "cuda-bindings; sys_platform != 'darwin'",                                                                                 # for non-colocated refit
   "pybase64",                                                                                                                # for sglang refit
-  # bare-metal: cu13 -> cu12, same version number (verify this exact patch exists for cu12 during
-  # the first real `uv sync` -- not independently confirmed, only the cu13 pin and cu12 package's
-  # existence were, see nemo-rl-0.7.0-wheelyard-plan.md).
-  "nvidia-cudnn-cu12==9.20.0.48; sys_platform != 'darwin'",                                                                  # for transformer-engine no build isolation
+  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                                  # for transformer-engine no build isolation
   # tilelang — replacement Triton kernel mamba-ssm requires when
   # Triton >= 3.4.0 on Hopper, see github.com/state-spaces/mamba#640.
   # Without this, qwen3.5 / nano-v3 / moonlight megatron recipes
@@ -110,18 +109,17 @@ dependencies = [
   # binary that ships in this wheel at <site-packages>/mooncake/. Bundled
   # with TQ rather than gated behind an extra so worker venvs (built
   # without extras) can be flipped to mooncake_cpu via config alone.
-  # bare-metal: plain cu12-default `mooncake-transfer-engine` instead of upstream's
-  # `-cuda13` distribution name -- same package/namespace, cu12-linked build. This repo's own
-  # comment confirms this cu12 variant exists and works; it's pinned to cu13 upstream only to
-  # match an assumed cu13 base image.
-  # bare-metal: also bumped 0.3.11.post1 -> 0.3.13.post1 (latest) -- confirmed via a real `uv
-  # sync` install-time error that upstream's exact pinned version only ships manylinux_2_35
-  # wheels (needs glibc 2.35+), incompatible with this cluster's RHEL8/glibc 2.28. Checked every
-  # release on PyPI: manylinux_2_28 support starts at 0.3.12 -- same RHEL8-compat footgun class
-  # already documented for vllm/flash-attn/TE elsewhere in this project, just discovered here for
-  # a different package. No functional concern bumping a patch-level data-plane dependency we
-  # don't actively use (default backend is "simple"/in-process, see TransferQueue comment above).
-  "mooncake-transfer-engine==0.3.13.post1 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # bare-metal: matches upstream's own `-cuda13` distribution name now (real CUDA 13 runtime,
+  # libcudart.so.13) -- bumped 0.3.11.post1 -> 0.3.13.post1 (latest) though, same as the cu126
+  # branch: confirmed via a real `uv sync` install-time error that upstream's exact pinned version
+  # only ships manylinux_2_35 wheels (needs glibc 2.35+), incompatible with this cluster's
+  # RHEL8/glibc 2.28. Checked every release on PyPI: manylinux_2_28 support starts at 0.3.12 --
+  # same RHEL8-compat footgun class already documented for vllm/flash-attn/TE elsewhere in this
+  # project, just discovered here for a different package (and independent of the CUDA
+  # version -- confirmed the same manylinux_2_28 gap exists on the -cuda13 distribution too). No
+  # functional concern bumping a patch-level data-plane dependency we don't actively use (default
+  # backend is "simple"/in-process, see TransferQueue comment above).
+  "mooncake-transfer-engine-cuda13==0.3.13.post1 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 
 # bare-metal: carried over unchanged from v0.6.0 -- our own DomynEdge-specific plugin, not an
@@ -157,12 +155,11 @@ automodel = [
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
-  # bare-metal: plain PyPI pin instead of upstream's git+core_cu13 source -- matches v0.6.0's own
-  # automodel-extra pattern (PyPI's bare "transformer-engine" extra already defaults to core_cu12,
-  # confirmed directly in TE's own setup.py). Pinned to the EXACT version our locally-built
-  # transformer-engine-torch wheel (below) was built against -- a range here could let the
-  # resolver pick a transformer-engine-torch version other than our wheel's.
-  "transformer-engine[pytorch,core_cu12]==2.14.1",
+  # bare-metal: plain PyPI pin instead of upstream's git+core_cu13 source. core_cu13 is upstream's own real extra
+  # here now -- no substitution needed, matches [tool.uv.sources].transformer-engine-torch's
+  # cu13.0 wheel below. Pinned to the EXACT version that wheel was built against -- a range here
+  # could let the resolver pick a transformer-engine-torch version other than our wheel's.
+  "transformer-engine[pytorch,core_cu13]==2.14.1",
   # bare-metal: transformer-engine[pytorch]'s own wheel only pulls this in transitively -- made a
   # direct dep so our [tool.uv.sources].transformer-engine-torch override actually applies (same
   # footgun already hit on flash-attn/torchaudio/openai/xgrammar/llguidance, see CLAUDE.md).
@@ -182,11 +179,10 @@ vllm = [
   # bare-metal: deep_gemm/deep_ep dropped -- see automodel extra's comment above, same reasoning
   # (both hard-require Hopper sm_90+, confirmed unbuildable on A100 regardless of CUDA toolkit
   # version).
-  # bare-metal: plain version pin instead of upstream's GitHub-release-wheel URLs (that release is
-  # cu130-only) -- routed to a wheel built from source against cu126 instead, see
-  # [tool.uv.sources].vllm below and .tmp/vllm-0.20.0-cu126-build-test.md for the validation this
-  # was built from.
-  "vllm==0.20.0",
+  # cuda-13: no version pin -- our locally-built wheel (see [tool.uv.sources].vllm below) carries
+  # a setuptools-scm dev version string (0.20.1.dev1+g...) rather than a clean 0.20.0, because the
+  # git worktree it was built from is 1 commit past the v0.20.0 tag. A strict `==0.20.0` pin would reject that dev version outright.
+  "vllm",
   # bare-metal: vllm's own wheel doesn't declare flash-attn as a dependency at all (confirmed via
   # its actual PyPI Requires-Dist metadata), but made a direct dep here anyway for the same
   # footgun-avoidance reason as automodel's own flash-attn line -- harmless if actually unused by
@@ -195,27 +191,16 @@ vllm = [
   "num2words>=0.5.14",
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
-  # bare-metal: flashinfer-jit-cache dropped -- this is NeMo-RL's own optional AOT-kernel-cache
-  # addition (not part of vllm==0.20.0's own actual Requires-Dist, confirmed via its PyPI
-  # metadata). A cu126 index does exist (https://flashinfer.ai/whl/cu126/), but checked it
-  # directly -- it has no build of this exact pinned version (0.6.8.post1) at all, only newer
-  # releases. v0.6.0's bare-metal setup never used jit-cache either and works fine without it.
-  # Revisit (with a newer flashinfer-python/cubin/jit-cache version set, kept all three in sync)
-  # only if first-run perf profiling shows AOT caching actually matters here.
-  # bare-metal: dropped the `[cu13]` extra marker -- confirmed via nvidia-cutlass-dsl's own PyPI
-  # metadata that it has no `[cu12]` extra at all (only `cu13`/`qnx`/`qnx-cu13`); the bare package
-  # with no extra already targets cu12 by default, so this is the correct way to get cu12, not a
-  # simplification of upstream's intent.
-  "nvidia-cutlass-dsl>=4.5.2",
+  # Routed via [tool.uv.sources].flashinfer-jit-cache below, matching upstream.
+  "flashinfer-jit-cache==0.6.8.post1",
+  "nvidia-cutlass-dsl[cu13]>=4.5.2",
 ]
-# bare-metal: sglang==0.5.12.post1 itself hard-requires cuda-python>=13.0, which transitively
-# needs cuda-bindings>=13 -- directly, structurally incompatible with torch==2.11.0+cu126's own
-# cuda-bindings<13 requirement (confirmed via a real `uv sync` resolver trace, not assumed). This
-# is a genuine consequence of choosing cu126 (the whole point of this fork), not a version-marker-
-# fixable gap like nvrx/flashinfer-jit-cache above -- no sglang version pin would change what
-# torch==2.11.0+cu126 itself needs. We never sync sglang (confirmed unused via launch.sh), but uv
-# still needs every extra's fork to resolve for the universal lockfile, so sglang itself (not just
-# one of its sub-dependencies) is excluded from the one python/platform combo we actually run.
+# cuda-13: the structural cuda-bindings<13 conflict this exclusion was originally written for
+# (sglang==0.5.12.post1 requires cuda-python>=13.0 -> cuda-bindings>=13, directly incompatible
+# with torch==2.11.0+cu126's own cuda-bindings<13) no longer applies now that this branch runs
+# real CUDA 13 -- but sglang itself remains unverified/out of scope here (launch.sh never syncs
+# it). Left excluded conservatively rather than silently re-enabling untested functionality;
+# revisit with a real validation pass if sglang is ever needed on this cluster.
 sglang = [
   "sglang==0.5.12.post1; python_version != '3.13'",
   "sglang-kernel==0.4.2.post2",         # Direct dep for explicit version control
@@ -232,10 +217,8 @@ sglang = [
   "flashinfer-jit-cache==0.6.11.post1; python_version != '3.13'",
   "transformers==5.6.0",
 ]
-# bare-metal: NOT adapted for cu126 -- this extra is unused on this cluster (confirmed via
-# launch.sh, which only ever runs `uv sync --extra automodel && uv sync --extra vllm`). Left
-# exactly as upstream wrote it (still cu13-referencing) so it's obviously untouched/unverified
-# rather than silently half-adapted. Fix for real if mcore ever becomes needed here.
+# bare-metal: unused on this cluster (confirmed via launch.sh, which only ever runs
+# `uv sync --extra automodel && uv sync --extra vllm`) -- left exactly as upstream wrote it. Fix for real if mcore ever becomes needed here.
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
   # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
@@ -366,7 +349,7 @@ squidward = { git = "ssh://git@github.com/igeniusai/squidward.git" }
 # way at the v0.6.0 pin. Direct wheel URLs in override-dependencies below sidestep source routing
 # entirely instead.
 triton = [
-  { index = "pytorch-cu126", marker = "sys_platform != 'darwin'" },
+  { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 # bare-metal: NeMo-RL v0.7.0's own pin (flash-attn==2.8.1) SIGABRTs (no Python exception) on the
@@ -379,28 +362,27 @@ triton = [
 # required for the ABI fix to take full effect; attention dropout (dropout_p > 0) is unsupported
 # by this wheel and will hard-abort the process if used. Fine for us: nothing in NeMo-RL's
 # training/inference paths uses attention dropout. See
-# vllm-domyn-edge/build-scripts/nemo-RL-v0.7.0-cu12.6/flash-attn/fetch.sh for the full writeup and
-# /leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu12.6/README.md.
-flash-attn = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu12.6/flash_attn-2.8.4-cp310-abi3-linux_x86_64.whl" }
-# bare-metal: vLLM's own official release wheel for v0.20.0 is cu130-only (upstream only
-# publishes that one GitHub release asset). Built from source against torch==2.11.0+cu126/sm_80
-# instead -- validated end-to-end (real build + import + a real A100 inference smoke test) in
-# .tmp/vllm-0.20.0-cu126-build-test.md before being wired in here.
-vllm = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu12.6/vllm-0.20.0+cu126-cp313-cp313-linux_x86_64.whl" }
+# vllm-domyn-edge/build-scripts/nemo-RL-v0.7.0/flash-attn/fetch.sh for the full writeup and
+# /leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu13.0/README.md.
+flash-attn = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu13.0/flash_attn-2.8.4-cp310-abi3-linux_x86_64.whl" }
+# cuda-13: this wheel was built locally, and is one commit ahead of the official vllm-0.20.0: make the reference match.
+vllm = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu13.0/vllm-0.20.1.dev1+g27d0a0398-cp313-cp313-linux_x86_64.whl" }
 # bare-metal: built from a git checkout of the matching v2.14.1 release tag against
-# torch==2.11.0+cu126/py3.13, core_cu12 instead of upstream's core_cu13, to match this project's
-# exact pins -- skips the local compile on every venv rebuild. Scoped to the automodel extra only
-# (mcore's own TE pin, a different version, is untouched -- see mcore extra's own note).
-transformer-engine-torch = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu12.6/transformer_engine_torch-2.14.1-cp313-cp313-linux_x86_64.whl", extra = "automodel" }
+# torch==2.11.0+cu130/py3.13, core_cu13 -- this IS NeMo-RL v0.7.0's own real pin now. Skips the local compile on
+# every venv rebuild. Scoped to the automodel extra only (mcore's own TE pin, a different
+# version, is untouched -- see mcore extra's own note).
+transformer-engine-torch = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu13.0/transformer_engine_torch-2.14.1-cp313-cp313-linux_x86_64.whl", extra = "automodel" }
 # bare-metal: same rev nemo-automodel's own pyproject.toml pins for this package in its "dev"
 # group -- keeping them identical avoids a second, possibly-incompatible build of the same Triton
 # kernel ever landing in the same venv. Unchanged from v0.6.0 -- not an upstream NeMo-RL
 # dependency at all, doesn't move with the NeMo-RL version bump.
-cut-cross-entropy = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu12.6/cut_cross_entropy-25.3.2-py3-none-any.whl" }
-causal-conv1d = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu12.6/causal_conv1d-1.6.2.post1-cp313-cp313-linux_x86_64.whl" }
-mamba-ssm = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu12.6/mamba_ssm-2.3.2.post1-cp313-cp313-linux_x86_64.whl" }
-nv-grouped-gemm = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu12.6/nv_grouped_gemm-1.1.4.post7-cp313-cp313-linux_x86_64.whl" }
-emerging-optimizers = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu12.6/emerging_optimizers-0.2.0-py3-none-any.whl" }
+cut-cross-entropy = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu13.0/cut_cross_entropy-25.3.2-py3-none-any.whl" }
+causal-conv1d = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu13.0/causal_conv1d-1.6.2.post1-cp313-cp313-linux_x86_64.whl" }
+mamba-ssm = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu13.0/mamba_ssm-2.3.2.post1-cp313-cp313-linux_x86_64.whl" }
+nv-grouped-gemm = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu13.0/nv_grouped_gemm-1.1.4.post7-cp313-cp313-linux_x86_64.whl" }
+emerging-optimizers = { path = "/leonardo_scratch/fast/BOOST_EUROPA/nruggeri/wheelyard/nemo-RL-v0.7.0-cu13.0/emerging_optimizers-0.2.0-py3-none-any.whl" }
+# match upstream exactly -- see the vllm extra's own flashinfer-jit-cache
+flashinfer-jit-cache = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
 members = [
@@ -418,12 +400,14 @@ name = "pypi"
 url = "https://pypi.org/simple"
 explicit = true
 
-# bare-metal: same as upstream's pytorch-cu130, just cu126 to match this cluster's CUDA/driver
-# version (A100s, driver 535.x -- confirmed via a real compute-node check that this driver is far
-# below CUDA 13's 580+ minimum, so cu130 wheels would fail at runtime even if they installed).
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
 explicit = true
 
 [tool.uv]
@@ -466,28 +450,20 @@ link-mode = "copy"
 # (automodel and mcore just carry their own independent TE pins) -- not needed since we only ever
 # sync one extra at a time (automodel OR vllm, never together, see the `conflicts` list below).
 override-dependencies = [
-  # bare-metal: cu13 -> cu12, same version number as the base-deps pin above (keep in sync).
-  "nvidia-cudnn-cu12==9.20.0.48; sys_platform != 'darwin'",
+  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
   "nvidia-cudnn-frontend==1.23.0",
-  # bare-metal: dropped the nvidia-cublas==13.5.1.27 override entirely -- confirmed via PyPI that
-  # bare "nvidia-cublas" (no cu-suffix) is an exclusively-cu13-versioned package (every release is
-  # 13.x.x.x); the cu12 cublas is a different package name (nvidia-cublas-cu12), which
-  # torch==2.11.0+cu126 already pulls in transitively (same as v0.6.0, which never needed an
-  # explicit cublas override either).
-  # bare-metal: cu13 -> cu12 suffix swap only, version floor kept as upstream wrote it (see
-  # base-deps entry above, kept in sync).
-  "nvidia-nvshmem-cu12>=3.6.5; sys_platform != 'darwin'",
+  "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
+  "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
   "opencv-python-headless; sys_platform == 'never'",
   "timm<=1.0.22",
   "nvidia-modelopt[torch]>=0.44.0a0",
   # bare-metal: direct wheel URLs instead of [tool.uv.sources] routing -- see the comment on
   # [tool.uv.sources] above (torch/torchvision/triton) for why. torchaudio added here too (not in
-  # upstream v0.7.0's own base deps, but vllm==0.20.0's own actual Requires-Dist pins
-  # torchaudio==2.11.0 directly, so it still needs the same cu126 routing once pulled in via the
-  # vllm extra).
-  "torch @ https://download.pytorch.org/whl/cu126/torch-2.11.0%2Bcu126-cp313-cp313-manylinux_2_28_x86_64.whl",
-  "torchvision @ https://download.pytorch.org/whl/cu126/torchvision-0.26.0%2Bcu126-cp313-cp313-manylinux_2_28_x86_64.whl",
-  "torchaudio @ https://download.pytorch.org/whl/cu126/torchaudio-2.11.0%2Bcu126-cp313-cp313-manylinux_2_28_x86_64.whl",
+  # upstream v0.7.0's own base deps, but vllm's own actual Requires-Dist pins torchaudio==2.11.0
+  # directly, so it still needs the same cu130 routing once pulled in via the vllm extra).
+  "torch @ https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp313-cp313-manylinux_2_28_x86_64.whl",
+  "torchvision @ https://download.pytorch.org/whl/cu130/torchvision-0.26.0%2Bcu130-cp313-cp313-manylinux_2_28_x86_64.whl",
+  "torchaudio @ https://download.pytorch.org/whl/cu130/torchaudio-2.11.0%2Bcu130-cp313-cp313-manylinux_2_28_x86_64.whl",
   # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
   "llguidance>=1.3.0,<1.4.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
@@ -495,9 +471,7 @@ override-dependencies = [
   # bare-metal: dropped the global deep_ep override entirely -- deep_ep is dropped from every
   # extra we actually use (Hopper-only, see automodel/vllm extras' own comments); this override
   # would otherwise force-reinstall it anyway regardless of what each extra declares.
-  # bare-metal: dropped the `[cu13]` extra marker -- see the vllm extra's own nvidia-cutlass-dsl
-  # entry above for the confirmed reasoning (no `[cu12]` extra exists; bare pin already targets cu12).
-  "nvidia-cutlass-dsl>=4.5.2",
+  "nvidia-cutlass-dsl[cu13]>=4.5.2",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
   # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3
@@ -525,6 +499,11 @@ override-dependencies = [
   # NeMo-RL no longer calls any decord API (replaced by torchvision/torchaudio).
   "decord2; sys_platform == 'never'",
 ]
+
+# workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base and libs-cu13 wheels overlap and race on shared paths.
+# libs-cu13 is a functional superset at 4.5.2, so drop libs-base to make
+# installs deterministic.
+exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
 
 # CVE fixes
 constraint-dependencies = [
