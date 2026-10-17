@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import tempfile
 import threading
@@ -716,22 +717,32 @@ class TestCollectorSlotScheduling:
         num_prompts_per_step: int = 2,
         max_gen_batches: int = 3,
         max_age: int = 1,
+        steal_on_discard: bool = False,
+        group_log: str | None = None,
+        log_dir: str | None = None,
     ):
         grpo_cfg = {
             "num_prompts_per_step": num_prompts_per_step,
             "num_generations_per_prompt": 4,
             "max_rollout_turns": 1,
             "use_dynamic_sampling": use_dynamic_sampling,
-            "async_grpo": {"max_trajectory_age_steps": max_age},
+            "async_grpo": {
+                "max_trajectory_age_steps": max_age,
+                "steal_on_discard": steal_on_discard,
+                "dynamic_sampling_group_log": group_log,
+            },
         }
         if use_dynamic_sampling:
             grpo_cfg["dynamic_sampling_max_gen_batches"] = max_gen_batches
         master_config = {
             "grpo": grpo_cfg,
             "policy": {"max_total_sequence_length": 512},
+            "logger": {"log_dir": log_dir},
         }
         replay_buffer = mock.MagicMock()
         replay_buffer.push_with_wait_signal.remote.return_value = "success"
+        # A bare MagicMock is truthy and would read as a successful steal.
+        replay_buffer.retarget_one.remote.return_value = None
         collector = AsyncTrajectoryCollector.__ray_actor_class__(
             policy_generation=MockGenerationInterface(),
             tokenizer=mock.MagicMock(),
@@ -743,9 +754,21 @@ class TestCollectorSlotScheduling:
         collector.running = True
         return collector, replay_buffer
 
-    def run_group(self, collector, *, target, filterable, rewards):
+    def run_group(
+        self,
+        collector,
+        *,
+        target,
+        filterable,
+        rewards,
+        input_batch=None,
+        final_extra=None,
+        epoch=None,
+    ):
         """Run one prompt-group worker whose rollout returns the given rewards."""
-        final_batch = BatchedDataDict({"total_reward": torch.tensor(rewards)})
+        final_batch = BatchedDataDict(
+            {"total_reward": torch.tensor(rewards), **(final_extra or {})}
+        )
         collector._inflight_sema.acquire()
         with (
             mock.patch(
@@ -755,7 +778,12 @@ class TestCollectorSlotScheduling:
             mock.patch("nemo_rl.algorithms.async_utils.ray.get", side_effect=lambda x: x),
         ):
             collector._run_prompt_group_worker(
-                BatchedDataDict({}), 0, target, 0, filterable
+                input_batch if input_batch is not None else BatchedDataDict({}),
+                0,
+                target,
+                0,
+                filterable,
+                epoch,
             )
 
     def test_without_dynamic_sampling_each_target_gets_exactly_its_groups(self):
@@ -860,3 +888,259 @@ class TestCollectorSlotScheduling:
 
         buffer.push_with_wait_signal.remote.assert_not_called()
         assert collector._reserve_slot() == (0, False)
+
+    def test_steal_fills_discard_of_next_target_from_furthest_donor(self):
+        collector, buffer = self.make_collector(
+            use_dynamic_sampling=True, max_age=2, steal_on_discard=True
+        )
+        # Initial window is targets [0, 1, 2]; two groups each.
+        for _ in range(6):
+            collector._reserve_slot()
+        self.run_group(
+            collector, target=2, filterable=True, rewards=[1.0, 0.0, 0.0, 0.0]
+        )
+        buffer.retarget_one.remote.return_value = 2
+
+        self.run_group(collector, target=0, filterable=True, rewards=[1.0] * 4)
+
+        buffer.retarget_one.remote.assert_called_once_with([2, 1], 0, 2)
+        slots = collector._target_slots
+        assert (slots[0].accepted, slots[0].inflight, slots[0].discarded) == (1, 1, 1)
+        assert (slots[0].stolen, slots[2].accepted, slots[2].donated) == (1, 0, 1)
+        # Target 0 is not reopened; the donor is, and gets the replacement.
+        assert collector._reserve_slot() == (2, True)
+
+        # Target 0: 2 launches + 1 group generated for the donor = 3 groups.
+        stats = collector.get_target_stats(0)
+        assert stats["dynamic_sampling_num_gen_batches"] == 1.5
+        assert stats["dynamic_sampling_num_stolen_groups"] == 1.0
+        assert (
+            collector.get_target_stats(2)["dynamic_sampling_num_donated_groups"] == 1.0
+        )
+
+    def test_steal_only_for_next_target_to_train(self):
+        collector, buffer = self.make_collector(
+            use_dynamic_sampling=True, max_age=2, steal_on_discard=True
+        )
+        for _ in range(6):
+            collector._reserve_slot()
+        buffer.retarget_one.remote.return_value = 2
+
+        # Target 0 is still incomplete, so a discard of target 1 relaunches as usual.
+        self.run_group(collector, target=1, filterable=True, rewards=[0.0] * 4)
+
+        buffer.retarget_one.remote.assert_not_called()
+        assert collector._target_slots[1].stolen == 0
+        assert collector._reserve_slot() == (1, True)
+
+    def test_steal_without_eligible_donor_reopens_slot(self):
+        collector, buffer = self.make_collector(
+            use_dynamic_sampling=True, max_age=2, steal_on_discard=True
+        )
+        for _ in range(6):
+            collector._reserve_slot()
+
+        self.run_group(collector, target=0, filterable=True, rewards=[0.0] * 4)
+
+        buffer.retarget_one.remote.assert_called_once()
+        assert collector._target_slots[0].stolen == 0
+        assert collector._reserve_slot() == (0, True)
+
+    def test_steal_off_never_touches_the_buffer(self):
+        collector, buffer = self.make_collector(use_dynamic_sampling=True, max_age=2)
+        for _ in range(6):
+            collector._reserve_slot()
+
+        self.run_group(collector, target=0, filterable=True, rewards=[0.0] * 4)
+
+        buffer.retarget_one.remote.assert_not_called()
+        assert collector._reserve_slot() == (0, True)
+
+    def test_donor_refill_keeps_donor_filtering_budget(self):
+        # One filtered launch per target; the refill of a donated slot must not
+        # use it up.
+        collector, buffer = self.make_collector(
+            use_dynamic_sampling=True,
+            num_prompts_per_step=1,
+            max_gen_batches=1,
+            steal_on_discard=True,
+        )
+        assert collector._reserve_slot() == (0, True)
+        assert collector._reserve_slot() == (1, True)
+        self.run_group(
+            collector, target=1, filterable=True, rewards=[1.0, 0.0, 0.0, 0.0]
+        )
+        buffer.retarget_one.remote.return_value = 1
+
+        self.run_group(collector, target=0, filterable=True, rewards=[0.0] * 4)
+
+        assert collector._reserve_slot() == (1, True)
+
+    def _log_records(self, log_dir):
+        with open(os.path.join(log_dir, "dynamic_sampling_groups.jsonl")) as f:
+            return [json.loads(line) for line in f]
+
+    def _log_inputs(self):
+        input_batch = BatchedDataDict({"idx": [12] * 4, "task_name": ["b"] * 4})
+        message_log = [
+            {"role": "user", "token_ids": torch.tensor([1, 2])},
+            {"role": "assistant", "token_ids": torch.tensor([3, 4, 5])},
+        ]
+        final_extra = {
+            "message_log": [message_log] * 4,
+            "truncated": torch.tensor([False, False, True, False]),
+        }
+        return input_batch, final_extra
+
+    def test_group_log_zero_variance_records_discarded_and_forced(self, tmp_path):
+        collector, _ = self.make_collector(
+            use_dynamic_sampling=True, group_log="zero_variance", log_dir=str(tmp_path)
+        )
+        collector._source_ranges = [
+            {
+                "task_name": "a",
+                "data_path": "/d/a.jsonl",
+                "start": 0,
+                "num_rows": 10,
+                "num_source_rows": 10,
+            },
+            {
+                "task_name": "b",
+                "data_path": "/d/b.jsonl",
+                "start": 10,
+                "num_rows": 6,
+                "num_source_rows": 3,
+            },
+        ]
+        input_batch, final_extra = self._log_inputs()
+        for _ in range(3):
+            collector._reserve_slot()
+        kwargs = dict(input_batch=input_batch, final_extra=final_extra, epoch=2)
+
+        self.run_group(
+            collector, target=0, filterable=True, rewards=[1.0] * 4, **kwargs
+        )
+        self.run_group(
+            collector, target=0, filterable=True, rewards=[1.0, 0.0, 0.0, 0.0], **kwargs
+        )
+        self.run_group(
+            collector, target=1, filterable=False, rewards=[0.0] * 4, **kwargs
+        )
+
+        discarded, forced = self._log_records(tmp_path)
+        assert discarded["status"] == "discarded"
+        assert discarded["rewards"] == [1.0] * 4
+        assert (discarded["idx"], discarded["task_name"]) == (12, "b")
+        # idx 12 is row 2 of b.jsonl, which is repeated twice.
+        assert (discarded["source_path"], discarded["source_row"]) == ("/d/b.jsonl", 2)
+        assert (discarded["target_weight"], discarded["epoch"]) == (0, 2)
+        assert (discarded["mean_gen_tokens"], discarded["max_gen_tokens"]) == (3.0, 3)
+        assert discarded["num_truncated"] == 1
+        assert discarded["borrowed_from"] is None
+        assert forced["status"] == "forced"
+        assert forced["reward_mean"] == 0.0
+
+    def test_group_log_all_records_accepted_and_borrowed_from(self, tmp_path):
+        collector, buffer = self.make_collector(
+            use_dynamic_sampling=True,
+            max_age=2,
+            steal_on_discard=True,
+            group_log="all",
+            log_dir=str(tmp_path),
+        )
+        for _ in range(6):
+            collector._reserve_slot()
+        self.run_group(
+            collector, target=2, filterable=True, rewards=[1.0, 0.0, 0.0, 0.0]
+        )
+        buffer.retarget_one.remote.return_value = 2
+        self.run_group(collector, target=0, filterable=True, rewards=[0.0] * 4)
+
+        accepted, discarded = self._log_records(tmp_path)
+        assert accepted["status"] == "accepted"
+        assert accepted["idx"] is None and accepted["source_path"] is None
+        assert discarded["status"] == "discarded"
+        assert discarded["borrowed_from"] == 2
+
+    def test_group_log_off_writes_nothing(self, tmp_path):
+        collector, _ = self.make_collector(
+            use_dynamic_sampling=True, log_dir=str(tmp_path)
+        )
+        collector._reserve_slot()
+
+        self.run_group(collector, target=0, filterable=True, rewards=[1.0] * 4)
+
+        assert not os.listdir(tmp_path)
+
+
+class TestRetargetOne:
+    """ReplayBuffer.retarget_one on the plain (non-actor) class."""
+
+    def make_buffer(self, seed=None):
+        return ReplayBuffer.__ray_actor_class__(max_size=20, seed=seed)
+
+    def push(self, buffer, *, generation_version, target, rewards):
+        group = {
+            "batch": BatchedDataDict({"total_reward": torch.tensor(rewards)}),
+            "rollout_metrics": {},
+            "timestamp": 0.0,
+        }
+        assert (
+            buffer.push_with_wait_signal(group, generation_version, target) == "success"
+        )
+
+    def test_moves_one_group_from_the_furthest_donor(self):
+        buffer = self.make_buffer()
+        mixed = [1.0, 0.0]
+        self.push(buffer, generation_version=0, target=1, rewards=mixed)
+        self.push(buffer, generation_version=0, target=3, rewards=mixed)
+        self.push(buffer, generation_version=0, target=3, rewards=mixed)
+
+        assert buffer.retarget_one([3, 2, 1], 0, 5) == 3
+
+        assert sorted(buffer.target_weight_versions) == [0, 1, 3]
+
+    def test_same_seed_and_state_pick_the_same_group(self):
+        picks = []
+        for _ in range(2):
+            buffer = self.make_buffer(seed=42)
+            for _ in range(8):
+                self.push(buffer, generation_version=0, target=3, rewards=[1.0, 0.0])
+            buffer.retarget_one([3], 0, 5)
+            picks.append(buffer.target_weight_versions.index(0))
+
+        assert picks[0] == picks[1]
+
+    def test_skips_ineligible_groups(self):
+        buffer = self.make_buffer()
+        # For target 3 with max_age 2, donor 5 only has a group that is too old,
+        # one generated after target 3 and a zero-variance one; donor 4 then
+        # has an eligible group.
+        self.push(buffer, generation_version=0, target=5, rewards=[1.0, 0.0])
+        self.push(buffer, generation_version=4, target=5, rewards=[1.0, 0.0])
+        self.push(buffer, generation_version=2, target=5, rewards=[1.0, 1.0])
+        self.push(buffer, generation_version=2, target=4, rewards=[0.0, 1.0])
+
+        assert buffer.retarget_one([5, 4], 3, 2) == 4
+        assert buffer.target_weight_versions == [5, 5, 5, 3]
+
+    def test_returns_none_without_changes_when_nothing_is_eligible(self):
+        buffer = self.make_buffer()
+        self.push(buffer, generation_version=4, target=5, rewards=[1.0, 0.0])
+        self.push(buffer, generation_version=2, target=5, rewards=[1.0, 1.0])
+
+        assert buffer.retarget_one([5], 3, 2) is None
+        assert buffer.target_weight_versions == [5, 5]
+
+    def test_moved_group_is_sampled_for_its_new_target(self):
+        buffer = self.make_buffer()
+        self.push(buffer, generation_version=0, target=0, rewards=[1.0, 0.0])
+        self.push(buffer, generation_version=0, target=2, rewards=[0.0, 1.0])
+
+        assert buffer.retarget_one([2], 0, 2) == 2
+        sample = buffer.sample(
+            num_prompt_groups=2, current_weight_version=0, max_age_steps=2
+        )
+
+        assert sample is not None and len(sample["trajectories"]) == 2
+        assert buffer.size() == 0

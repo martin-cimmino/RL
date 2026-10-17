@@ -119,6 +119,17 @@ class AsyncGRPOConfig(TypedDict):
     in_flight_weight_updates: NotRequired[bool]
     # Recomputes the KV cache after the in-flight weight updates.
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    # Requires grpo.use_dynamic_sampling. When dynamic sampling discards a group
+    # of the next target to train, move a finished group of the furthest later
+    # target into it instead of relaunching; the replacement prompt is then
+    # generated for that later target. Cuts the trainer's wait on chains of
+    # discards without extra generation. Recommended: true with dynamic sampling.
+    steal_on_discard: NotRequired[bool]
+    # Per-group jsonl log at <logger.log_dir>/dynamic_sampling_groups.jsonl,
+    # with each prompt's source file and row: None (off), "zero_variance" (groups
+    # whose rewards are all equal: discarded, or accepted past the launch cap)
+    # or "all" (every group, i.e. the pass rate of every prompt seen).
+    dynamic_sampling_group_log: NotRequired[Optional[str]]
 
 
 class AdvEstimatorConfig(TypedDict):
@@ -2570,6 +2581,25 @@ def async_grpo_train(
                 "Without in-flight weight updates, having more max_trajectory_age_steps will not give any performance benefit."
             )
 
+    async_cfg = master_config["grpo"]["async_grpo"]
+    if (
+        async_cfg.get("steal_on_discard")
+        and not master_config["grpo"]["use_dynamic_sampling"]
+    ):
+        raise ValueError(
+            "grpo.async_grpo.steal_on_discard requires grpo.use_dynamic_sampling=true: "
+            "it only acts on groups discarded by dynamic sampling."
+        )
+    if async_cfg.get("dynamic_sampling_group_log") not in (
+        None,
+        "zero_variance",
+        "all",
+    ):
+        raise ValueError(
+            "grpo.async_grpo.dynamic_sampling_group_log must be null, 'zero_variance' "
+            f"or 'all', got {async_cfg['dynamic_sampling_group_log']!r}"
+        )
+
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
@@ -2687,7 +2717,7 @@ def async_grpo_train(
     )
 
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
-        max_size=optimal_buffer_size
+        max_size=optimal_buffer_size, seed=master_config["grpo"]["seed"]
     )
 
     _tc_py_exec = get_actor_python_env(
@@ -3237,6 +3267,13 @@ def async_grpo_train(
                     metrics["dynamic_sampling_num_discarded_groups"] = (
                         target_stats.get("dynamic_sampling_num_discarded_groups", 0.0)
                     )
+                    if async_cfg.get("steal_on_discard"):
+                        metrics["dynamic_sampling_num_stolen_groups"] = (
+                            target_stats.get("dynamic_sampling_num_stolen_groups", 0.0)
+                        )
+                        metrics["dynamic_sampling_num_donated_groups"] = (
+                            target_stats.get("dynamic_sampling_num_donated_groups", 0.0)
+                        )
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]

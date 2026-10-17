@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import bisect
 from typing import Any, Optional, Union
 
 from datasets import concatenate_datasets
@@ -28,6 +29,68 @@ from nemo_rl.data.datasets import (
 from nemo_rl.data.processors import preference_preprocessor
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
+
+
+def build_source_ranges(
+    data_list: list[Any], train_cfgs: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Describe where each training dataset sits in the concatenated dataset.
+
+    A datum's idx is its position in the concatenation of data_config["train"]
+    in config order (the dataloader shuffles indices, not the data), so these
+    ranges map an idx back to its source file and row.
+
+    Args:
+        data_list: Loaded datasets, in config order.
+        train_cfgs: The matching data_config["train"] entries.
+
+    Returns:
+        One dict per dataset with task_name, data_path (None if the dataset has
+        no file), start, num_rows (after any repeat) and num_source_rows (rows in
+        the file before repeat; None if the dataset does not report it, e.g.
+        datasets that shuffle rows in a train/validation split).
+    """
+    source_ranges = []
+    start = 0
+    for data, cfg in zip(data_list, train_cfgs, strict=True):
+        num_rows = len(data.dataset)
+        source_ranges.append(
+            {
+                "task_name": data.task_name,
+                "data_path": cfg.get("data_path"),
+                "start": start,
+                "num_rows": num_rows,
+                "num_source_rows": getattr(data, "num_source_rows", None),
+            }
+        )
+        start += num_rows
+    return source_ranges
+
+
+def resolve_source(
+    idx: int, source_ranges: list[dict[str, Any]]
+) -> tuple[Optional[str], Optional[int]]:
+    """Map an idx of the concatenated training dataset to (data_path, row).
+
+    Args:
+        idx: Index into the concatenated dataset (DatumSpec["idx"]).
+        source_ranges: Output of build_source_ranges.
+
+    Returns:
+        The source file and its 0-based row; the row is None when the dataset
+        does not report num_source_rows. (None, None) if idx is out of range.
+    """
+    pos = bisect.bisect_right([r["start"] for r in source_ranges], idx) - 1
+    if pos < 0 or idx >= source_ranges[pos]["start"] + source_ranges[pos]["num_rows"]:
+        return None, None
+    source = source_ranges[pos]
+    num_source_rows = source["num_source_rows"]
+    row = (
+        (idx - source["start"]) % num_source_rows
+        if num_source_rows is not None
+        else None
+    )
+    return source["data_path"], row
 
 
 # TODO: @yukih: unify to setup_data after dataset refactored
@@ -142,6 +205,7 @@ def setup_response_data(
             task_data_processors,
             task_data_preprocessors=task_data_preprocessors,
             max_seq_length=data_config["max_input_seq_length"],
+            source_ranges=build_source_ranges(data_list, data_config["train"]),
         )
     sample_count = sum(len(data.dataset) for data in data_list)
     print(f"  ✓ Training dataset loaded with {sample_count} samples.")

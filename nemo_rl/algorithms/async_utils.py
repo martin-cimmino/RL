@@ -1,8 +1,9 @@
-# Custom override of nemo_rl.algorithms.async_utils
-# Adds NemoGym rollout support to AsyncTrajectoryCollector._run_prompt_group_worker
-#
-# This file is mounted over the upstream module via sys.modules patching
-# in custom/script/run_grpo.py.
+# Fork changes to nemo_rl.algorithms.async_utils:
+# - NemoGym rollout support in AsyncTrajectoryCollector._run_prompt_group_worker
+# - per-target slot scheduling with dynamic sampling
+# - async_grpo.steal_on_discard: a dynamic-sampling discard of the next target to
+#   train borrows a finished group from a future target instead of relaunching
+# - async_grpo.dynamic_sampling_group_log: per-group jsonl log with dataset source
 
 
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
@@ -19,6 +20,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
+import json
+import os
+import random
 import threading as _threading
 import time
 from dataclasses import dataclass
@@ -30,6 +35,7 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.utils import resolve_source
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
@@ -49,14 +55,24 @@ class _TargetSlots:
     A slot is taken when a prompt group is launched for the target and settled
     when the group is either pushed to the replay buffer (accepted) or dropped
     by dynamic sampling (discarded), which re-opens the slot for a new prompt.
+    With steal_on_discard, a discard may instead be filled by a finished group
+    moved over from a later target (stolen here, donated there).
     """
 
     accepted: int = 0
     inflight: int = 0
     launched: int = 0
     discarded: int = 0
+    stolen: int = 0
+    donated: int = 0
     generated_samples: int = 0
     generated_reward_sum: float = 0.0
+
+
+def _all_rewards_equal(batch: BatchedDataDict[DatumSpec]) -> bool:
+    """Whether a prompt group has zero reward variance (no advantage signal)."""
+    rewards = batch["total_reward"]
+    return bool((rewards == rewards[0]).all())
 
 
 @ray.remote  # pragma: no cover
@@ -67,7 +83,15 @@ class ReplayBuffer:
     grpo.num_generations_per_prompt (required to compute per-prompt advantages).
     """
 
-    def __init__(self, max_size: int):
+    def __init__(self, max_size: int, seed: Optional[int] = None):
+        """Create an empty buffer.
+
+        Args:
+            max_size: Maximum number of buffered prompt groups.
+            seed: Seed for retarget_one's random pick. It does not make async
+                runs reproducible (buffer contents depend on generation timing);
+                it only ties the buffer's RNG to grpo.seed like the rest.
+        """
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
@@ -78,6 +102,7 @@ class ReplayBuffer:
 
         self.last_target_weight_already_generated = -1
         self._lock = _threading.Lock()
+        self._rng = random.Random(seed)
 
     def push_with_wait_signal(
         self,
@@ -125,6 +150,41 @@ class ReplayBuffer:
         """Get set of target weight versions that already have trajectories."""
         with self._lock:
             return set(self.target_weight_versions)
+
+    def retarget_one(
+        self, donor_targets: list[int], to_target: int, max_age: int
+    ) -> Optional[int]:
+        """Move one buffered group from a donor target to to_target.
+
+        Donors are tried in the given order (the collector passes them furthest
+        first). Within the first donor that has an eligible group, one is picked
+        at random: the earliest-finished groups of a target tend to be the
+        shortest, so FIFO would bias to_target towards short responses.
+
+        A group is eligible if it stays inside sample()'s age window at
+        to_target and its rewards are not all equal (a group accepted unfiltered
+        past the dynamic-sampling launch cap must not land in a target that is
+        still filtering). Nothing is changed unless a group is moved.
+
+        Returns:
+            The donor target the group was taken from, or None if no donor has
+            an eligible group.
+        """
+        with self._lock:
+            for donor in donor_targets:
+                eligible = [
+                    i
+                    for i, target in enumerate(self.target_weight_versions)
+                    if target == donor
+                    and self.trajectory_versions[i] <= to_target
+                    and to_target - self.trajectory_versions[i] <= max_age
+                    and not _all_rewards_equal(self.trajectories[i]["batch"])
+                ]
+                if eligible:
+                    i = self._rng.choice(eligible)
+                    self.target_weight_versions[i] = to_target
+                    return donor
+            return None
 
     def sample(
         self,
@@ -330,6 +390,21 @@ class AsyncTrajectoryCollector:
             if self._use_dynamic_sampling
             else 0
         )
+        async_cfg = grpo_cfg["async_grpo"]
+        self._max_trajectory_age = int(async_cfg["max_trajectory_age_steps"])
+        # On a discard of the next target to train, borrow a finished group
+        # from a later target instead of relaunching (see _settle_discard).
+        self._steal_on_discard = bool(async_cfg.get("steal_on_discard"))
+        # None (off), "zero_variance" or "all": which settled groups _log_group
+        # writes. The file is opened on the first record.
+        self._group_log_mode: Optional[str] = async_cfg.get(
+            "dynamic_sampling_group_log"
+        )
+        self._group_log_lock = _threading.Lock()
+        self._group_log_file = None
+        # Offsets of the concatenated training files, to map a datum's idx back
+        # to its source file and row (set from the dataloader's dataset).
+        self._source_ranges: Optional[list[dict[str, Any]]] = None
 
         # Track current epoch for checkpointing (0 means not started)
         self.current_epoch: int = 0
@@ -383,6 +458,20 @@ class AsyncTrajectoryCollector:
                 return target_weight
         return None
 
+    def _lowest_incomplete_target(self) -> Optional[int]:
+        """Return the lowest unconsumed target still short of accepted groups.
+
+        Caller must hold self._slot_cv. This is the target the trainer will
+        consume next. A target whose last push has not been settled yet still
+        looks incomplete here, which can only make a steal be skipped.
+        """
+        for target_weight in sorted(
+            t for t in self._target_slots if t >= self.current_weight_version
+        ):
+            if self._target_slots[target_weight].accepted < self._groups_per_target:
+                return target_weight
+        return None
+
     def _reserve_slot(self) -> Optional[tuple[int, bool]]:
         """Block until some target weight has an open slot, then take it.
 
@@ -397,9 +486,12 @@ class AsyncTrajectoryCollector:
                     slots = self._target_slots.setdefault(target_weight, _TargetSlots())
                     slots.inflight += 1
                     slots.launched += 1
+                    # Relaunches that refill a donated slot don't count against
+                    # the donor's own filtering budget.
                     filterable = (
                         self._use_dynamic_sampling
-                        and slots.launched <= self._max_filtered_launches_per_target
+                        and slots.launched - slots.donated
+                        <= self._max_filtered_launches_per_target
                     )
                     return target_weight, filterable
 
@@ -430,6 +522,70 @@ class AsyncTrajectoryCollector:
                 slots.discarded += 1
             self._slot_cv.notify_all()
 
+    def _settle_discard(self, target_weight: int) -> Optional[int]:
+        """Release the slot of a group dropped by dynamic sampling.
+
+        Without steal_on_discard (or when target_weight is not the next target
+        to train, or no donor has an eligible group) the slot re-opens and a new
+        prompt is launched for target_weight, as in _settle_slot.
+
+        With steal_on_discard and target_weight being the next target to train,
+        one finished group of the furthest later target that has an eligible one
+        is moved to target_weight in the replay buffer instead: the discarded
+        slot is filled at once, and the donor's slot re-opens, so the
+        replacement prompt is generated for the donor, which has the most time
+        to wait for it. No extra generation happens and no valid group is lost.
+
+        Why this is safe:
+        - Per target, accepted + inflight always equals the groups in the
+          buffer plus the groups in flight. A steal turns the discarding
+          worker's in-flight slot into an accepted group, so no target can
+          exceed num_prompts_per_step groups and none is stranded. Between a
+          donor push and its _settle_slot the donor's accepted may dip to -1
+          for a moment; _find_open_target only uses the sum.
+        - ReplayBuffer.retarget_one only moves groups inside sample()'s age
+          window at target_weight.
+        - The trainer only consumes target == weight_version; a steal goes to
+          the lowest incomplete target and takes from higher ones only.
+          _slot_cv is held across the buffer call, so set_weight_version and
+          get_target_stats never see the move half-applied. The buffer never
+          calls the collector, so this cannot deadlock.
+
+        Caller must not hold self._slot_cv (it is not re-entrant).
+
+        Returns:
+            The donor target the replacement group came from, or None.
+        """
+        with self._slot_cv:
+            slots = self._target_slots.get(target_weight)
+            if slots is None:
+                return None
+            donor = None
+            if (
+                self._steal_on_discard
+                and target_weight == self._lowest_incomplete_target()
+            ):
+                donor_targets = sorted(
+                    (t for t in self._target_slots if t > target_weight),
+                    reverse=True,
+                )
+                if donor_targets:
+                    donor = ray.get(
+                        self.replay_buffer.retarget_one.remote(
+                            donor_targets, target_weight, self._max_trajectory_age
+                        )
+                    )
+            slots.inflight -= 1
+            slots.discarded += 1
+            if donor is not None:
+                slots.accepted += 1
+                slots.stolen += 1
+                donor_slots = self._target_slots[donor]
+                donor_slots.accepted -= 1
+                donor_slots.donated += 1
+            self._slot_cv.notify_all()
+            return donor
+
     def get_target_stats(self, target_weight: int) -> dict[str, float]:
         """Return generation statistics for a consumed target weight.
 
@@ -440,16 +596,22 @@ class AsyncTrajectoryCollector:
         """
         with self._slot_cv:
             slots = self._target_slots.get(target_weight)
-        if slots is None:
-            return {}
-        stats = {
-            "dynamic_sampling_num_gen_batches": slots.launched / self._groups_per_target,
-            "dynamic_sampling_num_discarded_groups": float(slots.discarded),
-        }
-        if slots.generated_samples > 0:
-            stats["unfiltered_reward"] = (
-                slots.generated_reward_sum / slots.generated_samples
-            )
+            if slots is None:
+                return {}
+            # Launches whose group was moved to another target count there.
+            stats = {
+                "dynamic_sampling_num_gen_batches": (
+                    slots.launched + slots.stolen - slots.donated
+                )
+                / self._groups_per_target,
+                "dynamic_sampling_num_discarded_groups": float(slots.discarded),
+                "dynamic_sampling_num_stolen_groups": float(slots.stolen),
+                "dynamic_sampling_num_donated_groups": float(slots.donated),
+            }
+            if slots.generated_samples > 0:
+                stats["unfiltered_reward"] = (
+                    slots.generated_reward_sum / slots.generated_samples
+                )
         return stats
 
     def set_weight_version(self, version: int) -> None:
@@ -466,6 +628,7 @@ class AsyncTrajectoryCollector:
         """Start collecting trajectories from dataloader."""
         self.running = True
         self.dataloader = dataloader
+        self._source_ranges = getattr(dataloader.dataset, "source_ranges", None)
 
         print("Started continuous trajectory collection")
 
@@ -544,6 +707,8 @@ class AsyncTrajectoryCollector:
         """
         try:
             num_generations = self.master_config["grpo"]["num_generations_per_prompt"]
+            # The dataloader epoch this batch belongs to, for the group log.
+            epoch = self.current_epoch
 
             for prompt_idx in range(batch.size):
                 # Validation pauses collection; don't start new groups meanwhile.
@@ -589,6 +754,7 @@ class AsyncTrajectoryCollector:
                         target_weight,
                         prompt_idx,
                         filterable,
+                        epoch,
                     ),
                     daemon=True,
                 )
@@ -765,6 +931,77 @@ class AsyncTrajectoryCollector:
             for t in finished:
                 self._inflight_threads.remove(t)
 
+    def _log_group(
+        self,
+        status: str,
+        repeated_batch: BatchedDataDict[DatumSpec],
+        final_batch: BatchedDataDict[DatumSpec],
+        generation_weight_version: int,
+        target_weight_version: int,
+        epoch: Optional[int],
+        borrowed_from: Optional[int] = None,
+    ) -> None:
+        """Append a settled prompt group to logger.log_dir/dynamic_sampling_groups.jsonl.
+
+        Written when async_grpo.dynamic_sampling_group_log is "all" (every
+        group) or "zero_variance" (groups whose rewards are all equal, whether
+        discarded or accepted past the launch cap). Each record maps the prompt
+        back to its source file and row, for filtering the dataset offline.
+        A failed write is reported and never affects training.
+        """
+        if self._group_log_mode is None:
+            return
+        if self._group_log_mode == "zero_variance" and not _all_rewards_equal(
+            final_batch
+        ):
+            return
+        try:
+            rewards = final_batch["total_reward"]
+            idx = repeated_batch["idx"][0] if "idx" in repeated_batch else None
+            source_path, source_row = None, None
+            if idx is not None and self._source_ranges:
+                source_path, source_row = resolve_source(int(idx), self._source_ranges)
+            record: dict[str, Any] = {
+                "time": datetime.datetime.now().isoformat(timespec="seconds"),
+                "status": status,
+                "rewards": [float(r) for r in rewards],
+                "reward_mean": float(rewards.float().mean()),
+                "idx": None if idx is None else int(idx),
+                "task_name": (
+                    repeated_batch["task_name"][0]
+                    if "task_name" in repeated_batch
+                    else None
+                ),
+                "source_path": source_path,
+                "source_row": source_row,
+                "target_weight": target_weight_version,
+                "generation_weight_version": generation_weight_version,
+                "epoch": epoch,
+                "borrowed_from": borrowed_from,
+            }
+            if "message_log" in final_batch:
+                # Same count as assistant_tokens in run_async_nemo_gym_rollout.
+                gen_tokens = [
+                    sum(len(m["token_ids"]) for m in log if m["role"] == "assistant")
+                    for log in final_batch["message_log"]
+                ]
+                record["mean_gen_tokens"] = sum(gen_tokens) / len(gen_tokens)
+                record["max_gen_tokens"] = max(gen_tokens)
+            if "truncated" in final_batch:
+                record["num_truncated"] = sum(bool(t) for t in final_batch["truncated"])
+            line = json.dumps(record, ensure_ascii=False)
+            with self._group_log_lock:
+                if self._group_log_file is None:
+                    log_dir = self.master_config["logger"]["log_dir"]
+                    os.makedirs(log_dir, exist_ok=True)
+                    self._group_log_file = open(
+                        os.path.join(log_dir, "dynamic_sampling_groups.jsonl"), "a"
+                    )
+                self._group_log_file.write(line + "\n")
+                self._group_log_file.flush()
+        except Exception as e:
+            print(f"⚠️ Failed to write dynamic sampling group log: {e}")
+
     def _run_prompt_group_worker(
         self,
         repeated_batch: BatchedDataDict[DatumSpec],
@@ -772,6 +1009,7 @@ class AsyncTrajectoryCollector:
         target_weight_version: int,
         prompt_idx: int,
         filterable: bool,
+        epoch: Optional[int] = None,
     ) -> None:
         # Whether this worker's slot was accepted/discarded; if neither happens
         # (error, shutdown) the slot is re-opened so the target is not starved.
@@ -819,13 +1057,26 @@ class AsyncTrajectoryCollector:
                 if slots is not None:
                     slots.generated_samples += rewards.numel()
                     slots.generated_reward_sum += float(rewards.sum())
-            if filterable and bool((rewards == rewards[0]).all()):
+            zero_variance = _all_rewards_equal(final_batch_cpu)
+            if filterable and zero_variance:
+                donor = self._settle_discard(target_weight_version)
+                slot_settled = True
+                borrowed = (
+                    f" → borrowed from target {donor}" if donor is not None else ""
+                )
                 print(
                     f"🗑️ Dynamic sampling: discarded zero-variance group (prompt_idx {prompt_idx}, "
-                    f"target_weight {target_weight_version}, reward {float(rewards[0]):.3f})"
+                    f"target_weight {target_weight_version}, reward {float(rewards[0]):.3f}){borrowed}"
                 )
-                self._settle_slot(target_weight_version, accepted=False, discarded=True)
-                slot_settled = True
+                self._log_group(
+                    "discarded",
+                    repeated_batch,
+                    final_batch_cpu,
+                    generation_weight_version,
+                    target_weight_version,
+                    epoch,
+                    borrowed_from=donor,
+                )
                 return
 
             trajectory_group = {
@@ -853,6 +1104,18 @@ class AsyncTrajectoryCollector:
                             target_weight_version, accepted=True, discarded=False
                         )
                         slot_settled = True
+                        # "forced": zero variance but past the dynamic-sampling
+                        # launch cap, so accepted unfiltered.
+                        self._log_group(
+                            "forced"
+                            if self._use_dynamic_sampling and zero_variance
+                            else "accepted",
+                            repeated_batch,
+                            final_batch_cpu,
+                            generation_weight_version,
+                            target_weight_version,
+                            epoch,
+                        )
                         break
                     elif status == "full":
                         # Exponential backoff up to 0.5 second

@@ -38,6 +38,8 @@ class NemoGymDataset(RawDataset):
         # will use `json.loads` to load to dict format at `nemo_gym_data_processor` later since `Dataset` cannot handle nested structure well
         with open(data_path) as f:
             self.dataset = [raw_line for raw_line in f]
+        # Rows in the file itself (before `repeat`), to map an index back to its line.
+        self.num_source_rows = len(self.dataset)
 
         # format the dataset
         # extra_env_info holds a whole raw JSONL line per row; Arrow's default

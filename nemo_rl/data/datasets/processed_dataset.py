@@ -42,6 +42,9 @@ class AllTaskProcessedDataset:
         task_data_processors: Either a single TaskDataProcessFnCallable for single-task,
             or a dict mapping task names to (TaskDataSpec, TaskDataProcessFnCallable) for multi-task
         max_seq_length: Maximum sequence length for tokenized outputs
+        source_ranges: Where each concatenated source dataset sits in `dataset`
+            (see nemo_rl.data.utils.build_source_ranges), to map an idx back to
+            its source file and row. None if unknown.
     """
 
     def __init__(
@@ -57,8 +60,10 @@ class AllTaskProcessedDataset:
             Union[dict[str, TaskDataPreProcessFnCallable], TaskDataPreProcessFnCallable]
         ] = None,
         max_seq_length: Optional[int] = None,
+        source_ranges: Optional[list[dict[str, Any]]] = None,
     ):
         self.dataset = dataset
+        self.source_ranges = source_ranges
         self.tokenizer = tokenizer
         # TODO @yukih: will be removed once eval datasets are adapted
         self.default_task_data_spec = default_task_data_spec
