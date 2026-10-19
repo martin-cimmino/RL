@@ -1081,6 +1081,27 @@ def _calculate_single_metric(
     }
 
 
+# [CUSTOM] Helpers for run_async_nemo_gym_rollout's zero_reward_without_final_answer.
+def _response_hit_output_cap(response: dict) -> bool:
+    """True if the last model call stopped on max_output_tokens (Gym's vllm_model sets this on finish_reason=length)."""
+    incomplete_details = response.get("incomplete_details") or {}
+    return incomplete_details.get("reason") == "max_output_tokens"
+
+
+def _response_has_final_answer(response: dict) -> bool:
+    """True if the response holds a tool call or non-empty assistant text (reasoning alone does not count)."""
+    for item in response.get("output") or []:
+        if item.get("type") == "function_call":
+            return True
+        if item.get("type") == "message" and item.get("role") == "assistant":
+            for content in item.get("content") or []:
+                if content.get("type") == "output_text" and (
+                    content.get("text") or ""
+                ).strip():
+                    return True
+    return False
+
+
 def run_async_nemo_gym_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
@@ -1091,12 +1112,19 @@ def run_async_nemo_gym_rollout(
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
     max_output_tokens: Optional[int] = None,
+    zero_reward_without_final_answer: bool = False,
 ) -> AsyncNemoGymRolloutResult:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters.
 
     [CUSTOM] max_output_tokens: per model call, sent as responses_create_params.max_output_tokens
     (Gym's vllm_model maps it to vLLM's max_tokens). generation_config["max_new_tokens"] is
     NOT applied on this path, so without it a call can run to max_model_len.
+
+    [CUSTOM] zero_reward_without_final_answer: set the reward to 0 for rollouts whose last model
+    call hit max_output_tokens or produced neither a tool call nor non-empty assistant text
+    (e.g. never closed </think>). Gym verifiers score the final text only, and some score ""
+    as a pass (instruction_following: ~27% of train prompts), which rewards degenerate
+    rollouts. The verifier's own reward is kept as full_result["ungated_reward"].
     """
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
     nemo_gym_rows = input_batch["extra_env_info"]
@@ -1157,6 +1185,20 @@ def run_async_nemo_gym_rollout(
                 "generation_logprobs",
             )
 
+    # [CUSTOM] Flag output-cap truncation and missing final answers; see the docstring.
+    # Set on every full_result (not only gated ones) so the per-agent metrics below log
+    # <agent>/hit_output_cap, <agent>/no_final_answer and <agent>/ungated_reward for all agents.
+    for r in results:
+        full_result = r["full_result"]
+        response = full_result.get("response") or {}
+        full_result["hit_output_cap"] = _response_hit_output_cap(response)
+        full_result["no_final_answer"] = not _response_has_final_answer(response)
+        full_result["ungated_reward"] = full_result["reward"]
+        if zero_reward_without_final_answer and (
+            full_result["hit_output_cap"] or full_result["no_final_answer"]
+        ):
+            full_result["reward"] = 0.0
+
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
@@ -1171,8 +1213,14 @@ def run_async_nemo_gym_rollout(
                 ),
                 "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
                 "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
-                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
-                == max_total_tokens_per_sample,
+                # [CUSTOM] Also count max_output_tokens truncation: upstream only checked
+                # max_model_len, so truncation_rate read 0 and overlong_filtering never fired
+                # whenever train/val_max_new_tokens capped generation below it.
+                "hit_max_tokens": (
+                    sum(len(m["token_ids"]) for m in r["message_log"])
+                    == max_total_tokens_per_sample
+                )
+                or r["full_result"]["hit_output_cap"],
             }
             for r in results
         ]

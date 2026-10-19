@@ -21,7 +21,7 @@ from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import DistributedCrossEntropy
 
-Tensor = TypeVar("Tensor", bound=torch.Tensor)
+Tensor = torch.Tensor
 
 
 class DraftCrossEntropyLossConfig(TypedDict):
@@ -456,10 +456,12 @@ class ClippedPGLossFn(LossFunction):
                     actor_importance_weights_expanded
                     <= self.truncated_importance_sampling_ratio
                 )
+                # [CUSTOM] Average the out-of-bounds indicator itself. Metrics are normalized
+                # by the global count and summed over microbatches, so "1.0 - in-bounds"
+                # added 1.0 per microbatch (it previously logged 255.0 every step).
                 _is_filter_metrics = {
-                    "is_oob_ratio": 1.0
-                    - masked_mean(
-                        token_in_bounds.float(),
+                    "is_oob_ratio": masked_mean(
+                        (~token_in_bounds).float(),
                         mask,
                         global_normalization_factor=global_valid_toks,
                     ).item(),
@@ -476,10 +478,10 @@ class ClippedPGLossFn(LossFunction):
                     actor_importance_weights_expanded
                     <= self.truncated_importance_sampling_ratio
                 )
+                # [CUSTOM] Average the out-of-bounds indicator.
                 _is_filter_metrics = {
-                    "is_oob_ratio": 1.0
-                    - masked_mean(
-                        token_kept_mask.float(),
+                    "is_oob_ratio": masked_mean(
+                        (~token_kept_mask).float(),
                         mask,
                         global_normalization_factor=global_valid_toks,
                     ).item(),
@@ -508,10 +510,10 @@ class ClippedPGLossFn(LossFunction):
                     )
                     & (seq_geomean_is_ratio <= self.truncated_importance_sampling_ratio)
                 ).float()  # [B]
+                # [CUSTOM] Average the out-of-bounds indicator.
                 _is_filter_metrics = {
-                    "is_oob_ratio": 1.0
-                    - masked_mean(
-                        seq_kept_mask,
+                    "is_oob_ratio": masked_mean(
+                        1.0 - seq_kept_mask,
                         sample_mask,
                         global_normalization_factor=global_valid_seqs,
                     ).item(),
