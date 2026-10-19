@@ -19,6 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import threading as _threading
 import time
 from dataclasses import dataclass
@@ -49,12 +50,17 @@ class _TargetSlots:
     A slot is taken when a prompt group is launched for the target and settled
     when the group is either pushed to the replay buffer (accepted) or dropped
     by dynamic sampling (discarded), which re-opens the slot for a new prompt.
+    [CUSTOM] With async_grpo.groups_multiplier > 1 more groups than needed are
+    launched; a group that passed the filter is claimed before its push, and
+    any group finishing once the target is fully claimed is dropped (surplus).
     """
 
     accepted: int = 0
     inflight: int = 0
     launched: int = 0
     discarded: int = 0
+    claimed: int = 0
+    surplus: int = 0
     generated_samples: int = 0
     generated_reward_sum: float = 0.0
 
@@ -301,11 +307,23 @@ class AsyncTrajectoryCollector:
         self._inflight_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
 
-        # Limit in-flight generator requests to num_prompts_per_step * max_trajectory_age_steps
+        # [CUSTOM] Over-launch factor per target (see _TargetSlots); 1 keeps the
+        # upstream behavior of launching exactly the groups still needed.
+        self._groups_multiplier = float(
+            self.master_config["grpo"]["async_grpo"].get("groups_multiplier", 1.0)
+        )
+        if self._groups_multiplier < 1.0:
+            raise ValueError(
+                f"async_grpo.groups_multiplier must be >= 1, got {self._groups_multiplier}"
+            )
+
+        # Limit in-flight generator requests to
+        # num_prompts_per_step * max_trajectory_age_steps * groups_multiplier.
         # This value limits the parallelism of the generation requests.
-        max_inflight = (
+        max_inflight = math.ceil(
             int(self.master_config["grpo"]["num_prompts_per_step"])
             * int(self.master_config["grpo"]["async_grpo"]["max_trajectory_age_steps"])
+            * self._groups_multiplier
         ) or 1
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
@@ -377,11 +395,22 @@ class AsyncTrajectoryCollector:
         )
         for target_weight in sorted(candidates):
             slots = self._target_slots.get(target_weight)
-            if slots is None or (
-                slots.accepted + slots.inflight < self._groups_per_target
-            ):
+            if slots is None or self._has_open_slot(slots):
                 return target_weight
         return None
+
+    def _has_open_slot(self, slots: _TargetSlots) -> bool:
+        """Whether a target may launch another group. Caller holds self._slot_cv.
+
+        Groups not yet claimed may number up to groups_multiplier times the groups
+        the target still needs; with a multiplier of 1 this is the upstream rule
+        accepted + inflight < num_prompts_per_step.
+        """
+        needed = self._groups_per_target - slots.accepted - slots.claimed
+        unclaimed_inflight = slots.inflight - slots.claimed
+        return needed > 0 and unclaimed_inflight < math.ceil(
+            needed * self._groups_multiplier
+        )
 
     def _reserve_slot(self) -> Optional[tuple[int, bool]]:
         """Block until some target weight has an open slot, then take it.
@@ -414,7 +443,13 @@ class AsyncTrajectoryCollector:
         return None
 
     def _settle_slot(
-        self, target_weight: int, *, accepted: bool, discarded: bool
+        self,
+        target_weight: int,
+        *,
+        accepted: bool,
+        discarded: bool,
+        claimed: bool = False,
+        surplus: bool = False,
     ) -> None:
         """Release an in-flight slot of target_weight and wake waiting launchers."""
         with self._slot_cv:
@@ -424,11 +459,31 @@ class AsyncTrajectoryCollector:
                 # moved past this target before the slot was settled.
                 return
             slots.inflight -= 1
+            if claimed:
+                slots.claimed -= 1
             if accepted:
                 slots.accepted += 1
             if discarded:
                 slots.discarded += 1
+            if surplus:
+                slots.surplus += 1
             self._slot_cv.notify_all()
+
+    def _claim_slot(self, target_weight: int) -> bool:
+        """[CUSTOM] Reserve one of target_weight's accepted groups before pushing.
+
+        Returns False when the target is consumed or already fully claimed: the
+        group is surplus and must not reach the replay buffer, which would keep
+        it past its target and later fail the buffer's age check.
+        """
+        with self._slot_cv:
+            slots = self._target_slots.get(target_weight)
+            if slots is None or (
+                slots.accepted + slots.claimed >= self._groups_per_target
+            ):
+                return False
+            slots.claimed += 1
+            return True
 
     def get_target_stats(self, target_weight: int) -> dict[str, float]:
         """Return generation statistics for a consumed target weight.
@@ -445,6 +500,7 @@ class AsyncTrajectoryCollector:
         stats = {
             "dynamic_sampling_num_gen_batches": slots.launched / self._groups_per_target,
             "dynamic_sampling_num_discarded_groups": float(slots.discarded),
+            "dynamic_sampling_num_surplus_groups": float(slots.surplus),
         }
         if slots.generated_samples > 0:
             stats["unfiltered_reward"] = (
@@ -776,6 +832,7 @@ class AsyncTrajectoryCollector:
         # Whether this worker's slot was accepted/discarded; if neither happens
         # (error, shutdown) the slot is re-opened so the target is not starved.
         slot_settled = False
+        slot_claimed = False
         try:
             # Check if NemoGym should be used
             env_config = self.master_config.get("env", {})
@@ -828,6 +885,18 @@ class AsyncTrajectoryCollector:
                 slot_settled = True
                 return
 
+            if not self._claim_slot(target_weight_version):
+                print(
+                    f"♻️ Surplus group dropped (prompt_idx {prompt_idx}, "
+                    f"target_weight {target_weight_version}): target already has its groups"
+                )
+                self._settle_slot(
+                    target_weight_version, accepted=False, discarded=False, surplus=True
+                )
+                slot_settled = True
+                return
+            slot_claimed = True
+
             trajectory_group = {
                 "batch": final_batch_cpu,
                 "rollout_metrics": rollout_metrics,
@@ -850,7 +919,10 @@ class AsyncTrajectoryCollector:
                             f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, target_weight {target_weight_version})"
                         )
                         self._settle_slot(
-                            target_weight_version, accepted=True, discarded=False
+                            target_weight_version,
+                            accepted=True,
+                            discarded=False,
+                            claimed=True,
                         )
                         slot_settled = True
                         break
@@ -874,7 +946,12 @@ class AsyncTrajectoryCollector:
         finally:
             # Re-open the slot on error or shutdown so another prompt fills it.
             if not slot_settled:
-                self._settle_slot(target_weight_version, accepted=False, discarded=False)
+                self._settle_slot(
+                    target_weight_version,
+                    accepted=False,
+                    discarded=False,
+                    claimed=slot_claimed,
+                )
                 print(
                     f"🧹 Released unfilled slot for target weight {target_weight_version} (prompt_idx {prompt_idx})"
                 )

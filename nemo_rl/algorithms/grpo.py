@@ -119,6 +119,10 @@ class AsyncGRPOConfig(TypedDict):
     in_flight_weight_updates: NotRequired[bool]
     # Recomputes the KV cache after the in-flight weight updates.
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    # [CUSTOM] Launch up to this many times the prompt groups a target still
+    # needs and keep the first ones to finish (surplus groups are dropped), so
+    # dynamic-sampling replacements no longer wait on each other. Default 1.
+    groups_multiplier: NotRequired[float]
 
 
 class AdvEstimatorConfig(TypedDict):

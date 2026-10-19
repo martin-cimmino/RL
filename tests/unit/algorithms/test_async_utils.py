@@ -16,6 +16,7 @@ import os
 import tempfile
 import threading
 import unittest.mock as mock
+from typing import Optional
 
 import pytest
 import ray
@@ -716,13 +717,17 @@ class TestCollectorSlotScheduling:
         num_prompts_per_step: int = 2,
         max_gen_batches: int = 3,
         max_age: int = 1,
+        groups_multiplier: Optional[float] = None,
     ):
+        async_cfg = {"max_trajectory_age_steps": max_age}
+        if groups_multiplier is not None:
+            async_cfg["groups_multiplier"] = groups_multiplier
         grpo_cfg = {
             "num_prompts_per_step": num_prompts_per_step,
             "num_generations_per_prompt": 4,
             "max_rollout_turns": 1,
             "use_dynamic_sampling": use_dynamic_sampling,
-            "async_grpo": {"max_trajectory_age_steps": max_age},
+            "async_grpo": async_cfg,
         }
         if use_dynamic_sampling:
             grpo_cfg["dynamic_sampling_max_gen_batches"] = max_gen_batches
@@ -860,3 +865,103 @@ class TestCollectorSlotScheduling:
 
         buffer.push_with_wait_signal.remote.assert_not_called()
         assert collector._reserve_slot() == (0, False)
+
+    # [CUSTOM] async_grpo.groups_multiplier
+
+    def test_groups_multiplier_over_launches_each_target(self):
+        collector, _ = self.make_collector(
+            use_dynamic_sampling=True, num_prompts_per_step=2, groups_multiplier=2
+        )
+
+        reservations = [collector._reserve_slot()[0] for _ in range(8)]
+
+        # Initial window [0, 1]: each target needs 2 groups and may launch 4.
+        assert reservations == [0, 0, 0, 0, 1, 1, 1, 1]
+        with collector._slot_cv:
+            assert collector._find_open_target() is None
+
+    def test_groups_multiplier_scales_inflight_cap(self):
+        collector, _ = self.make_collector(
+            use_dynamic_sampling=True,
+            num_prompts_per_step=3,
+            max_age=2,
+            groups_multiplier=1.5,
+        )
+
+        assert collector._inflight_sema._value == 9  # ceil(3 * 2 * 1.5)
+
+    def test_groups_multiplier_below_one_is_rejected(self):
+        with pytest.raises(ValueError, match="groups_multiplier"):
+            self.make_collector(use_dynamic_sampling=True, groups_multiplier=0.5)
+
+    def test_surplus_group_is_dropped_not_pushed(self):
+        collector, buffer = self.make_collector(
+            use_dynamic_sampling=True, num_prompts_per_step=1, groups_multiplier=3
+        )
+        for _ in range(3):
+            assert collector._reserve_slot() == (0, True)
+
+        mixed = [1.0, 0.0, 1.0, 0.0]
+        self.run_group(collector, target=0, filterable=True, rewards=mixed)
+        self.run_group(collector, target=0, filterable=True, rewards=mixed)
+
+        assert buffer.push_with_wait_signal.remote.call_count == 1
+        slots = collector._target_slots[0]
+        assert (slots.accepted, slots.claimed, slots.surplus) == (1, 0, 1)
+        assert collector.get_target_stats(0)["dynamic_sampling_num_surplus_groups"] == 1.0
+        with collector._slot_cv:
+            assert collector._has_open_slot(slots) is False
+
+    def test_open_slots_shrink_with_remaining_need(self):
+        collector, _ = self.make_collector(
+            use_dynamic_sampling=True, num_prompts_per_step=2, groups_multiplier=2
+        )
+        for _ in range(4):
+            collector._reserve_slot()
+        slots = collector._target_slots[0]
+
+        self.run_group(collector, target=0, filterable=True, rewards=[1.0, 0.0, 0.0, 0.0])
+        # 1 group still needed -> at most 2 unclaimed in flight; 3 are.
+        with collector._slot_cv:
+            assert collector._has_open_slot(slots) is False
+
+        self.run_group(collector, target=0, filterable=True, rewards=[0.0] * 4)
+        self.run_group(collector, target=0, filterable=True, rewards=[0.0] * 4)
+        with collector._slot_cv:
+            assert collector._has_open_slot(slots) is True
+
+    def test_group_for_consumed_target_is_dropped(self):
+        collector, buffer = self.make_collector(
+            use_dynamic_sampling=True, num_prompts_per_step=1, groups_multiplier=2
+        )
+        collector._reserve_slot()
+        collector._reserve_slot()
+        self.run_group(collector, target=0, filterable=True, rewards=[1.0, 0.0, 0.0, 0.0])
+        collector.set_weight_version(1)
+
+        self.run_group(collector, target=0, filterable=True, rewards=[1.0, 0.0, 0.0, 0.0])
+
+        assert buffer.push_with_wait_signal.remote.call_count == 1
+
+    def test_failed_push_releases_claim(self):
+        collector, buffer = self.make_collector(
+            use_dynamic_sampling=True, num_prompts_per_step=1, groups_multiplier=2
+        )
+        collector._reserve_slot()
+        final_batch = BatchedDataDict({"total_reward": torch.tensor([1.0, 0.0, 0.0, 0.0])})
+        collector._inflight_sema.acquire()
+        with (
+            mock.patch(
+                "nemo_rl.algorithms.async_utils.run_async_multi_turn_rollout",
+                return_value=(final_batch, {}),
+            ),
+            mock.patch(
+                "nemo_rl.algorithms.async_utils.ray.get",
+                side_effect=RuntimeError("push failed"),
+            ),
+        ):
+            collector._run_prompt_group_worker(BatchedDataDict({}), 0, 0, 0, True)
+
+        slots = collector._target_slots[0]
+        assert (slots.accepted, slots.claimed, slots.inflight) == (0, 0, 0)
+        assert collector._reserve_slot() == (0, True)
