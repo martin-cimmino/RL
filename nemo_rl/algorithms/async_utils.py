@@ -61,6 +61,7 @@ class _TargetSlots:
     discarded: int = 0
     claimed: int = 0
     surplus: int = 0
+    consumed_early: int = 0
     generated_samples: int = 0
     generated_reward_sum: float = 0.0
 
@@ -83,6 +84,7 @@ class ReplayBuffer:
         self.target_weight_versions = []  # it is the weight-version of the trainer where this trajectory will be used.
 
         self.last_target_weight_already_generated = -1
+        self.expired_dropped = 0  # [CUSTOM] groups dropped by flexible sampling
         self._lock = _threading.Lock()
 
     def push_with_wait_signal(
@@ -137,6 +139,7 @@ class ReplayBuffer:
         num_prompt_groups: int,
         current_weight_version: int,
         max_age_steps: int,
+        flexible: bool = False,
     ) -> Optional[dict[str, Any]]:
         """Sample per-prompt trajectory groups intended for the current training step.
 
@@ -145,8 +148,15 @@ class ReplayBuffer:
         until the remaining trajectories are generated. This ensures no trajectory
         loses its last chance to be used for its intended training step.
 
+        [CUSTOM] With flexible=True, any group inside the age window may serve the
+        step, oldest generation first (earliest expiry first), so a step is not
+        held back by its last straggler while finished groups for later steps sit
+        in the buffer. 'target_weight_versions' lists the targets of the groups
+        taken, so the caller can re-open the later targets' slots.
+
         Returns:
-            Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
+            Dictionary with 'trajectories', 'avg_trajectory_age' and
+            'target_weight_versions' keys, or None if insufficient data
         """
         with self._lock:
             if not self.trajectories:
@@ -172,7 +182,25 @@ class ReplayBuffer:
             old_trajectories = [
                 v for v in self.trajectory_versions if v < min_valid_version
             ]
-            if old_trajectories:
+            if old_trajectories and flexible:
+                # [CUSTOM] A leftover group of an already-passed target can age
+                # out here; drop it rather than abort the run. Its target is
+                # below the current version, so no slot accounting is involved.
+                keep = [
+                    i
+                    for i, v in enumerate(self.trajectory_versions)
+                    if v >= min_valid_version
+                ]
+                print(
+                    f"🗑️ Dropping {len(old_trajectories)} expired groups (older than min_valid_version {min_valid_version})"
+                )
+                self.expired_dropped += len(old_trajectories)
+                self.trajectories = [self.trajectories[i] for i in keep]
+                self.trajectory_versions = [self.trajectory_versions[i] for i in keep]
+                self.target_weight_versions = [
+                    self.target_weight_versions[i] for i in keep
+                ]
+            elif old_trajectories:
                 raise ValueError(
                     f"Found {len(old_trajectories)} trajectories older than min_valid_version {min_valid_version}"
                 )
@@ -199,11 +227,18 @@ class ReplayBuffer:
 
             # Only select trajectories intended for the current training step
             # This ensures no trajectory loses its "last chance" to be used for its intended step
-            intended_indices = [
-                i
-                for i in valid_indices
-                if self.target_weight_versions[i] == current_weight_version
-            ]
+            if flexible:
+                # Oldest generation first; the sort is stable, so insertion order
+                # (FIFO) breaks ties.
+                intended_indices = sorted(
+                    valid_indices, key=lambda i: self.trajectory_versions[i]
+                )
+            else:
+                intended_indices = [
+                    i
+                    for i in valid_indices
+                    if self.target_weight_versions[i] == current_weight_version
+                ]
 
             print(
                 f"   🎯 Found {len(intended_indices)} trajectories intended for current step {current_weight_version}"
@@ -240,6 +275,7 @@ class ReplayBuffer:
             )
 
             sampled_items = [self.trajectories[i] for i in selected]
+            sampled_targets = [self.target_weight_versions[i] for i in selected]
 
             # Remove selected items in reverse order to maintain correct indices
             for idx in sorted(selected, reverse=True):
@@ -253,6 +289,7 @@ class ReplayBuffer:
             return {
                 "trajectories": sampled_items,
                 "avg_trajectory_age": avg_trajectory_age,
+                "target_weight_versions": sampled_targets,
             }
 
     def size(self) -> int:
@@ -507,6 +544,23 @@ class AsyncTrajectoryCollector:
                 slots.generated_reward_sum / slots.generated_samples
             )
         return stats
+
+    def release_consumed(self, current_target: int, targets: list[int]) -> None:
+        """[CUSTOM] Re-open slots of later targets whose groups were consumed early.
+
+        With flexible replay-buffer sampling a training step may take groups
+        assigned to later targets; those targets must generate replacements, so
+        their accepted counts are lowered by what was taken.
+        """
+        with self._slot_cv:
+            for target in targets:
+                if target <= current_target:
+                    continue
+                slots = self._target_slots.get(target)
+                if slots is not None and slots.accepted > 0:
+                    slots.accepted -= 1
+                    slots.consumed_early += 1
+            self._slot_cv.notify_all()
 
     def set_weight_version(self, version: int) -> None:
         with self._slot_cv:

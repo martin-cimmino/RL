@@ -965,3 +965,92 @@ class TestCollectorSlotScheduling:
         slots = collector._target_slots[0]
         assert (slots.accepted, slots.claimed, slots.inflight) == (0, 0, 0)
         assert collector._reserve_slot() == (0, True)
+
+
+class TestFlexibleSampling:
+    """[CUSTOM] Flexible replay-buffer sampling and early-consumption release.
+
+    Uses the plain (non-actor) classes so no Ray cluster is needed.
+    """
+
+    @staticmethod
+    def make_buffer(entries):
+        """Build a buffer from (generation_version, target_version) pairs."""
+        buffer = ReplayBuffer.__ray_actor_class__(max_size=100)
+        for i, (gen, target) in enumerate(entries):
+            buffer.push_with_wait_signal(
+                {"batch": i, "rollout_metrics": {}}, gen, target
+            )
+        return buffer
+
+    def test_strict_mode_still_waits_for_the_exact_target(self):
+        # Step 5 has only 1 of its 2 groups; 3 groups of later targets are ready.
+        buffer = self.make_buffer([(4, 5), (4, 6), (4, 6), (4, 7)])
+
+        assert buffer.sample(2, 5, 10) is None
+
+    def test_flexible_mode_fills_the_step_from_later_targets(self):
+        buffer = self.make_buffer([(4, 5), (4, 6), (4, 6), (4, 7)])
+
+        result = buffer.sample(2, 5, 10, flexible=True)
+
+        assert [t["batch"] for t in result["trajectories"]] == [0, 1]
+        assert result["target_weight_versions"] == [5, 6]
+        assert buffer.size() == 2
+
+    def test_flexible_mode_takes_oldest_generation_first(self):
+        # Generation versions 3, 5, 4, 4 -> oldest first, FIFO among ties.
+        buffer = self.make_buffer([(3, 7), (5, 6), (4, 8), (4, 6)])
+
+        result = buffer.sample(3, 5, 10, flexible=True)
+
+        assert [t["batch"] for t in result["trajectories"]] == [0, 2, 3]
+
+    def test_flexible_mode_still_waits_when_buffer_is_short(self):
+        buffer = self.make_buffer([(4, 5), (4, 6)])
+
+        assert buffer.sample(3, 5, 10, flexible=True) is None
+        assert buffer.size() == 2
+
+    def test_flexible_mode_ignores_groups_generated_after_the_step(self):
+        # A group generated at version 6 cannot serve step 5.
+        buffer = self.make_buffer([(4, 5), (6, 7)])
+
+        assert buffer.sample(2, 5, 10, flexible=True) is None
+
+    def test_expired_group_is_dropped_in_flexible_mode_but_raises_in_strict(self):
+        entries = [(0, 3), (4, 5), (4, 5)]
+
+        with pytest.raises(ValueError, match="older than"):
+            self.make_buffer(entries).sample(2, 5, 3)
+
+        buffer = self.make_buffer(entries)
+        result = buffer.sample(2, 5, 3, flexible=True)  # min_valid_version = 2
+        assert [t["batch"] for t in result["trajectories"]] == [1, 2]
+        assert buffer.expired_dropped == 1
+        assert buffer.size() == 0
+
+    def test_release_consumed_reopens_later_targets_only(self):
+        collector, _ = TestCollectorSlotScheduling().make_collector(
+            use_dynamic_sampling=True, num_prompts_per_step=2, max_age=2
+        )
+        for _ in range(6):
+            collector._reserve_slot()
+        for target in (0, 1, 1, 2, 2):
+            collector._target_slots[target].accepted += 1
+        # Step 0 took one group of its own and groups of targets 1 and 2.
+        collector.release_consumed(0, [0, 1, 2, 2])
+
+        assert collector._target_slots[0].accepted == 1  # current target untouched
+        assert collector._target_slots[1].accepted == 1
+        assert collector._target_slots[2].accepted == 0
+        assert collector._target_slots[2].consumed_early == 2
+
+    def test_release_ignores_forgotten_targets(self):
+        collector, _ = TestCollectorSlotScheduling().make_collector(
+            use_dynamic_sampling=True, max_age=2
+        )
+
+        collector.release_consumed(0, [5, 6])  # no slots yet: nothing to do
+
+        assert collector._target_slots == {}

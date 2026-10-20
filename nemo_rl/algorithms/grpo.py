@@ -123,6 +123,9 @@ class AsyncGRPOConfig(TypedDict):
     # needs and keep the first ones to finish (surplus groups are dropped), so
     # dynamic-sampling replacements no longer wait on each other. Default 1.
     groups_multiplier: NotRequired[float]
+    # [CUSTOM] Let a training step take any group inside the age window, oldest
+    # first, instead of only groups assigned to that exact step. Default False.
+    flexible_sampling: NotRequired[bool]
 
 
 class AdvEstimatorConfig(TypedDict):
@@ -2603,6 +2606,9 @@ def async_grpo_train(
     val_at_start = master_config["grpo"]["val_at_start"]
     val_at_end = master_config["grpo"]["val_at_end"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    flexible_sampling = bool(
+        master_config["grpo"]["async_grpo"].get("flexible_sampling", False)
+    )
 
     # ── Multi-epoch support ──────────────────────────────────────────────────
     # The async trainer samples from the replay buffer rather than iterating the
@@ -2851,6 +2857,7 @@ def async_grpo_train(
                             num_prompt_groups=num_prompt_groups_needed,
                             current_weight_version=weight_version,
                             max_age_steps=max_trajectory_age_steps,
+                            flexible=flexible_sampling,
                         )
                     )
 
@@ -2883,6 +2890,19 @@ def async_grpo_train(
                     # Extract trajectories and metadata from sample result
                     trajectories = sample_result["trajectories"]
                     avg_trajectory_age = sample_result["avg_trajectory_age"]
+                    num_early_groups = sum(
+                        1
+                        for target in sample_result["target_weight_versions"]
+                        if target != weight_version
+                    )
+                    if flexible_sampling and num_early_groups:
+                        # Groups of later targets were taken: let those targets
+                        # generate replacements.
+                        ray.get(
+                            trajectory_collector.release_consumed.remote(
+                                weight_version, sample_result["target_weight_versions"]
+                            )
+                        )
 
                     print(
                         f"✅ Sampled {len(trajectories)} trajectory groups from buffer (avg age: {avg_trajectory_age:.2f} steps)"
@@ -3241,6 +3261,10 @@ def async_grpo_train(
                     metrics["dynamic_sampling_num_discarded_groups"] = (
                         target_stats.get("dynamic_sampling_num_discarded_groups", 0.0)
                     )
+                    metrics["dynamic_sampling_num_surplus_groups"] = target_stats.get(
+                        "dynamic_sampling_num_surplus_groups", 0.0
+                    )
+                metrics["async_num_early_groups"] = float(num_early_groups)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
