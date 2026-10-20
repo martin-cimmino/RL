@@ -158,8 +158,9 @@ class ReplayBuffer:
         taken, so the caller can re-open the later targets' slots.
 
         Returns:
-            Dictionary with 'trajectories', 'avg_trajectory_age' and
-            'target_weight_versions' keys, or None if insufficient data
+            Dictionary with 'trajectories', 'avg_trajectory_age',
+            'target_weight_versions' and 'expired_dropped_total' keys, or None
+            if insufficient data
         """
         with self._lock:
             if not self.trajectories:
@@ -293,6 +294,8 @@ class ReplayBuffer:
                 "trajectories": sampled_items,
                 "avg_trajectory_age": avg_trajectory_age,
                 "target_weight_versions": sampled_targets,
+                # Running total; the trainer logs the per-step difference.
+                "expired_dropped_total": self.expired_dropped,
             }
 
     def size(self) -> int:
@@ -997,6 +1000,11 @@ class AsyncTrajectoryCollector:
                 print(
                     f"♻️ Surplus group dropped (prompt_idx {prompt_idx}, "
                     f"target_weight {target_weight_version}): target already has its groups"
+                    + (
+                        " and no later target within the age window needs one"
+                        if self._reassign_surplus
+                        else ""
+                    )
                 )
                 self._settle_slot(
                     target_weight_version, accepted=False, discarded=False, surplus=True

@@ -1036,6 +1036,7 @@ class TestFlexibleSampling:
         assert [t["batch"] for t in result["trajectories"]] == [1, 2]
         assert buffer.expired_dropped == 1
         assert buffer.size() == 0
+        assert result["expired_dropped_total"] == 1
 
     def test_release_consumed_reopens_later_targets_only(self):
         collector, _ = TestCollectorSlotScheduling().make_collector(

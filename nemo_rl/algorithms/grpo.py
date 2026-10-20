@@ -2611,6 +2611,9 @@ def async_grpo_train(
     flexible_sampling = bool(
         master_config["grpo"]["async_grpo"].get("flexible_sampling", False)
     )
+    # Buffer's running count of informative groups dropped for exceeding the
+    # age window (flexible sampling only); logged per step as a difference.
+    expired_dropped_seen = 0
 
     # ── Multi-epoch support ──────────────────────────────────────────────────
     # The async trainer samples from the replay buffer rather than iterating the
@@ -2892,6 +2895,11 @@ def async_grpo_train(
                     # Extract trajectories and metadata from sample result
                     trajectories = sample_result["trajectories"]
                     avg_trajectory_age = sample_result["avg_trajectory_age"]
+                    expired_dropped_total = sample_result.get(
+                        "expired_dropped_total", 0
+                    )
+                    num_expired_groups = expired_dropped_total - expired_dropped_seen
+                    expired_dropped_seen = expired_dropped_total
                     num_early_groups = sum(
                         1
                         for target in sample_result["target_weight_versions"]
@@ -3270,6 +3278,10 @@ def async_grpo_train(
                         target_stats.get("dynamic_sampling_num_reassigned_groups", 0.0)
                     )
                 metrics["async_num_early_groups"] = float(num_early_groups)
+                # Informative groups (non-zero advantage) lost because they aged
+                # past max_trajectory_age_steps in the buffer, since the last step.
+                metrics["async_num_expired_groups"] = float(num_expired_groups)
+                metrics["async_num_expired_groups_total"] = float(expired_dropped_total)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
