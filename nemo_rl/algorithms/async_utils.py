@@ -62,6 +62,9 @@ class _TargetSlots:
     claimed: int = 0
     surplus: int = 0
     consumed_early: int = 0
+    reassigned: int = 0
+    # Early consumptions reported before the group's push was settled.
+    release_pending: int = 0
     generated_samples: int = 0
     generated_reward_sum: float = 0.0
 
@@ -349,6 +352,15 @@ class AsyncTrajectoryCollector:
         self._groups_multiplier = float(
             self.master_config["grpo"]["async_grpo"].get("groups_multiplier", 1.0)
         )
+        # [CUSTOM] With flexible sampling the step a group trains on does not
+        # matter, so a group finishing after its target is full is reassigned
+        # to the next target that still needs groups instead of being dropped.
+        self._reassign_surplus = bool(
+            self.master_config["grpo"]["async_grpo"].get("flexible_sampling", False)
+        )
+        self._max_age = int(
+            self.master_config["grpo"]["async_grpo"]["max_trajectory_age_steps"]
+        )
         if self._groups_multiplier < 1.0:
             raise ValueError(
                 f"async_grpo.groups_multiplier must be >= 1, got {self._groups_multiplier}"
@@ -487,40 +499,72 @@ class AsyncTrajectoryCollector:
         discarded: bool,
         claimed: bool = False,
         surplus: bool = False,
+        claim_target: Optional[int] = None,
     ) -> None:
-        """Release an in-flight slot of target_weight and wake waiting launchers."""
-        with self._slot_cv:
-            slots = self._target_slots.get(target_weight)
-            if slots is None:
-                # Already consumed and forgotten: the push landed and the trainer
-                # moved past this target before the slot was settled.
-                return
-            slots.inflight -= 1
-            if claimed:
-                slots.claimed -= 1
-            if accepted:
-                slots.accepted += 1
-            if discarded:
-                slots.discarded += 1
-            if surplus:
-                slots.surplus += 1
-            self._slot_cv.notify_all()
+        """Release an in-flight slot of target_weight and wake waiting launchers.
 
-    def _claim_slot(self, target_weight: int) -> bool:
-        """[CUSTOM] Reserve one of target_weight's accepted groups before pushing.
-
-        Returns False when the target is consumed or already fully claimed: the
-        group is surplus and must not reach the replay buffer, which would keep
-        it past its target and later fail the buffer's age check.
+        claim_target is the target the group was claimed for when it differs
+        from the one it was launched for (surplus reassignment); its claimed and
+        accepted counts are updated instead of target_weight's.
         """
         with self._slot_cv:
+            # Either entry may already be consumed and forgotten: the push
+            # landed and the trainer moved past it before the slot was settled.
             slots = self._target_slots.get(target_weight)
-            if slots is None or (
-                slots.accepted + slots.claimed >= self._groups_per_target
-            ):
-                return False
-            slots.claimed += 1
-            return True
+            if slots is not None:
+                slots.inflight -= 1
+                if discarded:
+                    slots.discarded += 1
+                if surplus:
+                    slots.surplus += 1
+            target = target_weight if claim_target is None else claim_target
+            claim_slots = self._target_slots.get(target)
+            if claim_slots is not None:
+                if claimed:
+                    claim_slots.claimed -= 1
+                if accepted:
+                    if claim_slots.release_pending > 0:
+                        # Already taken by a training step (release_consumed).
+                        claim_slots.release_pending -= 1
+                    else:
+                        claim_slots.accepted += 1
+            self._slot_cv.notify_all()
+
+    def _claim_slot(
+        self, target_weight: int, generation_weight_version: int
+    ) -> Optional[int]:
+        """[CUSTOM] Reserve one accepted group of a target before pushing.
+
+        Returns the target claimed: target_weight if it still needs groups,
+        otherwise (with surplus reassignment) the lowest later target that
+        does and that the group can still reach within the age window. None
+        means the group is surplus and must not reach the replay buffer, which
+        would keep it past its target and later fail the buffer's age check.
+        """
+        with self._slot_cv:
+            candidates = [target_weight]
+            if self._reassign_surplus:
+                first = max(target_weight + 1, self.current_weight_version)
+                candidates += list(
+                    range(first, generation_weight_version + self._max_age + 1)
+                )
+            for target in candidates:
+                if target < self.current_weight_version:
+                    continue
+                if target == target_weight:
+                    slots = self._target_slots.get(target)
+                    if slots is None:
+                        continue
+                else:
+                    slots = self._target_slots.setdefault(target, _TargetSlots())
+                if slots.accepted + slots.claimed < self._groups_per_target:
+                    slots.claimed += 1
+                    if target != target_weight:
+                        origin = self._target_slots.get(target_weight)
+                        if origin is not None:
+                            origin.reassigned += 1
+                    return target
+            return None
 
     def get_target_stats(self, target_weight: int) -> dict[str, float]:
         """Return generation statistics for a consumed target weight.
@@ -538,6 +582,7 @@ class AsyncTrajectoryCollector:
             "dynamic_sampling_num_gen_batches": slots.launched / self._groups_per_target,
             "dynamic_sampling_num_discarded_groups": float(slots.discarded),
             "dynamic_sampling_num_surplus_groups": float(slots.surplus),
+            "dynamic_sampling_num_reassigned_groups": float(slots.reassigned),
         }
         if slots.generated_samples > 0:
             stats["unfiltered_reward"] = (
@@ -557,9 +602,14 @@ class AsyncTrajectoryCollector:
                 if target <= current_target:
                     continue
                 slots = self._target_slots.get(target)
-                if slots is not None and slots.accepted > 0:
+                if slots is None:
+                    continue
+                slots.consumed_early += 1
+                if slots.accepted > 0:
                     slots.accepted -= 1
-                    slots.consumed_early += 1
+                else:
+                    # Taken before its push was settled; settle will not count it.
+                    slots.release_pending += 1
             self._slot_cv.notify_all()
 
     def set_weight_version(self, version: int) -> None:
@@ -887,6 +937,7 @@ class AsyncTrajectoryCollector:
         # (error, shutdown) the slot is re-opened so the target is not starved.
         slot_settled = False
         slot_claimed = False
+        claim_target: Optional[int] = None
         try:
             # Check if NemoGym should be used
             env_config = self.master_config.get("env", {})
@@ -939,7 +990,10 @@ class AsyncTrajectoryCollector:
                 slot_settled = True
                 return
 
-            if not self._claim_slot(target_weight_version):
+            claim_target = self._claim_slot(
+                target_weight_version, generation_weight_version
+            )
+            if claim_target is None:
                 print(
                     f"♻️ Surplus group dropped (prompt_idx {prompt_idx}, "
                     f"target_weight {target_weight_version}): target already has its groups"
@@ -950,6 +1004,11 @@ class AsyncTrajectoryCollector:
                 slot_settled = True
                 return
             slot_claimed = True
+            if claim_target != target_weight_version:
+                print(
+                    f"🔁 Surplus group reassigned (prompt_idx {prompt_idx}): "
+                    f"target_weight {target_weight_version} -> {claim_target}"
+                )
 
             trajectory_group = {
                 "batch": final_batch_cpu,
@@ -965,18 +1024,19 @@ class AsyncTrajectoryCollector:
                         self.replay_buffer.push_with_wait_signal.remote(
                             trajectory_group,
                             generation_weight_version,
-                            target_weight_version,
+                            claim_target,
                         )
                     )
                     if status == "success":
                         print(
-                            f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, target_weight {target_weight_version})"
+                            f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, target_weight {claim_target})"
                         )
                         self._settle_slot(
                             target_weight_version,
                             accepted=True,
                             discarded=False,
                             claimed=True,
+                            claim_target=claim_target,
                         )
                         slot_settled = True
                         break
@@ -1005,6 +1065,7 @@ class AsyncTrajectoryCollector:
                     accepted=False,
                     discarded=False,
                     claimed=slot_claimed,
+                    claim_target=claim_target,
                 )
                 print(
                     f"🧹 Released unfilled slot for target weight {target_weight_version} (prompt_idx {prompt_idx})"

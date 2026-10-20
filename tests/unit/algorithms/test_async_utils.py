@@ -29,7 +29,11 @@ os.environ["RAY_TEMP_DIR"] = _temp_dir
 os.environ["RAY_TMPDIR"] = _temp_dir  # Alternative env var
 os.environ["TMPDIR"] = _temp_dir  # System temp dir
 
-from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
+from nemo_rl.algorithms.async_utils import (
+    AsyncTrajectoryCollector,
+    ReplayBuffer,
+    _TargetSlots,
+)
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -718,10 +722,13 @@ class TestCollectorSlotScheduling:
         max_gen_batches: int = 3,
         max_age: int = 1,
         groups_multiplier: Optional[float] = None,
+        flexible_sampling: bool = False,
     ):
         async_cfg = {"max_trajectory_age_steps": max_age}
         if groups_multiplier is not None:
             async_cfg["groups_multiplier"] = groups_multiplier
+        if flexible_sampling:
+            async_cfg["flexible_sampling"] = True
         grpo_cfg = {
             "num_prompts_per_step": num_prompts_per_step,
             "num_generations_per_prompt": 4,
@@ -1054,3 +1061,95 @@ class TestFlexibleSampling:
         collector.release_consumed(0, [5, 6])  # no slots yet: nothing to do
 
         assert collector._target_slots == {}
+
+    # [CUSTOM] Surplus reassignment (on with flexible_sampling)
+
+    @staticmethod
+    def pushed_targets(buffer):
+        return [c.args[2] for c in buffer.push_with_wait_signal.remote.call_args_list]
+
+    def test_surplus_group_is_reassigned_to_next_target(self):
+        collector, buffer = TestCollectorSlotScheduling().make_collector(
+            use_dynamic_sampling=True,
+            num_prompts_per_step=1,
+            groups_multiplier=3,
+            max_age=2,
+            flexible_sampling=True,
+        )
+        for _ in range(3):
+            assert collector._reserve_slot()[0] == 0
+        mixed = [1.0, 0.0, 1.0, 0.0]
+        harness = TestCollectorSlotScheduling()
+
+        harness.run_group(collector, target=0, filterable=True, rewards=mixed)
+        harness.run_group(collector, target=0, filterable=True, rewards=mixed)
+
+        assert self.pushed_targets(buffer) == [0, 1]
+        assert collector._target_slots[0].accepted == 1
+        assert collector._target_slots[0].reassigned == 1
+        assert collector._target_slots[0].surplus == 0
+        assert collector._target_slots[1].accepted == 1
+        assert collector._target_slots[1].claimed == 0
+        assert collector.get_target_stats(0)["dynamic_sampling_num_reassigned_groups"] == 1.0
+
+    def test_surplus_dropped_when_no_reachable_target_needs_groups(self):
+        collector, buffer = TestCollectorSlotScheduling().make_collector(
+            use_dynamic_sampling=True,
+            num_prompts_per_step=1,
+            groups_multiplier=3,
+            max_age=1,
+            flexible_sampling=True,
+        )
+        for _ in range(3):
+            collector._reserve_slot()
+        mixed = [1.0, 0.0, 1.0, 0.0]
+        harness = TestCollectorSlotScheduling()
+        # Generated at version 0 with age 1: only targets 0 and 1 are reachable.
+        for _ in range(3):
+            harness.run_group(collector, target=0, filterable=True, rewards=mixed)
+
+        assert self.pushed_targets(buffer) == [0, 1]
+        assert collector._target_slots[0].surplus == 1
+
+    def test_without_flexible_sampling_surplus_is_still_dropped(self):
+        collector, buffer = TestCollectorSlotScheduling().make_collector(
+            use_dynamic_sampling=True, num_prompts_per_step=1, groups_multiplier=3
+        )
+        for _ in range(3):
+            collector._reserve_slot()
+        harness = TestCollectorSlotScheduling()
+        for _ in range(2):
+            harness.run_group(collector, target=0, filterable=True, rewards=[1.0, 0.0, 0.0, 0.0])
+
+        assert self.pushed_targets(buffer) == [0]
+        assert collector._target_slots[0].surplus == 1
+
+    def test_reassigned_slot_counts_against_the_later_target(self):
+        collector, _ = TestCollectorSlotScheduling().make_collector(
+            use_dynamic_sampling=True,
+            num_prompts_per_step=1,
+            groups_multiplier=1,
+            max_age=2,
+            flexible_sampling=True,
+        )
+        collector._target_slots[0] = _TargetSlots(accepted=1)
+
+        assert collector._claim_slot(0, 0) == 1
+        # Target 1 now has its one group claimed: no more launches for it.
+        with collector._slot_cv:
+            assert collector._has_open_slot(collector._target_slots[1]) is False
+
+    def test_early_consumption_before_settle_is_not_double_counted(self):
+        collector, _ = TestCollectorSlotScheduling().make_collector(
+            use_dynamic_sampling=True, num_prompts_per_step=2, max_age=2,
+            flexible_sampling=True,
+        )
+        collector._reserve_slot()  # target 0
+        slots = collector._target_slots.setdefault(1, _TargetSlots())
+        slots.inflight, slots.claimed = 1, 1
+        # Step 0 took the target-1 group before the collector settled its push.
+        collector.release_consumed(0, [1])
+        collector._settle_slot(1, accepted=True, discarded=False, claimed=True)
+
+        assert (slots.accepted, slots.claimed, slots.release_pending) == (0, 0, 0)
+        assert slots.consumed_early == 1

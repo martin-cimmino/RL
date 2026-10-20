@@ -124,7 +124,9 @@ class AsyncGRPOConfig(TypedDict):
     # dynamic-sampling replacements no longer wait on each other. Default 1.
     groups_multiplier: NotRequired[float]
     # [CUSTOM] Let a training step take any group inside the age window, oldest
-    # first, instead of only groups assigned to that exact step. Default False.
+    # first, instead of only groups assigned to that exact step; groups that
+    # finish after their target is full are reassigned to a later target
+    # instead of being dropped. Default False.
     flexible_sampling: NotRequired[bool]
 
 
@@ -3263,6 +3265,9 @@ def async_grpo_train(
                     )
                     metrics["dynamic_sampling_num_surplus_groups"] = target_stats.get(
                         "dynamic_sampling_num_surplus_groups", 0.0
+                    )
+                    metrics["dynamic_sampling_num_reassigned_groups"] = (
+                        target_stats.get("dynamic_sampling_num_reassigned_groups", 0.0)
                     )
                 metrics["async_num_early_groups"] = float(num_early_groups)
                 if generation_logger_metrics is not None:
