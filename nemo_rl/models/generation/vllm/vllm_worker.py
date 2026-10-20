@@ -106,7 +106,12 @@ class BaseVllmGenerationWorker:
             init_kwargs["seed"] = seed
             # Need to give each DP group its own vllm cache to address:
             # https://github.com/vllm-project/vllm/issues/18851
-            env_vars["VLLM_CACHE_ROOT"] = os.path.expanduser(f"~/.cache/vllm_{seed}")
+            # [CUSTOM] NRL_VLLM_CACHE_BASE moves these per-replica caches (~140MB
+            # each, one per vLLM replica) off a small home quota.
+            cache_base = os.environ.get("NRL_VLLM_CACHE_BASE", "~/.cache")
+            env_vars["VLLM_CACHE_ROOT"] = os.path.expanduser(
+                os.path.join(cache_base, f"vllm_{seed}")
+            )
 
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)
