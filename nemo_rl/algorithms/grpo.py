@@ -327,7 +327,26 @@ def setup(
             dataloader_state_dict = torch.load(
                 os.path.join(last_checkpoint_path, f"train_dataloader{suffix}.pt")
             )
+            # [CUSTOM] Async GRPO saves the collector's wrapped state
+            # ({"current_epoch", "dataloader_state"}, see
+            # AsyncTrajectoryCollector.get_dataloader_state). Loading the wrapper
+            # as-is left the real state one level down, so the collector found
+            # no "_snapshot", discarded it and every resume replayed the data
+            # from the start of the shuffle order.
+            if isinstance(dataloader_state_dict, dict) and "dataloader_state" in (
+                dataloader_state_dict
+            ):
+                dataloader_state_dict = dataloader_state_dict["dataloader_state"]
             dataloader.load_state_dict(dataloader_state_dict)
+            snapshot = dataloader_state_dict.get("_snapshot", {}) if isinstance(
+                dataloader_state_dict, dict
+            ) else {}
+            yielded = (
+                snapshot.get("_main_snapshot", {})
+                .get("_sampler_iter_state", {})
+                .get("samples_yielded")
+            )
+            print(f"  ✓ Restored train dataloader state (samples_yielded={yielded})")
         return dataloader
 
     if data_config["use_multiple_dataloader"]:
