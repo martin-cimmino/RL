@@ -19,6 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import math
 import threading as _threading
 import time
@@ -88,6 +89,9 @@ class ReplayBuffer:
 
         self.last_target_weight_already_generated = -1
         self.expired_dropped = 0  # [CUSTOM] groups dropped by flexible sampling
+        # [CUSTOM] prompt ids of those groups, handed back on the next successful
+        # sample so the collector regenerates the prompts.
+        self.expired_prompt_uids: list[int] = []
         self._lock = _threading.Lock()
 
     def push_with_wait_signal(
@@ -199,6 +203,12 @@ class ReplayBuffer:
                     f"🗑️ Dropping {len(old_trajectories)} expired groups (older than min_valid_version {min_valid_version})"
                 )
                 self.expired_dropped += len(old_trajectories)
+                self.expired_prompt_uids.extend(
+                    self.trajectories[i].get("prompt_uid")
+                    for i, v in enumerate(self.trajectory_versions)
+                    if v < min_valid_version
+                    and self.trajectories[i].get("prompt_uid") is not None
+                )
                 self.trajectories = [self.trajectories[i] for i in keep]
                 self.trajectory_versions = [self.trajectory_versions[i] for i in keep]
                 self.target_weight_versions = [
@@ -296,7 +306,13 @@ class ReplayBuffer:
                 "target_weight_versions": sampled_targets,
                 # Running total; the trainer logs the per-step difference.
                 "expired_dropped_total": self.expired_dropped,
+                "expired_prompt_uids": self._take_expired_prompt_uids(),
             }
+
+    def _take_expired_prompt_uids(self) -> list[int]:
+        """Return and forget the prompt ids of expired groups. Caller holds the lock."""
+        uids, self.expired_prompt_uids = self.expired_prompt_uids, []
+        return uids
 
     def size(self) -> int:
         """Return current buffer size."""
@@ -403,6 +419,17 @@ class AsyncTrajectoryCollector:
 
         # Track current epoch for checkpointing (0 means not started)
         self.current_epoch: int = 0
+
+        # [CUSTOM] Prompt bookkeeping, so no prompt taken from the dataloader is
+        # lost: every prompt is pending (keyed by a uid) until it is trained on
+        # or discarded by dynamic sampling. Surplus, expired or failed groups
+        # send their prompt back to the retry queue, and checkpoints save the
+        # pending prompts so a resume regenerates them (pending_prompts.pt).
+        self._pending_lock = _threading.Lock()
+        self._pending_prompts: dict[int, BatchedDataDict[DatumSpec]] = {}
+        self._retry_uids: collections.deque[int] = collections.deque()
+        self._next_prompt_uid = 0
+        self._num_requeued_prompts = 0
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
@@ -664,7 +691,26 @@ class AsyncTrajectoryCollector:
                     )
                     self.dataloader.next_iter_state = None
 
-                for batch in self.dataloader:
+                iterator = iter(self.dataloader)
+                while self.running:
+                    # [CUSTOM] Regenerate requeued / restored prompts first.
+                    retry_items = self._take_retry_prompts()
+                    if retry_items:
+                        self._launch_prompts(retry_items)
+                        continue
+                    # Fetch and register under one lock so a checkpoint never
+                    # sees the dataloader past a prompt that is not pending.
+                    with self._pending_lock:
+                        try:
+                            batch = next(iterator)
+                        except StopIteration:
+                            break
+                        items = [
+                            (self._register_prompt(single), single)
+                            for single in (
+                                batch.slice(i, i + 1) for i in range(batch.size)
+                            )
+                        ]
                     if not self.running:
                         break
 
@@ -682,7 +728,7 @@ class AsyncTrajectoryCollector:
                         break
 
                     # Blocks per prompt until a target weight has an open slot.
-                    self._process_batch(batch)
+                    self._launch_prompts(items)
 
                 if self.running:
                     print(
@@ -699,7 +745,18 @@ class AsyncTrajectoryCollector:
             print("🛑 Trajectory collection stopped")
 
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
-        """Launch one prompt group per prompt in batch, each for an open target slot.
+        """Register every prompt of batch and launch it (see _launch_prompts)."""
+        with self._pending_lock:
+            items = [
+                (self._register_prompt(single), single)
+                for single in (batch.slice(i, i + 1) for i in range(batch.size))
+            ]
+        self._launch_prompts(items)
+
+    def _launch_prompts(
+        self, items: list[tuple[int, BatchedDataDict[DatumSpec]]]
+    ) -> None:
+        """Launch one prompt group per (uid, prompt), each for an open target slot.
 
         Each prompt reserves a slot of the lowest target weight that still needs
         groups, so one dataloader batch may feed several targets, and a target
@@ -708,12 +765,11 @@ class AsyncTrajectoryCollector:
         try:
             num_generations = self.master_config["grpo"]["num_generations_per_prompt"]
 
-            for prompt_idx in range(batch.size):
+            for prompt_idx, (prompt_uid, single_prompt_batch) in enumerate(items):
                 # Validation pauses collection; don't start new groups meanwhile.
                 if not self._manual_pause_cleared.is_set() and self.running:
                     self._manual_pause_cleared.wait()
 
-                single_prompt_batch = batch.slice(prompt_idx, prompt_idx + 1)
                 repeated_batch = single_prompt_batch.repeat_interleave(num_generations)
 
                 # A reserved slot is only released by the worker, so keep the
@@ -752,6 +808,7 @@ class AsyncTrajectoryCollector:
                         target_weight,
                         prompt_idx,
                         filterable,
+                        prompt_uid,
                     ),
                     daemon=True,
                 )
@@ -766,6 +823,66 @@ class AsyncTrajectoryCollector:
             import traceback
 
             traceback.print_exc()
+
+    def _register_prompt(self, single_prompt_batch: BatchedDataDict[DatumSpec]) -> int:
+        """Mark a prompt pending and return its uid. Caller holds _pending_lock."""
+        uid = self._next_prompt_uid
+        self._next_prompt_uid += 1
+        self._pending_prompts[uid] = single_prompt_batch
+        return uid
+
+    def _finish_prompt(self, uid: Optional[int]) -> None:
+        """A prompt was trained on or discarded by dynamic sampling."""
+        if uid is None:
+            return
+        with self._pending_lock:
+            self._pending_prompts.pop(uid, None)
+
+    def _requeue_prompt(self, uid: Optional[int]) -> None:
+        """Send a still-pending prompt back for generation."""
+        if uid is None:
+            return
+        with self._pending_lock:
+            if uid in self._pending_prompts and uid not in self._retry_uids:
+                self._retry_uids.append(uid)
+                self._num_requeued_prompts += 1
+
+    def _take_retry_prompts(self) -> list[tuple[int, BatchedDataDict[DatumSpec]]]:
+        """Pop every prompt waiting in the retry queue."""
+        with self._pending_lock:
+            items = []
+            while self._retry_uids:
+                uid = self._retry_uids.popleft()
+                if uid in self._pending_prompts:
+                    items.append((uid, self._pending_prompts[uid]))
+            return items
+
+    def update_prompt_status(
+        self, consumed_uids: list[int], requeue_uids: list[int]
+    ) -> dict[str, float]:
+        """[CUSTOM] Called by the trainer after each sample.
+
+        consumed_uids: prompts of the groups the step trained on (finished).
+        requeue_uids: prompts of groups the buffer dropped as expired.
+        """
+        for uid in consumed_uids:
+            self._finish_prompt(uid)
+        for uid in requeue_uids:
+            self._requeue_prompt(uid)
+        with self._pending_lock:
+            return {
+                "async_num_pending_prompts": float(len(self._pending_prompts)),
+                "async_num_requeued_prompts_total": float(self._num_requeued_prompts),
+            }
+
+    def restore_pending_prompts(
+        self, prompts: list[BatchedDataDict[DatumSpec]]
+    ) -> None:
+        """[CUSTOM] On resume, queue the prompts pending at the checkpoint first."""
+        with self._pending_lock:
+            for single_prompt_batch in prompts:
+                self._retry_uids.append(self._register_prompt(single_prompt_batch))
+        print(f"♻️ Restored {len(prompts)} pending prompts from the checkpoint for regeneration")
 
     def get_weight_version(self) -> int:
         return self.current_weight_version
@@ -882,10 +999,19 @@ class AsyncTrajectoryCollector:
         Returns a dict containing:
             - dataloader_state: The StatefulDataLoader's state_dict
             - current_epoch: The current epoch number (1-indexed)
+            - pending_prompts: [CUSTOM] prompts taken from the dataloader but not
+              yet trained on or discarded by dynamic sampling (saved separately
+              by the trainer, as pending_prompts.pt)
         """
         state = {"current_epoch": self.current_epoch}
-        if hasattr(self, "dataloader") and hasattr(self.dataloader, "state_dict"):
-            state["dataloader_state"] = self.dataloader.state_dict()
+        # [CUSTOM] One lock for both, so every prompt the dataloader state counts
+        # as yielded is either finished or in pending_prompts.
+        with self._pending_lock:
+            if hasattr(self, "dataloader") and hasattr(self.dataloader, "state_dict"):
+                state["dataloader_state"] = self.dataloader.state_dict()
+            state["pending_prompts"] = [
+                self._pending_prompts[uid] for uid in sorted(self._pending_prompts)
+            ]
         return state
 
     def set_dataloader_state(self, state: dict) -> None:
@@ -935,6 +1061,7 @@ class AsyncTrajectoryCollector:
         target_weight_version: int,
         prompt_idx: int,
         filterable: bool,
+        prompt_uid: Optional[int] = None,
     ) -> None:
         # Whether this worker's slot was accepted/discarded; if neither happens
         # (error, shutdown) the slot is re-opened so the target is not starved.
@@ -991,6 +1118,7 @@ class AsyncTrajectoryCollector:
                 )
                 self._settle_slot(target_weight_version, accepted=False, discarded=True)
                 slot_settled = True
+                self._finish_prompt(prompt_uid)
                 return
 
             claim_target = self._claim_slot(
@@ -1010,6 +1138,8 @@ class AsyncTrajectoryCollector:
                     target_weight_version, accepted=False, discarded=False, surplus=True
                 )
                 slot_settled = True
+                # [CUSTOM] Not trained and not filtered: generate the prompt again.
+                self._requeue_prompt(prompt_uid)
                 return
             slot_claimed = True
             if claim_target != target_weight_version:
@@ -1022,6 +1152,7 @@ class AsyncTrajectoryCollector:
                 "batch": final_batch_cpu,
                 "rollout_metrics": rollout_metrics,
                 "timestamp": time.time(),
+                "prompt_uid": prompt_uid,
             }
 
             # Use exponential backoff when buffer is full
@@ -1078,6 +1209,10 @@ class AsyncTrajectoryCollector:
                 print(
                     f"🧹 Released unfilled slot for target weight {target_weight_version} (prompt_idx {prompt_idx})"
                 )
+                # [CUSTOM] Error or shutdown: the prompt stays pending (saved at the
+                # next checkpoint) and, while running, is generated again.
+                if self.running:
+                    self._requeue_prompt(prompt_uid)
 
             # Detach thread record when finished
             with self._threads_lock:

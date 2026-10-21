@@ -755,7 +755,7 @@ class TestCollectorSlotScheduling:
         collector.running = True
         return collector, replay_buffer
 
-    def run_group(self, collector, *, target, filterable, rewards):
+    def run_group(self, collector, *, target, filterable, rewards, prompt_uid=None):
         """Run one prompt-group worker whose rollout returns the given rewards."""
         final_batch = BatchedDataDict({"total_reward": torch.tensor(rewards)})
         collector._inflight_sema.acquire()
@@ -767,7 +767,7 @@ class TestCollectorSlotScheduling:
             mock.patch("nemo_rl.algorithms.async_utils.ray.get", side_effect=lambda x: x),
         ):
             collector._run_prompt_group_worker(
-                BatchedDataDict({}), 0, target, 0, filterable
+                BatchedDataDict({}), 0, target, 0, filterable, prompt_uid
             )
 
     def test_without_dynamic_sampling_each_target_gets_exactly_its_groups(self):
@@ -1154,3 +1154,128 @@ class TestFlexibleSampling:
 
         assert (slots.accepted, slots.claimed, slots.release_pending) == (0, 0, 0)
         assert slots.consumed_early == 1
+
+
+class TestPromptBookkeeping:
+    """[CUSTOM] No prompt taken from the dataloader is lost: each one ends trained
+    on or discarded by dynamic sampling; anything else is generated again."""
+
+    @staticmethod
+    def setup(**kw):
+        harness = TestCollectorSlotScheduling()
+        collector, buffer = harness.make_collector(use_dynamic_sampling=True, **kw)
+        return harness, collector, buffer
+
+    @staticmethod
+    def register(collector, name):
+        with collector._pending_lock:
+            return collector._register_prompt(BatchedDataDict({"name": [name]}))
+
+    def test_dynamic_sampling_discard_finishes_the_prompt(self):
+        harness, collector, _ = self.setup()
+        uid = self.register(collector, "a")
+        collector._reserve_slot()
+
+        harness.run_group(collector, target=0, filterable=True, rewards=[0.0] * 4, prompt_uid=uid)
+
+        assert collector._pending_prompts == {}
+        assert not collector._retry_uids
+
+    def test_buffered_group_stays_pending_until_trained(self):
+        harness, collector, buffer = self.setup()
+        uid = self.register(collector, "a")
+        collector._reserve_slot()
+
+        harness.run_group(collector, target=0, filterable=True, rewards=[1.0, 0.0, 0.0, 0.0], prompt_uid=uid)
+
+        pushed = buffer.push_with_wait_signal.remote.call_args.args[0]
+        assert pushed["prompt_uid"] == uid
+        assert uid in collector._pending_prompts
+        stats = collector.update_prompt_status([uid], [])
+        assert collector._pending_prompts == {}
+        assert stats["async_num_pending_prompts"] == 0.0
+
+    def test_surplus_group_is_requeued_not_lost(self):
+        harness, collector, buffer = self.setup(num_prompts_per_step=1, groups_multiplier=2)
+        uids = [self.register(collector, n) for n in "ab"]
+        collector._reserve_slot()
+        collector._reserve_slot()
+        mixed = [1.0, 0.0, 1.0, 0.0]
+
+        harness.run_group(collector, target=0, filterable=True, rewards=mixed, prompt_uid=uids[0])
+        harness.run_group(collector, target=0, filterable=True, rewards=mixed, prompt_uid=uids[1])
+
+        assert buffer.push_with_wait_signal.remote.call_count == 1
+        assert list(collector._retry_uids) == [uids[1]]
+        assert collector._take_retry_prompts()[0][1]["name"] == ["b"]
+
+    def test_failed_worker_requeues_its_prompt(self):
+        _, collector, _ = self.setup()
+        uid = self.register(collector, "a")
+        collector._reserve_slot()
+        collector._inflight_sema.acquire()
+        with mock.patch(
+            "nemo_rl.algorithms.async_utils.run_async_multi_turn_rollout",
+            side_effect=RuntimeError("rollout failed"),
+        ):
+            collector._run_prompt_group_worker(BatchedDataDict({}), 0, 0, 0, True, uid)
+
+        assert list(collector._retry_uids) == [uid]
+
+    def test_expired_groups_are_requeued(self):
+        _, collector, _ = self.setup()
+        uid = self.register(collector, "a")
+
+        collector.update_prompt_status([], [uid])
+        collector.update_prompt_status([], [uid])  # not queued twice
+
+        assert list(collector._retry_uids) == [uid]
+        assert collector._num_requeued_prompts == 1
+
+    def test_checkpoint_saves_pending_prompts_and_resume_queues_them_first(self):
+        _, collector, _ = self.setup()
+        uids = [self.register(collector, n) for n in "abc"]
+        collector.update_prompt_status([uids[1]], [])  # "b" was trained on
+
+        state = collector.get_dataloader_state()
+        assert [p["name"] for p in state["pending_prompts"]] == [["a"], ["c"]]
+
+        _, resumed, _ = self.setup()
+        resumed.restore_pending_prompts(state["pending_prompts"])
+        assert [p["name"] for _, p in resumed._take_retry_prompts()] == [["a"], ["c"]]
+        assert len(resumed._pending_prompts) == 2
+
+    def test_buffer_hands_back_expired_prompt_uids_once(self):
+        buffer = ReplayBuffer.__ray_actor_class__(max_size=100)
+        buffer.push_with_wait_signal({"batch": 0, "rollout_metrics": {}, "prompt_uid": 7}, 0, 3)
+        for i in (1, 2):
+            buffer.push_with_wait_signal({"batch": i, "rollout_metrics": {}, "prompt_uid": 10 + i}, 4, 5)
+
+        first = buffer.sample(1, 5, 3, flexible=True)
+        second = buffer.sample(1, 5, 3, flexible=True)
+
+        assert first["expired_prompt_uids"] == [7]
+        assert second["expired_prompt_uids"] == []
+
+    def test_collection_loop_registers_batches_and_runs_retries_first(self):
+        _, collector, _ = self.setup()
+        collector.dataloader = [
+            BatchedDataDict({"name": ["p0", "p1"]}),
+            BatchedDataDict({"name": ["p2", "p3"]}),
+        ]
+        collector.restore_pending_prompts([BatchedDataDict({"name": ["old"]})])
+        launched = []
+
+        def fake_launch(items):
+            launched.append([p["name"][0] for _, p in items])
+            if len(launched) == 3:
+                collector.running = False
+
+        collector._launch_prompts = fake_launch
+        collector._collection_loop()
+
+        assert launched == [["old"], ["p0", "p1"], ["p2", "p3"]]
+        # Nothing finished yet, so all five prompts are still pending.
+        assert sorted(p["name"][0] for p in collector._pending_prompts.values()) == [
+            "old", "p0", "p1", "p2", "p3"
+        ]

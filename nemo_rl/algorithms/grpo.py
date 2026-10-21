@@ -2755,6 +2755,17 @@ def async_grpo_train(
     )
 
     # Start trajectory collection in background
+    # [CUSTOM] Resume: regenerate the prompts that were pending at the checkpoint
+    # (in flight, buffered or queued) before reading new ones.
+    _last_ckpt = checkpointer.get_latest_checkpoint_path()
+    if _last_ckpt is not None:
+        _pending_path = os.path.join(_last_ckpt, "pending_prompts.pt")
+        if os.path.exists(_pending_path):
+            ray.get(
+                trajectory_collector.restore_pending_prompts.remote(
+                    torch.load(_pending_path, weights_only=False)
+                )
+            )
     collection_task = trajectory_collector.start_collection.remote(dataloader)
 
     # Ensure collector knows initial weight version
@@ -2923,6 +2934,18 @@ def async_grpo_train(
                         1
                         for target in sample_result["target_weight_versions"]
                         if target != weight_version
+                    )
+                    # [CUSTOM] Prompt bookkeeping: the trained groups' prompts are
+                    # done; expired groups' prompts are generated again.
+                    prompt_stats = ray.get(
+                        trajectory_collector.update_prompt_status.remote(
+                            [
+                                t["prompt_uid"]
+                                for t in trajectories
+                                if t.get("prompt_uid") is not None
+                            ],
+                            sample_result.get("expired_prompt_uids", []),
+                        )
                     )
                     if flexible_sampling and num_early_groups:
                         # Groups of later targets were taken: let those targets
@@ -3301,6 +3324,7 @@ def async_grpo_train(
                 # past max_trajectory_age_steps in the buffer, since the last step.
                 metrics["async_num_expired_groups"] = float(num_expired_groups)
                 metrics["async_num_expired_groups_total"] = float(expired_dropped_total)
+                metrics.update(prompt_stats)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
@@ -3387,10 +3411,21 @@ def async_grpo_train(
                         actual_dataloader_state = ray.get(
                             trajectory_collector.get_dataloader_state.remote()
                         )
+                        # [CUSTOM] Pending prompts hold non-tensor objects, so they go
+                        # in their own file: train_dataloader.pt is read back with
+                        # torch.load's default weights_only=True.
+                        pending_prompts = actual_dataloader_state.pop(
+                            "pending_prompts", None
+                        )
                         torch.save(
                             actual_dataloader_state,
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
+                        if pending_prompts is not None:
+                            torch.save(
+                                pending_prompts,
+                                os.path.join(checkpoint_path, "pending_prompts.pt"),
+                            )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
             # Logging
