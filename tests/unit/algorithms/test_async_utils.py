@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import os
 import tempfile
 import threading
@@ -1279,3 +1280,162 @@ class TestPromptBookkeeping:
         assert sorted(p["name"][0] for p in collector._pending_prompts.values()) == [
             "old", "p0", "p1", "p2", "p3"
         ]
+
+
+class TestSkipSolvedPrompts:
+    """[CUSTOM] Prompts whose whole group is solved (all-1) are skipped in later
+    epochs, and max_num_epochs then counts passes over the data."""
+
+    @staticmethod
+    def setup(max_num_epochs=2, **kw):
+        harness = TestCollectorSlotScheduling()
+        collector, buffer = harness.make_collector(use_dynamic_sampling=True, **kw)
+        collector._skip_solved = True
+        collector._solved_threshold = 1.0
+        collector._max_data_epochs = max_num_epochs
+        return harness, collector, buffer
+
+    @staticmethod
+    def group(idx):
+        return BatchedDataDict({"idx": [idx] * 4})
+
+    def run_group(self, harness, collector, idx, rewards, filterable=True):
+        """run_group of TestCollectorSlotScheduling, with the prompt's idx."""
+        collector._reserve_slot()
+        collector._inflight_sema.acquire()
+        final_batch = BatchedDataDict({"total_reward": torch.tensor(rewards)})
+        with (
+            mock.patch(
+                "nemo_rl.algorithms.async_utils.run_async_multi_turn_rollout",
+                return_value=(final_batch, {}),
+            ),
+            mock.patch("nemo_rl.algorithms.async_utils.ray.get", side_effect=lambda x: x),
+        ):
+            collector._run_prompt_group_worker(self.group(idx), 0, 0, 0, filterable, None)
+
+    def test_only_all_one_groups_are_marked_solved(self):
+        harness, collector, _ = self.setup(num_prompts_per_step=4)
+        collector.current_epoch = 1
+        self.run_group(harness, collector, 10, [1.0] * 4)
+        self.run_group(harness, collector, 11, [0.0] * 4)
+        self.run_group(harness, collector, 12, [1.0, 1.0, 1.0, 0.0])
+        # Accepted unfiltered (dynamic sampling launch cap reached): still solved.
+        self.run_group(harness, collector, 13, [1.0] * 4, filterable=False)
+
+        assert collector._solved_prompts == {10: 1, 13: 1}
+
+    def test_solved_prompts_are_skipped_in_later_epochs_and_reading_stops(self):
+        _, collector, _ = self.setup(max_num_epochs=2)
+        collector.dataloader = [
+            BatchedDataDict({"idx": [0, 1]}),
+            BatchedDataDict({"idx": [2, 3]}),
+        ]
+        launched = []
+
+        def fake_launch(items):
+            idxs = [p["idx"][0] for _, p in items]
+            launched.append(idxs)
+            if 1 in idxs:  # prompt 1 is solved in the first epoch
+                collector._solved_prompts[1] = collector.current_epoch
+
+        def stop_when_idle(_):
+            collector.running = False
+
+        collector._launch_prompts = fake_launch
+        with mock.patch("nemo_rl.algorithms.async_utils.time.sleep", stop_when_idle):
+            collector._collection_loop()
+
+        assert launched == [[0, 1], [2, 3], [0], [2, 3]]
+        assert collector._epochs_completed == 2
+        assert collector._num_skipped_solved == 1
+        assert collector._data_exhausted
+        stats = collector.update_prompt_status([], [])
+        assert stats["async_num_solved_prompts"] == 1.0
+        assert stats["async_num_skipped_solved_total"] == 1.0
+
+    def test_requeued_prompts_are_still_generated_after_the_last_epoch(self):
+        _, collector, _ = self.setup(max_num_epochs=1)
+        collector.dataloader = [BatchedDataDict({"idx": [0]})]
+        launched = []
+        uids = []
+
+        def fake_launch(items):
+            launched.append(([p["idx"][0] for _, p in items], collector._data_exhausted))
+            uids.append(items[0][0])
+
+        def stop_when_idle(_):
+            if len(launched) == 1:
+                # Idle after the last epoch, then the group expires in the buffer.
+                collector._requeue_prompt(uids[0])
+            else:
+                collector.running = False
+
+        collector._launch_prompts = fake_launch
+        with mock.patch("nemo_rl.algorithms.async_utils.time.sleep", stop_when_idle):
+            collector._collection_loop()
+
+        assert launched == [([0], False), ([0], True)]
+
+    def test_is_finished_waits_for_retries_and_running_workers(self):
+        _, collector, _ = self.setup()
+        assert not collector.is_finished()  # data not read yet
+
+        collector._data_exhausted = True
+        assert collector.is_finished()
+
+        with collector._pending_lock:
+            uid = collector._register_prompt(BatchedDataDict({"idx": [5]}))
+        collector._requeue_prompt(uid)
+        assert not collector.is_finished()
+        collector._take_retry_prompts()
+
+        collector._relaunching = True
+        assert not collector.is_finished()
+        collector._relaunching = False
+
+        alive = mock.MagicMock()
+        alive.is_alive.return_value = True
+        collector._inflight_threads.add(alive)
+        assert not collector.is_finished()
+        alive.is_alive.return_value = False
+        assert collector.is_finished()
+
+    def test_checkpoint_round_trip_and_old_checkpoints(self):
+        _, collector, _ = self.setup()
+        collector._epochs_completed = 3
+        collector._solved_prompts = {4: 1, 9: 3}
+        state = collector.get_dataloader_state()
+        state.pop("pending_prompts")
+        # train_dataloader.pt is read back with weights_only=True.
+        buf = io.BytesIO()
+        torch.save(state, buf)
+        buf.seek(0)
+        loaded = torch.load(buf, weights_only=True)
+
+        _, resumed, _ = self.setup()
+        resumed.restore_collection_state(loaded)
+        assert resumed._epochs_completed == 3
+        assert resumed._solved_prompts == {4: 1, 9: 3}
+
+        _, old, _ = self.setup()
+        old.restore_collection_state({"current_epoch": 2, "dataloader_state": {}})
+        assert old._epochs_completed == 1
+        assert old._solved_prompts == {}
+
+    def test_skip_config_reads_max_num_epochs(self):
+        harness = TestCollectorSlotScheduling()
+        collector, _ = harness.make_collector(use_dynamic_sampling=True)
+        assert collector._max_data_epochs is None
+        cfg = collector.master_config
+        cfg["grpo"]["max_num_epochs"] = 5
+        cfg["grpo"]["async_grpo"]["skip_solved_prompts"] = True
+        enabled = AsyncTrajectoryCollector.__ray_actor_class__(
+            policy_generation=MockGenerationInterface(),
+            tokenizer=mock.MagicMock(),
+            task_to_env={},
+            master_config=cfg,
+            replay_buffer=mock.MagicMock(),
+            start_step=0,
+        )
+        assert enabled._skip_solved and enabled._max_data_epochs == 5
+        assert enabled._solved_threshold == 1.0

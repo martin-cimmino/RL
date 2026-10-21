@@ -419,6 +419,28 @@ class AsyncTrajectoryCollector:
 
         # Track current epoch for checkpointing (0 means not started)
         self.current_epoch: int = 0
+        # [CUSTOM] Data epochs fully read, counted under _pending_lock together
+        # with the dataloader read so a checkpoint saves a consistent pair, and
+        # restored on resume (see restore_collection_state).
+        self._epochs_completed = 0
+
+        # [CUSTOM] Skip solved prompts: a prompt whose whole group reaches
+        # solved_reward_threshold (all-1) is recorded by dataset idx and not
+        # generated again in later epochs, while all-0 prompts stay in. Epochs
+        # then shrink, so max_num_epochs counts passes over the data: collection
+        # stops reading after that many and the trainer ends when the remaining
+        # groups cannot fill a step (see is_finished).
+        async_cfg = self.master_config["grpo"]["async_grpo"]
+        self._skip_solved = bool(async_cfg.get("skip_solved_prompts", False))
+        self._solved_threshold = float(async_cfg.get("solved_reward_threshold", 1.0))
+        self._max_data_epochs: Optional[int] = (
+            int(grpo_cfg["max_num_epochs"]) if self._skip_solved else None
+        )
+        self._solved_prompts: dict[int, int] = {}  # dataset idx -> epoch solved
+        self._num_skipped_solved = 0
+        self._data_exhausted = False
+        # True while requeued prompts are taken but their workers not started yet.
+        self._relaunching = False
 
         # [CUSTOM] Prompt bookkeeping, so no prompt taken from the dataloader is
         # lost: every prompt is pending (keyed by a uid) until it is trained on
@@ -673,7 +695,33 @@ class AsyncTrajectoryCollector:
         """
         try:
             while self.running:
-                self.current_epoch += 1
+                if (
+                    self._max_data_epochs is not None
+                    and self._epochs_completed >= self._max_data_epochs
+                ):
+                    # [CUSTOM] Every data epoch is read: only regenerate requeued
+                    # prompts until nothing is left (see is_finished).
+                    if not self._data_exhausted:
+                        self._data_exhausted = True
+                        print(
+                            f"🏁 Read all {self._max_data_epochs} data epochs; "
+                            "generating only requeued prompts from now on"
+                        )
+                    with self._pending_lock:
+                        self._relaunching = True
+                    retry_items = []
+                    try:
+                        retry_items = self._take_retry_prompts()
+                        if retry_items:
+                            self._launch_prompts(retry_items)
+                    finally:
+                        with self._pending_lock:
+                            self._relaunching = False
+                    if not retry_items:
+                        time.sleep(0.5)
+                    continue
+
+                self.current_epoch = self._epochs_completed + 1
                 print(f"Starting epoch {self.current_epoch} of trajectory collection")
 
                 # Defensive: torchdata's multiprocess iterator asserts
@@ -704,15 +752,24 @@ class AsyncTrajectoryCollector:
                         try:
                             batch = next(iterator)
                         except StopIteration:
+                            self._epochs_completed += 1
                             break
-                        items = [
-                            (self._register_prompt(single), single)
-                            for single in (
-                                batch.slice(i, i + 1) for i in range(batch.size)
-                            )
-                        ]
+                        items = []
+                        for single in (
+                            batch.slice(i, i + 1) for i in range(batch.size)
+                        ):
+                            # [CUSTOM] Solved in an earlier epoch: skip it.
+                            if (
+                                self._skip_solved
+                                and int(single["idx"][0]) in self._solved_prompts
+                            ):
+                                self._num_skipped_solved += 1
+                                continue
+                            items.append((self._register_prompt(single), single))
                     if not self.running:
                         break
+                    if not items:
+                        continue
 
                     # Check if manually paused and wait
                     if not self._manual_pause_cleared.is_set() and self.running:
@@ -857,6 +914,27 @@ class AsyncTrajectoryCollector:
                     items.append((uid, self._pending_prompts[uid]))
             return items
 
+    def _mark_solved(self, repeated_batch: BatchedDataDict[DatumSpec]) -> None:
+        """[CUSTOM] Record a prompt whose whole group was solved (all-1)."""
+        idx = int(repeated_batch["idx"][0])
+        with self._pending_lock:
+            self._solved_prompts.setdefault(idx, self.current_epoch)
+
+    def is_finished(self) -> bool:
+        """[CUSTOM] Every data epoch is read and no prompt is left to generate.
+
+        Checked under _pending_lock: a worker requeues its prompt before it
+        exits, and the collection loop keeps _relaunching set until the workers
+        of the prompts it took are started, so no prompt slips between checks.
+        """
+        if not self._data_exhausted:
+            return False
+        with self._pending_lock:
+            if self._retry_uids or self._relaunching:
+                return False
+            with self._threads_lock:
+                return not any(t.is_alive() for t in self._inflight_threads)
+
     def update_prompt_status(
         self, consumed_uids: list[int], requeue_uids: list[int]
     ) -> dict[str, float]:
@@ -870,10 +948,17 @@ class AsyncTrajectoryCollector:
         for uid in requeue_uids:
             self._requeue_prompt(uid)
         with self._pending_lock:
-            return {
+            stats = {
                 "async_num_pending_prompts": float(len(self._pending_prompts)),
                 "async_num_requeued_prompts_total": float(self._num_requeued_prompts),
+                "async_data_epoch": float(self.current_epoch),
             }
+            if self._skip_solved:
+                stats["async_num_solved_prompts"] = float(len(self._solved_prompts))
+                stats["async_num_skipped_solved_total"] = float(
+                    self._num_skipped_solved
+                )
+            return stats
 
     def restore_pending_prompts(
         self, prompts: list[BatchedDataDict[DatumSpec]]
@@ -883,6 +968,26 @@ class AsyncTrajectoryCollector:
             for single_prompt_batch in prompts:
                 self._retry_uids.append(self._register_prompt(single_prompt_batch))
         print(f"♻️ Restored {len(prompts)} pending prompts from the checkpoint for regeneration")
+
+    def restore_collection_state(self, state: dict) -> None:
+        """[CUSTOM] On resume, restore the data epochs read and the solved prompts.
+
+        state is the train_dataloader.pt of the checkpoint (see
+        get_dataloader_state). Checkpoints older than epochs_completed only hold
+        the epoch in progress, current_epoch.
+        """
+        if "epochs_completed" in state:
+            self._epochs_completed = int(state["epochs_completed"])
+        elif "current_epoch" in state:
+            self._epochs_completed = max(int(state["current_epoch"]) - 1, 0)
+        self._solved_prompts = {
+            int(idx): int(epoch)
+            for idx, epoch in state.get("solved_prompts", {}).items()
+        }
+        print(
+            f"♻️ Restored collection state: {self._epochs_completed} data epochs read, "
+            f"{len(self._solved_prompts)} solved prompts"
+        )
 
     def get_weight_version(self) -> int:
         return self.current_weight_version
@@ -1009,6 +1114,8 @@ class AsyncTrajectoryCollector:
         with self._pending_lock:
             if hasattr(self, "dataloader") and hasattr(self.dataloader, "state_dict"):
                 state["dataloader_state"] = self.dataloader.state_dict()
+            state["epochs_completed"] = self._epochs_completed
+            state["solved_prompts"] = dict(self._solved_prompts)
             state["pending_prompts"] = [
                 self._pending_prompts[uid] for uid in sorted(self._pending_prompts)
             ]
@@ -1106,6 +1213,8 @@ class AsyncTrajectoryCollector:
             # leave-one-out std would also be zero for the lone success in a
             # 1-of-N group, which must be kept.)
             rewards = final_batch_cpu["total_reward"]
+            if self._skip_solved and bool((rewards >= self._solved_threshold).all()):
+                self._mark_solved(repeated_batch)
             with self._slot_cv:
                 slots = self._target_slots.get(target_weight_version)
                 if slots is not None:
