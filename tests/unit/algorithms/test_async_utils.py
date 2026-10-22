@@ -1439,3 +1439,63 @@ class TestSkipSolvedPrompts:
         )
         assert enabled._skip_solved and enabled._max_data_epochs == 5
         assert enabled._solved_threshold == 1.0
+
+
+class TestAsyncRewardShaping:
+    """[CUSTOM] The async collector applies reward shaping before dynamic
+    sampling, as the sync loop does; the solved check uses the raw rewards."""
+
+    def run_group(self, collector, response_lengths, rewards):
+        final_batch = BatchedDataDict(
+            {
+                "total_reward": torch.tensor(rewards),
+                "message_log": [
+                    [
+                        {"role": "user", "token_ids": torch.zeros(5)},
+                        {"role": "assistant", "token_ids": torch.zeros(n)},
+                    ]
+                    for n in response_lengths
+                ],
+            }
+        )
+        collector._reserve_slot()
+        collector._inflight_sema.acquire()
+        with (
+            mock.patch(
+                "nemo_rl.algorithms.async_utils.run_async_multi_turn_rollout",
+                return_value=(final_batch, {}),
+            ),
+            mock.patch("nemo_rl.algorithms.async_utils.ray.get", side_effect=lambda x: x),
+        ):
+            collector._run_prompt_group_worker(
+                BatchedDataDict({"idx": [7] * 4}), 0, 0, 0, True, None
+            )
+
+    def make(self):
+        harness = TestCollectorSlotScheduling()
+        collector, buffer = harness.make_collector(use_dynamic_sampling=True)
+        collector.master_config["grpo"]["reward_shaping"] = {
+            "enabled": True,
+            "overlong_buffer_length": 10,
+            "overlong_buffer_penalty": 0.5,
+            "max_response_length": 100,
+        }
+        collector._skip_solved = True
+        collector._solved_threshold = 1.0
+        return collector, buffer
+
+    def test_overlong_penalty_breaks_ties_and_solved_uses_raw_rewards(self):
+        collector, buffer = self.make()
+        # All correct; one answer ends 5 tokens into the 10-token buffer.
+        self.run_group(collector, [50, 60, 70, 95], [1.0] * 4)
+
+        pushed = buffer.push_with_wait_signal.remote.call_args.args[0]
+        assert pushed["batch"]["total_reward"].tolist() == [1.0, 1.0, 1.0, 0.75]
+        assert collector._solved_prompts == {7: collector.current_epoch}
+
+    def test_short_all_correct_group_is_still_discarded(self):
+        collector, buffer = self.make()
+        self.run_group(collector, [50, 60, 70, 80], [1.0] * 4)
+
+        assert buffer.push_with_wait_signal.remote.call_count == 0
+        assert 7 in collector._solved_prompts

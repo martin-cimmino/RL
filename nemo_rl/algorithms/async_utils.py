@@ -30,7 +30,8 @@ import ray
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.grpo import MasterConfig
+from nemo_rl.algorithms.grpo import MasterConfig, scale_rewards
+from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -1215,6 +1216,17 @@ class AsyncTrajectoryCollector:
             rewards = final_batch_cpu["total_reward"]
             if self._skip_solved and bool((rewards >= self._solved_threshold).all()):
                 self._mark_solved(repeated_batch)
+            # [CUSTOM] Reward scaling and shaping (e.g. DAPO's overlong penalty)
+            # as in the sync loop, which applies them before dynamic sampling;
+            # the async path skipped them. The solved check above stays on the
+            # raw rewards, so a correct but long answer still counts as solved.
+            grpo_cfg = self.master_config["grpo"]
+            if grpo_cfg.get("reward_scaling"):
+                final_batch_cpu = scale_rewards(final_batch_cpu, grpo_cfg["reward_scaling"])
+            shaping_cfg = grpo_cfg.get("reward_shaping")
+            if shaping_cfg and shaping_cfg.get("enabled"):
+                final_batch_cpu = apply_reward_shaping(final_batch_cpu, shaping_cfg)
+            rewards = final_batch_cpu["total_reward"]
             with self._slot_cv:
                 slots = self._target_slots.get(target_weight_version)
                 if slots is not None:
