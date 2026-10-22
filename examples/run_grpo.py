@@ -114,22 +114,8 @@ def main() -> None:
 
     # Check if async mode is enabled
     if "async_grpo" in config["grpo"] and config["grpo"]["async_grpo"]["enabled"]:
-        # Async GRPO does not support reward scaling or reward shaping (DAPO
-        # features). Dynamic sampling is supported: the trajectory collector
-        # drops zero-variance groups before they reach the replay buffer.
-        unsupported_features = [
-            "reward_scaling",
-            "reward_shaping",
-        ]
-
-        for feature in unsupported_features:
-            if feature not in config["grpo"]:
-                continue
-
-            if config["grpo"][feature]["enabled"]:
-                raise NotImplementedError(
-                    f"{feature} is not supported with async GRPO"
-                )
+        # [CUSTOM] Reward scaling and shaping are applied by the trajectory
+        # collector to each group before dynamic sampling, as in the sync loop.
 
         # Async GRPO does not support multiple dataloaders
         if config["data"]["use_multiple_dataloader"]:
