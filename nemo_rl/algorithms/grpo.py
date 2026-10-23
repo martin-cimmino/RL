@@ -119,6 +119,10 @@ class AsyncGRPOConfig(TypedDict):
     in_flight_weight_updates: NotRequired[bool]
     # Recomputes the KV cache after the in-flight weight updates.
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    # [CUSTOM-ASYNC-BURST-CAP 2026-10-12] Caps AsyncTrajectoryCollector's own in-flight
+    # generation-request semaphore (see async_utils.py's _inflight_sema). Without this, that
+    # semaphore defaults to `num_prompts_per_step * max_trajectory_age_steps`.
+    max_concurrent_generations: NotRequired[int]
 
 
 class AdvEstimatorConfig(TypedDict):

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
+import os
 from typing import Any, Optional, Union
 
 from datasets import concatenate_datasets
@@ -28,6 +30,30 @@ from nemo_rl.data.datasets import (
 from nemo_rl.data.processors import preference_preprocessor
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
+
+
+# [CUSTOM-DATA-PATH-DIR-EXPANSION 2026-10-21] in the original nemo-RL version, 
+# `data_path` could only be a single path to a single file. Expand here to two options:
+# - pass in a file path, like before
+# - pass in a directory path: all *.jsonl and *.json files inside are loaded
+def _expand_directory_data_paths(cfg_list: list[dict]) -> list[dict]:
+    expanded: list[dict] = []
+    for cfg in cfg_list:
+        data_path = cfg.get("data_path")
+        if data_path and os.path.isdir(data_path):
+            shard_paths = sorted(
+                set(glob.glob(os.path.join(data_path, "*.jsonl")))
+                | set(glob.glob(os.path.join(data_path, "*.json")))
+            )
+            if not shard_paths:
+                raise ValueError(
+                    f"data_path {data_path!r} is a directory but contains no .jsonl/.json files."
+                )
+            for shard_path in shard_paths:
+                expanded.append({**cfg, "data_path": shard_path})
+        else:
+            expanded.append(cfg)
+    return expanded
 
 
 # TODO: @yukih: unify to setup_data after dataset refactored
@@ -97,6 +123,7 @@ def setup_response_data(
 
     if isinstance(data_config["train"], dict):
         data_config["train"] = [data_config["train"]]
+    data_config["train"] = _expand_directory_data_paths(data_config["train"])
 
     for cfg in data_config["train"]:
         # load dataset
@@ -175,6 +202,7 @@ def setup_response_data(
     if "validation" in data_config and data_config["validation"] is not None:
         if isinstance(data_config["validation"], dict):
             data_config["validation"] = [data_config["validation"]]
+        data_config["validation"] = _expand_directory_data_paths(data_config["validation"])
 
         for cfg in data_config["validation"]:
             # load dataset

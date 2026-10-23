@@ -51,7 +51,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
-from nemo_rl.utils.proxy import maybe_start_proxy  # [CUSTOM]
+from nemo_rl.utils.proxy import maybe_enable_proxy  # [CUSTOM]
 from nemo_rl.utils.redis_job import maybe_start_redis_job  # [CUSTOM]
 
 
@@ -138,12 +138,12 @@ def main() -> None:
     config: MasterConfig = OmegaConf.to_container(config, resolve=True)
     print("Applied CLI overrides")
 
-    # [CUSTOM] Opt-in (config["proxy"]["enabled"]): keeps a squidward forward-proxy alive for
-    # this process's whole lifetime, for environments that need real internet access
-    # (e.g. web-search tool servers). No-op if the config has no `proxy` block or
-    # `proxy.enabled` is false. Started before anything below that might itself want
-    # outbound internet.
-    maybe_start_proxy(config)
+    # [CUSTOM] Opt-in (config["proxy"]["enabled"]): exports HTTP_PROXY/HTTPS_PROXY/NO_PROXY for
+    # this process's whole lifetime, for environments that need real internet access (e.g.
+    # web-search tool servers). It assumed static address and PROXY_URL. No-op if the config has no `proxy` block or
+    # `proxy.enabled` is false. Called before anything below that might itself want outbound
+    # internet.
+    maybe_enable_proxy(config)
 
     # [CUSTOM] Opt-in (config["redis"]["enabled"]): submits the shared Redis SLURM job used as
     # the backing store for rate-limited Gym resources servers (e.g. brave_search). No-op if
