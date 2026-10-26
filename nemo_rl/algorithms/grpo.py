@@ -132,6 +132,26 @@ class AdvEstimatorConfig(TypedDict):
     minus_baseline: NotRequired[bool]
 
 
+class OverlongRepetitionConfig(TypedDict):
+    """[CUSTOM] Which truncated rollouts overlong filtering keeps in the loss.
+
+    Attributes:
+        enabled: Keep looping truncated rollouts in the loss.
+        ngram: n of the distinct n-gram ratio.
+        window: Number of last generated tokens the ratio is measured on.
+        max_distinct_ratio: A truncated rollout whose ratio is below this is a loop.
+        token_budget: A kept loop weighs as much as this many tokens (loss multiplier
+            token_budget / generated tokens), so one 32k-token loop cannot dominate a
+            token-level loss.
+    """
+
+    enabled: bool
+    ngram: NotRequired[int]
+    window: NotRequired[int]
+    max_distinct_ratio: NotRequired[float]
+    token_budget: NotRequired[int]
+
+
 class GRPOConfig(TypedDict):
     num_prompts_per_step: int
     num_generations_per_prompt: int
@@ -158,6 +178,9 @@ class GRPOConfig(TypedDict):
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
     overlong_filtering: NotRequired[bool]
+    # [CUSTOM] Truncated rollouts that end in a repetition loop stay in the loss (at reward 0)
+    # instead of being filtered, so loops are pushed down; see apply_overlong_filtering.
+    overlong_repetition: NotRequired["OverlongRepetitionConfig"]
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool
@@ -944,16 +967,34 @@ def dynamic_sampling(
     return batch_to_return, is_batch_complete, batch_cache, dynamic_sampling_metrics
 
 
+def distinct_ngram_ratio(token_ids: list[int], ngram: int, window: int) -> float:
+    """Share of distinct n-grams among the last `window` tokens (1.0 when too short)."""
+    tail = token_ids[-window:]
+    if len(tail) <= ngram:
+        return 1.0
+    grams = [tuple(tail[i : i + ngram]) for i in range(len(tail) - ngram + 1)]
+    return len(set(grams)) / len(grams)
+
+
 def apply_overlong_filtering(
     repeated_batch: BatchedDataDict[DatumSpec],
+    repetition_cfg: Optional[OverlongRepetitionConfig] = None,
 ) -> BatchedDataDict[DatumSpec]:
     """Zero the loss multiplier of truncated samples (DAPO overlong filtering).
 
     Truncated samples still count toward their group's reward baseline; they are
     only excluded from the policy-gradient loss.
 
+    [CUSTOM] With `repetition_cfg` enabled, a truncated sample whose generation ends
+    in a repetition loop is kept in the loss with multiplier
+    min(1, token_budget / generated tokens). Filtering every truncated sample means
+    that loops were never penalized, and they can grow on
+    out-of-domain prompts.
+
     Args:
-        repeated_batch: Rollout batch with "loss_multiplier" and "truncated".
+        repeated_batch: Rollout batch with "loss_multiplier" and "truncated"
+            (and "message_log" when `repetition_cfg` is enabled).
+        repetition_cfg: Which truncated samples to keep; None filters all of them.
 
     Returns:
         The same batch with "loss_multiplier" replaced by the filtered copy.
@@ -964,7 +1005,28 @@ def apply_overlong_filtering(
     if isinstance(truncated, list):
         truncated = torch.tensor(truncated, dtype=torch.bool)
 
-    loss_multiplier[truncated] = 0
+    keep = torch.zeros_like(loss_multiplier)
+    if repetition_cfg is not None and repetition_cfg["enabled"]:
+        ngram = repetition_cfg.get("ngram", 4)
+        window = repetition_cfg.get("window", 2048)
+        max_ratio = repetition_cfg.get("max_distinct_ratio", 0.4)
+        budget = repetition_cfg.get("token_budget", 4096)
+        for i in torch.nonzero(truncated).flatten().tolist():
+            generated = [
+                t
+                for m in repeated_batch["message_log"][i]
+                if m["role"] == "assistant"
+                for t in m["token_ids"].tolist()
+            ]
+            if generated and distinct_ngram_ratio(generated, ngram, window) < max_ratio:
+                keep[i] = min(1.0, budget / len(generated))
+        print(
+            f"  overlong filtering: {int(truncated.sum())} truncated, "
+            f"{int((keep > 0).sum())} repetition loops kept in the loss",
+            flush=True,
+        )
+
+    loss_multiplier[truncated] = loss_multiplier[truncated] * keep[truncated]
     repeated_batch["loss_multiplier"] = loss_multiplier
     return repeated_batch
 
@@ -1820,7 +1882,10 @@ def grpo_train(
 
                 with timer.time("data_processing"):
                     if master_config["grpo"]["overlong_filtering"]:
-                        repeated_batch = apply_overlong_filtering(repeated_batch)
+                        repeated_batch = apply_overlong_filtering(
+                            repeated_batch,
+                            master_config["grpo"].get("overlong_repetition"),
+                        )
                     # Add loss mask to each message in LLMMessageLogType
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
@@ -3000,7 +3065,10 @@ def async_grpo_train(
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
                     if master_config["grpo"]["overlong_filtering"]:
-                        repeated_batch = apply_overlong_filtering(repeated_batch)
+                        repeated_batch = apply_overlong_filtering(
+                            repeated_batch,
+                            master_config["grpo"].get("overlong_repetition"),
+                        )
                     # Add loss mask to each message
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
@@ -3249,8 +3317,8 @@ def async_grpo_train(
                     metrics["dynamic_sampling_num_gen_batches"] = target_stats.get(
                         "dynamic_sampling_num_gen_batches", 1.0
                     )
-                    metrics["dynamic_sampling_num_discarded_groups"] = (
-                        target_stats.get("dynamic_sampling_num_discarded_groups", 0.0)
+                    metrics["dynamic_sampling_num_discarded_groups"] = target_stats.get(
+                        "dynamic_sampling_num_discarded_groups", 0.0
                     )
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
