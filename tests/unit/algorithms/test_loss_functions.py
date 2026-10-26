@@ -871,6 +871,47 @@ def test_clipped_pg_loss_zero_mask():
     torch.testing.assert_close(loss, torch.tensor(0.0, device=device))
 
 
+@pytest.mark.parametrize("sequence_level_importance_ratios", [False, True])
+def test_clipped_pg_loss_masked_sample_with_corrupted_prev_logprobs(
+    sequence_level_importance_ratios,
+):
+    """A masked-out sample with corrupted prev_logprobs (~-700) must not make the loss or its gradient NaN."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(
+        batch_size=2, device=device
+    )
+    data["advantages"] = torch.full((batch_size, seq_len), -1.0, device=device)
+    data["generation_logprobs"] = torch.full((batch_size, seq_len), -1.0, device=device)
+    data["prev_logprobs"] = torch.full((batch_size, seq_len), -1.0, device=device)
+    # Sample 1 holds a corrupted token, as masked by seq_logprob_error_threshold.
+    data["prev_logprobs"][1, 2] = -700.0
+    data["sample_mask"] = torch.tensor([1, 0], device=device)
+
+    cfg = deepcopy(basic_pg_loss_test_config)
+    cfg["use_importance_sampling_correction"] = True
+    cfg["sequence_level_importance_ratios"] = sequence_level_importance_ratios
+    cfg["token_level_loss"] = not sequence_level_importance_ratios
+    loss_fn = ClippedPGLossFn(cfg)
+    logits = torch.randn(
+        batch_size, seq_len, vocab_size, device=device, requires_grad=True
+    )
+    loss_input, data = prepare_loss_input(logits, data, loss_fn)
+    loss, _ = loss_fn(
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"][:, 1:]
+        ),
+        **loss_input,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(logits.grad).all()
+    # The masked sample contributes no gradient at all.
+    assert torch.count_nonzero(logits.grad[1]) == 0
+
+
 def test_clipped_pg_loss_on_policy_kl_importance_sampling():
     """Tests PPO loss with KL penalty and importance sampling enabled."""
     if not torch.cuda.is_available():

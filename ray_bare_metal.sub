@@ -392,7 +392,32 @@ done
 
 echo "All workers connected!"
 
+# [CUSTOM] Hang watchdog: cancel the job when the driver log shows no new
+# "Step N/" header for STEP_HANG_TIMEOUT_S seconds (0 disables it), so that a
+# run stuck waiting on dead vLLM engines (a GPU ECC error on 2026-10-23) or on
+# NaN generations frees its nodes and the next CHAIN_JOBS job resumes from the
+# latest checkpoint. The default 2 h covers a 128k validation plus one step.
+STEP_HANG_TIMEOUT_S=${STEP_HANG_TIMEOUT_S:-7200}
+step-hang-watchdog() {
+  local driver_log="$LOG_DIR/ray-driver.log" last_step="" step last_change=$SECONDS
+  while true; do
+    sleep 300
+    step=$(grep -aoE '^=+ Step [0-9]+/' "$driver_log" 2>/dev/null | tail -1)
+    if [[ "$step" != "$last_step" ]]; then
+      last_step="$step"
+      last_change=$SECONDS
+    elif (( SECONDS - last_change > STEP_HANG_TIMEOUT_S )); then
+      echo "[WATCHDOG] no new step for $((SECONDS - last_change)) s (last: ${last_step:-none}), cancelling job $SLURM_JOB_ID" | tee "$LOG_DIR/HUNG" >&2
+      scancel "$SLURM_JOB_ID"
+      return
+    fi
+  done
+}
+
 if [[ -n "$COMMAND" ]]; then
+  if (( STEP_HANG_TIMEOUT_S > 0 )); then
+    step-hang-watchdog &
+  fi
   srun --overlap  --ntasks=1 --nodes=1 --mem=0 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "$COMMAND"
 else
   echo "[INFO]: Ray Cluster is idled"
