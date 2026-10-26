@@ -1190,6 +1190,13 @@ class AsyncTrajectoryCollector:
                     tokenizer=self.tokenizer,
                     task_to_env=self.task_to_env,
                     generation_config=generation_config,
+                    # [CUSTOM] Caps training calls; see run_async_nemo_gym_rollout.
+                    max_output_tokens=self.master_config["grpo"].get(
+                        "train_max_new_tokens"
+                    ),
+                    zero_reward_without_final_answer=self.master_config["grpo"].get(
+                        "zero_reward_without_final_answer", False
+                    ),
                 )
                 final_batch = nemo_gym_result.final_batch
                 rollout_metrics = nemo_gym_result.rollout_metrics

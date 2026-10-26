@@ -166,6 +166,11 @@ class GRPOConfig(TypedDict):
     max_val_samples: int
     # [CUSTOM] Per-call generation cap for NeMo-Gym validation rollouts; None = up to max_model_len.
     val_max_new_tokens: NotRequired[int | None]
+    # [CUSTOM] Same per-call cap for NeMo-Gym training rollouts (sync and async); None = up to max_model_len.
+    train_max_new_tokens: NotRequired[int | None]
+    # [CUSTOM] NeMo-Gym only (train and val): reward 0 when the last model call hit the output
+    # cap or gave no tool call / assistant text; see run_async_nemo_gym_rollout.
+    zero_reward_without_final_answer: NotRequired[bool]
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
@@ -1650,6 +1655,13 @@ def grpo_train(
                             generation_config=generation_config,
                             max_rollout_turns=None,
                             greedy=False,
+                            # [CUSTOM] Caps training calls; see run_async_nemo_gym_rollout.
+                            max_output_tokens=master_config["grpo"].get(
+                                "train_max_new_tokens"
+                            ),
+                            zero_reward_without_final_answer=master_config["grpo"].get(
+                                "zero_reward_without_final_answer", False
+                            ),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -2425,6 +2437,9 @@ def validate(
                     greedy=False,
                     # [CUSTOM] Caps validation calls only; see run_async_nemo_gym_rollout.
                     max_output_tokens=master_config["grpo"].get("val_max_new_tokens"),
+                    zero_reward_without_final_answer=master_config["grpo"].get(
+                        "zero_reward_without_final_answer", False
+                    ),
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
