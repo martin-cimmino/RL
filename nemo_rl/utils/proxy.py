@@ -15,7 +15,15 @@ logger = logging.getLogger(__name__)
 # Covers every cluster-internal address (all node IPs here are 10.x.x.x), so
 # internal traffic (vLLM policy, Ray, NemoGym) is never accidentally routed
 # through the proxy -- only genuine internet-bound requests are affected.
-_NO_PROXY = "localhost,127.0.0.1,10.0.0.0/8"
+#
+# [CUSTOM-NOPROXY-WILDCARD-HOST 2026-10-24] `0.0.0.0` must be listed explicitly, not just
+# `10.0.0.0/8`: NeMo-Gym's `NemoGym` Ray actor binds its head server to `0.0.0.0` AND
+# reuses that same literal string as the "host" it later polls via
+# `requests.get("http://0.0.0.0:<port>")` to check readiness. Without this entry
+# `requests`'s proxy-bypass check routes that poll through the proxy, which cannot 
+# forward to `0.0.0.0`, causing an infinite `connection_error` loop at job startup
+# ("Head server is not up yet ... Sleeping...").
+_NO_PROXY = "localhost,127.0.0.1,10.0.0.0/8,0.0.0.0"
 
 
 class ProxyConfig(TypedDict):
