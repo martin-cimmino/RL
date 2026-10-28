@@ -1814,7 +1814,11 @@ def _create_advantage_estimator(master_config: MasterConfig):
         print("  ✓ Using GRPO advantage estimator")
     elif adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
-        adv_estimator = OPDAdvantageEstimator({"name": "opd"}, loss_config)
+        adv_estimator = OPDAdvantageEstimator(
+            {"name": "opd"},
+            loss_config,
+            opd_config=master_config.on_policy_distillation,
+        )
         print("  ✓ Using OPD advantage estimator")
         # Warn if loss_fn is not configured per MOPD paper recommendations.
         if not loss_config.disable_ppo_ratio:
@@ -3929,6 +3933,7 @@ def async_grpo_train(
                         prev_logprobs=train_data["prev_logprobs"],
                         generation_logprobs=train_data["generation_logprobs"],
                         sample_mask=train_data["sample_mask"],
+                        token_mask=token_mask,
                     )
                     if (
                         hasattr(adv_estimator, "last_metrics")
@@ -4214,6 +4219,8 @@ def async_grpo_train(
             log_data = {}
             if "agent_ref" in repeated_batch:
                 log_data["agent_ref"] = repeated_batch["agent_ref"]
+            if "truncated" in repeated_batch:  # [CUSTOM] for scripts/mopd_metrics.py
+                log_data["truncated"] = repeated_batch["truncated"].tolist()
             log_data["content"] = flat_messages_content
             log_data["rewards"] = rewards.tolist()
             if master_config.grpo["use_dynamic_sampling"]:
