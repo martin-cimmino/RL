@@ -38,7 +38,9 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.reward_functions import (
+    DegenerationPenaltyConfig,
     RewardShapingConfig,
+    apply_degeneration_penalty,
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
@@ -180,6 +182,8 @@ class GRPOConfig(TypedDict):
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: NotRequired[float]
     reward_shaping: RewardShapingConfig
+    # [CUSTOM] Reward cap for word-salad responses, applied after reward_shaping.
+    degeneration_penalty: NotRequired[DegenerationPenaltyConfig]
     reward_scaling: RewardScalingConfig
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: NotRequired[bool]
@@ -1714,6 +1718,11 @@ def grpo_train(
                 if master_config["grpo"]["reward_shaping"]["enabled"]:
                     repeated_batch = apply_reward_shaping(
                         repeated_batch, master_config["grpo"]["reward_shaping"]
+                    )
+                degeneration_cfg = master_config["grpo"].get("degeneration_penalty")
+                if degeneration_cfg and degeneration_cfg["enabled"]:
+                    repeated_batch = apply_degeneration_penalty(
+                        repeated_batch, degeneration_cfg
                     )
 
                 # Calculate rewards & advantages

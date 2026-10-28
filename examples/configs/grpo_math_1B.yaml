@@ -23,6 +23,15 @@ grpo:
     overlong_buffer_penalty: 1
     max_response_length: ${policy.max_total_sequence_length}
     stop_properly_penalty_coef: null
+  # [CUSTOM] Cap the reward of word-salad responses: flagged when a window of
+  # window_tokens generated tokens holds >= min_low_logprob_tokens tokens with
+  # generation logprob < logprob_threshold.
+  degeneration_penalty:
+    enabled: false
+    logprob_threshold: -10.0
+    window_tokens: 2000
+    min_low_logprob_tokens: 50
+    penalty_reward: -1.0
 
   # Advantage Estimator Configuration
   # Options: "grpo" (default) or "reinforce_plus_plus"
