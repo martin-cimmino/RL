@@ -172,6 +172,10 @@ class GRPOConfig(TypedDict):
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
     overlong_filtering: NotRequired[bool]
+    # [CUSTOM] When true (and overlong_filtering is false), each truncated sample
+    # trains with the loss weight of one typical finished sample instead of its
+    # own, much larger, token count (see apply_overlong_length_normalization).
+    overlong_length_normalization: NotRequired[bool]
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool
@@ -1001,6 +1005,59 @@ def apply_overlong_filtering(
 
     loss_multiplier[truncated] = 0
     repeated_batch["loss_multiplier"] = loss_multiplier
+    return repeated_batch
+
+
+def apply_overlong_length_normalization(
+    repeated_batch: BatchedDataDict[DatumSpec],
+) -> BatchedDataDict[DatumSpec]:
+    """[CUSTOM] Scale truncated samples' loss weight down to one typical sample.
+
+    With token-level loss a sample's weight in the update is its token count. A
+    truncated sample sits at the length cap, often several times longer than the
+    rest, and its negative advantage can then dominate the step (the 2026-10-28
+    code-teacher run collapsed this way with overlong filtering off). Each
+    truncated sample's loss_multiplier is scaled by min(1, L_ref / L), where L is
+    its response length and L_ref the mean response length of the batch's
+    finished samples (of all samples if none finished). The token normalizer is
+    sum(token_mask * sample_mask), so a scaled sample counts as L_ref tokens.
+    Like overlong filtering, truncated samples keep their reward and their place
+    in the group baseline.
+
+    Args:
+        repeated_batch: Rollout batch with "loss_multiplier", "truncated" and
+            "message_log".
+
+    Returns:
+        The same batch with "loss_multiplier" replaced by the scaled copy.
+    """
+    loss_multiplier = repeated_batch["loss_multiplier"].clone().float()
+    truncated = repeated_batch["truncated"]
+    if isinstance(truncated, list):
+        truncated = torch.tensor(truncated, dtype=torch.bool)
+    truncated = truncated.to(loss_multiplier.device)
+    if not truncated.any():
+        return repeated_batch
+
+    lengths = torch.tensor(
+        [
+            sum(len(m["token_ids"]) for m in log if m["role"] == "assistant")
+            for log in repeated_batch["message_log"]
+        ],
+        dtype=torch.float32,
+        device=loss_multiplier.device,
+    )
+    reference = lengths[~truncated] if (~truncated).any() else lengths
+    ref_len = reference.mean()
+    scale = torch.clamp(ref_len / lengths.clamp(min=1), max=1.0)
+    loss_multiplier[truncated] = loss_multiplier[truncated] * scale[truncated]
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    print(
+        f"  📏 Overlong length normalization: {int(truncated.sum())} truncated samples, "
+        f"reference length {ref_len.item():.0f} tokens, mean loss weight "
+        f"{scale[truncated].mean().item():.3f}",
+        flush=True,
+    )
     return repeated_batch
 
 
@@ -1854,6 +1911,10 @@ def grpo_train(
                 with timer.time("data_processing"):
                     if master_config["grpo"]["overlong_filtering"]:
                         repeated_batch = apply_overlong_filtering(repeated_batch)
+                    elif master_config["grpo"].get("overlong_length_normalization"):
+                        repeated_batch = apply_overlong_length_normalization(
+                            repeated_batch
+                        )
                     # Add loss mask to each message in LLMMessageLogType
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
@@ -3252,6 +3313,10 @@ def async_grpo_train(
                 with timer.time("data_processing"):
                     if master_config["grpo"]["overlong_filtering"]:
                         repeated_batch = apply_overlong_filtering(repeated_batch)
+                    elif master_config["grpo"].get("overlong_length_normalization"):
+                        repeated_batch = apply_overlong_length_normalization(
+                            repeated_batch
+                        )
                     # Add loss mask to each message
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):

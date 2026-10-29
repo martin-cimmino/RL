@@ -11,6 +11,9 @@ grpo:
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
+  # [CUSTOM] With overlong_filtering false: scale each truncated sample's loss
+  # weight to that of one mean-length finished sample (min(1, L_ref / L)).
+  overlong_length_normalization: false
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
