@@ -988,6 +988,14 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         # param_iterator will return (name, tensor), we only need tensor
         dtensor_post_iter_func = lambda x: x[1]
 
+        # [CUSTOM-REFIT-ALLOCATOR-RELEASE] packed_broadcast_producer allocates via raw NCCL
+        # cudaMalloc, outside PyTorch's caching allocator -- blocks the allocator is holding but
+        # not using can starve that call on memory-tight configs. Ports the fix idea from
+        # upstream commit daf32a3ca ("refit: release cached allocator blocks between bulk
+        # reshard and misc broadcast"), adapted to our single-call structure (our checkout
+        # predates that commit's bulk/misc broadcast split).
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
         packed_broadcast_producer(
             iterator=dtensor_params_generator(self.model, self.dtype),
             group=self.model_update_group,
