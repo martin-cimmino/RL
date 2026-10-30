@@ -303,10 +303,19 @@ class AsyncTrajectoryCollector:
 
         # Limit in-flight generator requests to num_prompts_per_step * max_trajectory_age_steps
         # This value limits the parallelism of the generation requests.
-        max_inflight = (
-            int(self.master_config["grpo"]["num_prompts_per_step"])
-            * int(self.master_config["grpo"]["async_grpo"]["max_trajectory_age_steps"])
-        ) or 1
+        #
+        # [CUSTOM-ASYNC-BURST-CAP 2026-10-12] Add a custom config flag for this value, 
+        # otherwise fall back to previous default.
+        max_concurrent_generations = self.master_config["grpo"]["async_grpo"].get(
+            "max_concurrent_generations"
+        )
+        if max_concurrent_generations is not None:
+            max_inflight = int(max_concurrent_generations)
+        else:
+            max_inflight = (
+                int(self.master_config["grpo"]["num_prompts_per_step"])
+                * int(self.master_config["grpo"]["async_grpo"]["max_trajectory_age_steps"])
+            ) or 1
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
         # Simple lock to prevent race conditions when checking/spawning workers
