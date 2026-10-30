@@ -712,6 +712,44 @@ def test_apply_overlong_filtering_keeps_truncated_loops_with_a_token_budget():
     assert filtered["loss_multiplier"].tolist() == [0.25, 0.0, 1.0, 0.0]
 
 
+def test_apply_overlong_filtering_keeps_truncated_word_salad():
+    varied = list(range(8000))
+
+    def log(mean_logprob):
+        messages = _assistant_log(varied)
+        messages[1]["generation_logprobs"] = torch.full((8000,), mean_logprob)
+        return messages
+
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([1.0, 1.0, 1.0]),
+            "truncated": torch.tensor([True, True, True]),
+            # Salad, coherent long reasoning, and no logprobs recorded.
+            "message_log": [log(-9.0), log(-0.3), _assistant_log(varied)],
+        }
+    )
+    cfg = {"enabled": True, "token_budget": 2000, "max_mean_logprob": -3.0}
+
+    filtered = apply_overlong_filtering(repeated_batch, cfg)
+
+    assert filtered["loss_multiplier"].tolist() == [0.25, 0.0, 0.0]
+
+
+def test_apply_overlong_filtering_keep_all_truncated():
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([1.0, 1.0]),
+            "truncated": torch.tensor([True, False]),
+            "message_log": [_assistant_log(list(range(8000)))] * 2,
+        }
+    )
+    cfg = {"enabled": True, "token_budget": 2000, "keep_all_truncated": True}
+
+    filtered = apply_overlong_filtering(repeated_batch, cfg)
+
+    assert filtered["loss_multiplier"].tolist() == [0.25, 1.0]
+
+
 def test_apply_overlong_filtering_disabled_repetition_filters_all():
     repeated_batch = BatchedDataDict(
         {

@@ -136,19 +136,27 @@ class OverlongRepetitionConfig(TypedDict):
     """[CUSTOM] Which truncated rollouts overlong filtering keeps in the loss.
 
     Attributes:
-        enabled: Keep looping truncated rollouts in the loss.
+        enabled: Keep degenerate (looping or word-salad) truncated rollouts in the loss.
         ngram: n of the distinct n-gram ratio.
-        window: Number of last generated tokens the ratio is measured on.
+        window: Number of last generated tokens both checks are measured on.
         max_distinct_ratio: A truncated rollout whose ratio is below this is a loop.
-        token_budget: A kept loop weighs as much as this many tokens (loss multiplier
-            token_budget / generated tokens), so one 32k-token loop cannot dominate a
-            token-level loss.
+        max_mean_logprob: A truncated rollout whose mean generation logprob is below
+            this is word salad (near-uniform sampling; coherent text sits above -1).
+            Omit it to keep loops only.
+        keep_all_truncated: Keep every truncated rollout, degenerate or not. Penalizing
+            only detected loops and salad let the degeneration drift just past each
+            detector (arms C5, C6), while nearly every truncated rollout was degenerate.
+        token_budget: A kept rollout weighs as much as this many tokens (loss
+            multiplier token_budget / generated tokens), so one 32k-token rollout
+            cannot dominate a token-level loss.
     """
 
     enabled: bool
     ngram: NotRequired[int]
     window: NotRequired[int]
     max_distinct_ratio: NotRequired[float]
+    max_mean_logprob: NotRequired[float]
+    keep_all_truncated: NotRequired[bool]
     token_budget: NotRequired[int]
 
 
@@ -976,6 +984,20 @@ def distinct_ngram_ratio(token_ids: list[int], ngram: int, window: int) -> float
     return len(set(grams)) / len(grams)
 
 
+def tail_mean_logprob(assistant_messages: list[dict], window: int) -> float:
+    """Mean generation logprob of the last `window` generated tokens (0.0 if unrecorded)."""
+    logprobs = torch.cat(
+        [
+            m.get(
+                "generation_logprobs",
+                torch.zeros_like(m["token_ids"], dtype=torch.float32),
+            ).float()
+            for m in assistant_messages
+        ]
+    )
+    return logprobs[-window:].mean().item()
+
+
 def apply_overlong_filtering(
     repeated_batch: BatchedDataDict[DatumSpec],
     repetition_cfg: Optional[OverlongRepetitionConfig] = None,
@@ -986,10 +1008,11 @@ def apply_overlong_filtering(
     only excluded from the policy-gradient loss.
 
     [CUSTOM] With `repetition_cfg` enabled, a truncated sample whose generation ends
-    in a repetition loop is kept in the loss with multiplier
+    in a repetition loop, or in word salad, is kept in the loss with multiplier
     min(1, token_budget / generated tokens). Filtering every truncated sample means
-    that loops were never penalized, and they can grow on
-    out-of-domain prompts.
+    that degenerate endings were never penalized, and they can grow on
+    out-of-domain prompts. Penalizing loops alone turned them into word salad
+    (arm C5, steps 55+), which the n-gram ratio scores as perfectly diverse.
 
     Args:
         repeated_batch: Rollout batch with "loss_multiplier" and "truncated"
@@ -1010,19 +1033,33 @@ def apply_overlong_filtering(
         ngram = repetition_cfg.get("ngram", 4)
         window = repetition_cfg.get("window", 2048)
         max_ratio = repetition_cfg.get("max_distinct_ratio", 0.4)
+        max_logprob = repetition_cfg.get("max_mean_logprob")
         budget = repetition_cfg.get("token_budget", 4096)
+        keep_all = repetition_cfg.get("keep_all_truncated", False)
+        loops = salads = others = 0
         for i in torch.nonzero(truncated).flatten().tolist():
-            generated = [
-                t
-                for m in repeated_batch["message_log"][i]
-                if m["role"] == "assistant"
-                for t in m["token_ids"].tolist()
+            assistant = [
+                m for m in repeated_batch["message_log"][i] if m["role"] == "assistant"
             ]
-            if generated and distinct_ngram_ratio(generated, ngram, window) < max_ratio:
-                keep[i] = min(1.0, budget / len(generated))
+            generated = [t for m in assistant for t in m["token_ids"].tolist()]
+            if not generated:
+                continue
+            if distinct_ngram_ratio(generated, ngram, window) < max_ratio:
+                loops += 1
+            elif (
+                max_logprob is not None
+                and tail_mean_logprob(assistant, window) < max_logprob
+            ):
+                salads += 1
+            elif keep_all:
+                others += 1
+            else:
+                continue
+            keep[i] = min(1.0, budget / len(generated))
         print(
             f"  overlong filtering: {int(truncated.sum())} truncated, "
-            f"{int((keep > 0).sum())} repetition loops kept in the loss",
+            f"{loops} repetition loops, {salads} word-salad and {others} other kept "
+            "in the loss",
             flush=True,
         )
 
