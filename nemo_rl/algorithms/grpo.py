@@ -3339,14 +3339,8 @@ def async_grpo_train(
 
                 print(f"Got trajectory batch (size: {repeated_batch.size})")
 
-                # [CUSTOM] Same reward shaping as grpo_train: it was never applied here,
-                # so reward_shaping.enabled was a silent no-op in async runs. Dynamic
-                # sampling already ran on the unshaped rewards in the collector.
-                if master_config["grpo"]["reward_shaping"]["enabled"]:
-                    repeated_batch = apply_reward_shaping(
-                        repeated_batch, master_config["grpo"]["reward_shaping"]
-                    )
-
+                # Reward scaling and shaping were already applied by the trajectory
+                # collector, before dynamic sampling (see async_utils.py).
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
                     # Extract the real prompt identity for advantage estimation.
