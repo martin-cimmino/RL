@@ -13,6 +13,7 @@
 # limitations under the License.
 import gc
 import os
+import re
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -136,6 +137,55 @@ class AdvEstimatorConfig(TypedDict):
     minus_baseline: NotRequired[bool]
 
 
+class OverlongRepetitionConfig(TypedDict):
+    """[CUSTOM] Which truncated rollouts overlong filtering keeps in the loss.
+
+    Attributes:
+        enabled: Keep degenerate (looping or word-salad) truncated rollouts in the loss.
+        ngram: n of the distinct n-gram ratio.
+        window: Number of last generated tokens both checks are measured on.
+        max_distinct_ratio: A truncated rollout whose ratio is below this is a loop.
+        max_mean_logprob: A truncated rollout whose mean generation logprob is below
+            this is word salad (near-uniform sampling; coherent text sits above -1).
+            Omit it to keep loops only.
+        keep_all_truncated: Keep every truncated rollout, degenerate or not. Penalizing
+            only detected loops and salad let the degeneration drift just past each
+            detector (arms C5, C6), while nearly every truncated rollout was degenerate.
+        token_budget: A kept rollout weighs as much as this many tokens (loss
+            multiplier token_budget / generated tokens), so one 32k-token rollout
+            cannot dominate a token-level loss.
+    """
+
+    enabled: bool
+    ngram: NotRequired[int]
+    window: NotRequired[int]
+    max_distinct_ratio: NotRequired[float]
+    max_mean_logprob: NotRequired[float]
+    keep_all_truncated: NotRequired[bool]
+    token_budget: NotRequired[int]
+
+
+class TailTokenMaskConfig(TypedDict):
+    """[CUSTOM] Policy-gradient mask for far-tail sampled tokens with positive advantage.
+
+    Attributes:
+        enabled: Zero the advantage of the masked tokens. Only the policy-gradient term
+            loses them: the KL penalty and the loss normalization still count them.
+        max_logprob: A token vLLM sampled with logprob below this is in the far tail.
+            In the v4mix overlong-filtering run, -9 caught ~80% of the
+            punctuation-glued foreign words at steps 150-200 and 0.12% of all loss
+            tokens.
+        protect_math_tokens: Never mask vocabulary tokens that contain a digit, a
+            backslash, a math operator or a Greek letter (rare but correct notation).
+        num_examples: Masked tokens printed per step, with their context.
+    """
+
+    enabled: bool
+    max_logprob: NotRequired[float]
+    protect_math_tokens: NotRequired[bool]
+    num_examples: NotRequired[int]
+
+
 class GRPOConfig(TypedDict):
     num_prompts_per_step: int
     num_generations_per_prompt: int
@@ -162,6 +212,12 @@ class GRPOConfig(TypedDict):
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
     overlong_filtering: NotRequired[bool]
+    # [CUSTOM] Truncated rollouts that end in a repetition loop stay in the loss (at reward 0)
+    # instead of being filtered, so loops are pushed down; see apply_overlong_filtering.
+    overlong_repetition: NotRequired["OverlongRepetitionConfig"]
+    # [CUSTOM] Far-tail sampled tokens with positive advantage get no policy-gradient
+    # push; see apply_tail_token_mask.
+    tail_token_mask: NotRequired["TailTokenMaskConfig"]
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool
@@ -327,7 +383,28 @@ def setup(
             dataloader_state_dict = torch.load(
                 os.path.join(last_checkpoint_path, f"train_dataloader{suffix}.pt")
             )
+            # [CUSTOM] Async GRPO saves the collector's wrapped state
+            # ({"current_epoch", "dataloader_state"}, see
+            # AsyncTrajectoryCollector.get_dataloader_state). Loading the wrapper
+            # as-is left the real state one level down, so the collector found
+            # no "_snapshot", discarded it and every resume replayed the data
+            # from the start of the shuffle order.
+            if isinstance(dataloader_state_dict, dict) and "dataloader_state" in (
+                dataloader_state_dict
+            ):
+                dataloader_state_dict = dataloader_state_dict["dataloader_state"]
             dataloader.load_state_dict(dataloader_state_dict)
+            snapshot = (
+                dataloader_state_dict.get("_snapshot", {})
+                if isinstance(dataloader_state_dict, dict)
+                else {}
+            )
+            yielded = (
+                snapshot.get("_main_snapshot", {})
+                .get("_sampler_iter_state", {})
+                .get("samples_yielded")
+            )
+            print(f"  ✓ Restored train dataloader state (samples_yielded={yielded})")
         return dataloader
 
     if data_config["use_multiple_dataloader"]:
@@ -948,16 +1025,49 @@ def dynamic_sampling(
     return batch_to_return, is_batch_complete, batch_cache, dynamic_sampling_metrics
 
 
+def distinct_ngram_ratio(token_ids: list[int], ngram: int, window: int) -> float:
+    """Share of distinct n-grams among the last `window` tokens (1.0 when too short)."""
+    tail = token_ids[-window:]
+    if len(tail) <= ngram:
+        return 1.0
+    grams = [tuple(tail[i : i + ngram]) for i in range(len(tail) - ngram + 1)]
+    return len(set(grams)) / len(grams)
+
+
+def tail_mean_logprob(assistant_messages: list[dict], window: int) -> float:
+    """Mean generation logprob of the last `window` generated tokens (0.0 if unrecorded)."""
+    logprobs = torch.cat(
+        [
+            m.get(
+                "generation_logprobs",
+                torch.zeros_like(m["token_ids"], dtype=torch.float32),
+            ).float()
+            for m in assistant_messages
+        ]
+    )
+    return logprobs[-window:].mean().item()
+
+
 def apply_overlong_filtering(
     repeated_batch: BatchedDataDict[DatumSpec],
+    repetition_cfg: Optional[OverlongRepetitionConfig] = None,
 ) -> BatchedDataDict[DatumSpec]:
     """Zero the loss multiplier of truncated samples (DAPO overlong filtering).
 
     Truncated samples still count toward their group's reward baseline; they are
     only excluded from the policy-gradient loss.
 
+    [CUSTOM] With `repetition_cfg` enabled, a truncated sample whose generation ends
+    in a repetition loop, or in word salad, is kept in the loss with multiplier
+    min(1, token_budget / generated tokens). Filtering every truncated sample means
+    that degenerate endings were never penalized, and they can grow on
+    out-of-domain prompts. Penalizing loops alone turned them into word salad
+    (arm C5, steps 55+), which the n-gram ratio scores as perfectly diverse.
+
     Args:
-        repeated_batch: Rollout batch with "loss_multiplier" and "truncated".
+        repeated_batch: Rollout batch with "loss_multiplier" and "truncated"
+            (and "message_log" when `repetition_cfg` is enabled).
+        repetition_cfg: Which truncated samples to keep; None filters all of them.
 
     Returns:
         The same batch with "loss_multiplier" replaced by the filtered copy.
@@ -968,9 +1078,154 @@ def apply_overlong_filtering(
     if isinstance(truncated, list):
         truncated = torch.tensor(truncated, dtype=torch.bool)
 
-    loss_multiplier[truncated] = 0
+    keep = torch.zeros_like(loss_multiplier)
+    if repetition_cfg is not None and repetition_cfg["enabled"]:
+        ngram = repetition_cfg.get("ngram", 4)
+        window = repetition_cfg.get("window", 2048)
+        max_ratio = repetition_cfg.get("max_distinct_ratio", 0.4)
+        max_logprob = repetition_cfg.get("max_mean_logprob")
+        budget = repetition_cfg.get("token_budget", 4096)
+        keep_all = repetition_cfg.get("keep_all_truncated", False)
+        loops = salads = others = 0
+        for i in torch.nonzero(truncated).flatten().tolist():
+            assistant = [
+                m for m in repeated_batch["message_log"][i] if m["role"] == "assistant"
+            ]
+            generated = [t for m in assistant for t in m["token_ids"].tolist()]
+            if not generated:
+                continue
+            if distinct_ngram_ratio(generated, ngram, window) < max_ratio:
+                loops += 1
+            elif (
+                max_logprob is not None
+                and tail_mean_logprob(assistant, window) < max_logprob
+            ):
+                salads += 1
+            elif keep_all:
+                others += 1
+            else:
+                continue
+            keep[i] = min(1.0, budget / len(generated))
+        print(
+            f"  overlong filtering: {int(truncated.sum())} truncated, "
+            f"{loops} repetition loops, {salads} word-salad and {others} other kept "
+            "in the loss",
+            flush=True,
+        )
+
+    loss_multiplier[truncated] = loss_multiplier[truncated] * keep[truncated]
     repeated_batch["loss_multiplier"] = loss_multiplier
     return repeated_batch
+
+
+# [CUSTOM] A token whose decoded text contains one of these is never masked by
+# tail_token_mask.protect_math_tokens. Sentence punctuation (. , ; : ! ? ( )) is left
+# out on purpose: the junk to mask is words glued right after it.
+MATH_TOKEN_CHARS = re.compile(
+    r"[0-9\\=+\-*/^_{}\[\]<>|$%≤≥≠≈∑∏∫√π∞≡∈∉⊂⊆∪∩→←↔⇒⇔·×÷°′α-ωΑ-Ω]"
+)
+
+
+def math_token_mask(tokenizer: TokenizerType) -> torch.Tensor:
+    """[CUSTOM] Bool tensor over the tokenizer's ids: True for tokens that decode to math."""
+    pieces = tokenizer.batch_decode([[i] for i in range(len(tokenizer))])
+    return torch.tensor(
+        [bool(MATH_TOKEN_CHARS.search(piece)) for piece in pieces], dtype=torch.bool
+    )
+
+
+def apply_tail_token_mask(
+    train_data: BatchedDataDict,
+    cfg: TailTokenMaskConfig,
+    protected: Optional[torch.Tensor] = None,
+    tokenizer: Optional[TokenizerType] = None,
+) -> dict[str, float]:
+    """[CUSTOM] Zero the advantage of far-tail sampled tokens that would be pushed up.
+
+    A token vLLM sampled with a very low logprob, in a rollout with positive advantage,
+    gets its probability raised by the policy gradient while its importance weight
+    stays ~1, so TIS/icepop never see it. In the overlong-filtering runs this is how
+    punctuation-glued foreign words grew (first occurrence at logprob ~-12), until
+    in-context copies turned them into repetition loops. Setting their advantage to 0
+    keeps them under the KL penalty.
+
+    Args:
+        train_data: Training batch with token-aligned [B, S] "advantages",
+            "generation_logprobs", "input_ids", "token_mask" and the [B]
+            "sample_mask"; "advantages" is replaced by the masked copy.
+        cfg: Mask configuration.
+        protected: Bool tensor over token ids that are never masked (see
+            math_token_mask); None protects nothing.
+        tokenizer: Decodes the printed examples; None prints none.
+
+    Returns:
+        Step metrics: masked share of all loss tokens and of the positive-advantage
+        ones, and the far-tail tokens left unmasked because they are protected.
+    """
+    advantages = train_data["advantages"]
+    device = advantages.device
+    loss_tokens = train_data["token_mask"].to(device).bool() & (
+        train_data["sample_mask"].to(device).unsqueeze(-1) > 0
+    )
+    positive = loss_tokens & (advantages > 0)
+    generation_logprobs = train_data["generation_logprobs"].to(device)
+    tail = positive & (generation_logprobs < cfg.get("max_logprob", -9.0))
+
+    input_ids = train_data["input_ids"].to(device)
+    is_protected = torch.zeros_like(tail)
+    if protected is not None:
+        protected = protected.to(device)
+        in_vocab = input_ids < protected.numel()
+        is_protected[in_vocab] = protected[input_ids[in_vocab]]
+    masked = tail & ~is_protected
+    train_data["advantages"] = advantages.masked_fill(masked, 0.0)
+
+    num_masked = int(masked.sum())
+    metrics = {
+        "tail_mask/masked_frac": num_masked / max(int(loss_tokens.sum()), 1),
+        "tail_mask/masked_frac_of_positive": num_masked / max(int(positive.sum()), 1),
+        "tail_mask/protected_tokens": float((tail & is_protected).sum()),
+    }
+    print(
+        f"  tail token mask: {num_masked} tokens masked "
+        f"({metrics['tail_mask/masked_frac']:.4%} of loss tokens), "
+        f"{int(metrics['tail_mask/protected_tokens'])} protected",
+        flush=True,
+    )
+    num_examples = cfg.get("num_examples", 5)
+    if tokenizer is not None and num_masked > 0 and num_examples > 0:
+        rows, cols = torch.nonzero(masked, as_tuple=True)
+        picks = torch.linspace(0, num_masked - 1, min(num_examples, num_masked)).long()
+        for k in picks.tolist():
+            b, i = rows[k].item(), cols[k].item()
+            ids = input_ids[b].tolist()
+            before = tokenizer.decode(ids[max(0, i - 12) : i])
+            token = tokenizer.decode(ids[i : i + 1])
+            after = tokenizer.decode(ids[i + 1 : i + 4])
+            print(
+                f"    lp {generation_logprobs[b, i].item():.1f}: "
+                f"{(before + '⟦' + token + '⟧' + after)!r}",
+                flush=True,
+            )
+    return metrics
+
+
+def _setup_tail_token_mask(
+    master_config: MasterConfig, tokenizer: TokenizerType
+) -> tuple[Optional[TailTokenMaskConfig], Optional[torch.Tensor]]:
+    """[CUSTOM] The enabled tail-token mask config (None when off) and its protected ids."""
+    cfg = master_config["grpo"].get("tail_token_mask")
+    if cfg is None or not cfg["enabled"]:
+        return None, None
+    protected = (
+        math_token_mask(tokenizer) if cfg.get("protect_math_tokens", True) else None
+    )
+    if protected is not None:
+        print(
+            f"  tail token mask: {int(protected.sum())} math tokens protected",
+            flush=True,
+        )
+    return cfg, protected
 
 
 def scale_rewards(
@@ -1471,6 +1726,10 @@ def grpo_train(
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
+    # [CUSTOM] Tail-token mask config (None when off) and its protected token ids.
+    tail_mask_cfg, tail_mask_protected = _setup_tail_token_mask(
+        master_config, tokenizer
+    )
 
     # Run validation at the start if configured
     # TODO: Add validation with kv scales if needed
@@ -1824,7 +2083,10 @@ def grpo_train(
 
                 with timer.time("data_processing"):
                     if master_config["grpo"]["overlong_filtering"]:
-                        repeated_batch = apply_overlong_filtering(repeated_batch)
+                        repeated_batch = apply_overlong_filtering(
+                            repeated_batch,
+                            master_config["grpo"].get("overlong_repetition"),
+                        )
                     # Add loss mask to each message in LLMMessageLogType
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
@@ -1944,6 +2206,12 @@ def grpo_train(
                         advantages=train_data["advantages"],
                     )
                     del baseline_for_log
+
+                    tail_mask_metrics = {}
+                    if tail_mask_cfg is not None:
+                        tail_mask_metrics = apply_tail_token_mask(
+                            train_data, tail_mask_cfg, tail_mask_protected, tokenizer
+                        )
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
@@ -2086,6 +2354,7 @@ def grpo_train(
                 metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
                 metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
                 metrics["masked_correct_pct"] = masked_correct_pct
+                metrics.update(tail_mask_metrics)
 
                 ## Checkpointing
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
@@ -2656,6 +2925,10 @@ def async_grpo_train(
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
+    # [CUSTOM] Tail-token mask config (None when off) and its protected token ids.
+    tail_mask_cfg, tail_mask_protected = _setup_tail_token_mask(
+        master_config, tokenizer
+    )
 
     assert not colocated_inference, (
         "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
@@ -2951,6 +3224,14 @@ def async_grpo_train(
 
                 print(f"Got trajectory batch (size: {repeated_batch.size})")
 
+                # [CUSTOM] Same reward shaping as grpo_train: it was never applied here,
+                # so reward_shaping.enabled was a silent no-op in async runs. Dynamic
+                # sampling already ran on the unshaped rewards in the collector.
+                if master_config["grpo"]["reward_shaping"]["enabled"]:
+                    repeated_batch = apply_reward_shaping(
+                        repeated_batch, master_config["grpo"]["reward_shaping"]
+                    )
+
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
                     # Extract the real prompt identity for advantage estimation.
@@ -3004,7 +3285,10 @@ def async_grpo_train(
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
                     if master_config["grpo"]["overlong_filtering"]:
-                        repeated_batch = apply_overlong_filtering(repeated_batch)
+                        repeated_batch = apply_overlong_filtering(
+                            repeated_batch,
+                            master_config["grpo"].get("overlong_repetition"),
+                        )
                     # Add loss mask to each message
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
@@ -3100,6 +3384,12 @@ def async_grpo_train(
                     print(
                         f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
                     )
+
+                    tail_mask_metrics = {}
+                    if tail_mask_cfg is not None:
+                        tail_mask_metrics = apply_tail_token_mask(
+                            train_data, tail_mask_cfg, tail_mask_protected, tokenizer
+                        )
 
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
@@ -3253,8 +3543,8 @@ def async_grpo_train(
                     metrics["dynamic_sampling_num_gen_batches"] = target_stats.get(
                         "dynamic_sampling_num_gen_batches", 1.0
                     )
-                    metrics["dynamic_sampling_num_discarded_groups"] = (
-                        target_stats.get("dynamic_sampling_num_discarded_groups", 0.0)
+                    metrics["dynamic_sampling_num_discarded_groups"] = target_stats.get(
+                        "dynamic_sampling_num_discarded_groups", 0.0
                     )
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
@@ -3264,6 +3554,7 @@ def async_grpo_train(
                 metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
                 metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
                 metrics["masked_correct_pct"] = masked_correct_pct
+                metrics.update(tail_mask_metrics)
 
                 # Checkpointing (same as sync version)
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
