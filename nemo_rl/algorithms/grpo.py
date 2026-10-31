@@ -14,14 +14,17 @@
 import gc
 import os
 import re
+import sys
 import time
+import unicodedata
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Any, NamedTuple, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
+import regex
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
@@ -166,7 +169,7 @@ class OverlongRepetitionConfig(TypedDict):
 
 
 class TailTokenMaskConfig(TypedDict):
-    """[CUSTOM] Policy-gradient mask for far-tail sampled tokens with positive advantage.
+    r"""[CUSTOM] Policy-gradient mask for far-tail sampled tokens with positive advantage.
 
     Attributes:
         enabled: Zero the advantage of the masked tokens. Only the policy-gradient term
@@ -175,14 +178,17 @@ class TailTokenMaskConfig(TypedDict):
             In the v4mix overlong-filtering run, -9 caught ~80% of the
             punctuation-glued foreign words at steps 150-200 and 0.12% of all loss
             tokens.
-        protect_math_tokens: Never mask vocabulary tokens that contain a digit, a
-            backslash, a math operator or a Greek letter (rare but correct notation).
+        protect_math_tokens: Never mask math (rare but correct notation): tokens that
+            decode to a digit, a backslash, a math symbol or a Greek letter, byte
+            fragments of such characters, and LaTeX command names right after "\".
+        extra_protected_token_ids: Token ids never masked, on top of the math ones.
         num_examples: Masked tokens printed per step, with their context.
     """
 
     enabled: bool
     max_logprob: NotRequired[float]
     protect_math_tokens: NotRequired[bool]
+    extra_protected_token_ids: NotRequired[list[int]]
     num_examples: NotRequired[int]
 
 
@@ -1118,26 +1124,102 @@ def apply_overlong_filtering(
     return repeated_batch
 
 
-# [CUSTOM] A token whose decoded text contains one of these is never masked by
-# tail_token_mask.protect_math_tokens. Sentence punctuation (. , ; : ! ? ( )) is left
-# out on purpose: the junk to mask is words glued right after it.
-MATH_TOKEN_CHARS = re.compile(
-    r"[0-9\\=+\-*/^_{}\[\]<>|$%≤≥≠≈∑∏∫√π∞≡∈∉⊂⊆∪∩→←↔⇒⇔·×÷°′α-ωΑ-Ω]"
+# [CUSTOM] Characters that make a token math for tail_token_mask.protect_math_tokens:
+# digits, ASCII operators and LaTeX characters, ° ′ ·, and the Unicode math symbols
+# (\p{Math}), number forms (² ½), Greek letters, superscripts/subscripts (ⁿ ₘ ⱼ ᵐ ˢ)
+# and the diacritics of notation (x̂, vector arrow). Sentence punctuation
+# (. , ; : ! ? ( )) is left out on purpose: the junk to mask is words glued right
+# after it.
+MATH_CHAR = regex.compile(
+    r"[0-9\\=+\-*/^_{}\[\]<>|$%°′·"
+    r"\p{Math}\p{No}\p{Greek}"
+    r"\p{Block=Superscripts_And_Subscripts}\N{LATIN SUBSCRIPT SMALL LETTER J}"
+    r"\p{Block=Phonetic_Extensions}\p{Block=Spacing_Modifier_Letters}"
+    r"\p{Block=Combining_Diacritical_Marks}"
+    r"\p{Block=Combining_Diacritical_Marks_For_Symbols}]"
 )
 
 
-def math_token_mask(tokenizer: TokenizerType) -> torch.Tensor:
-    """[CUSTOM] Bool tensor over the tokenizer's ids: True for tokens that decode to math."""
-    pieces = tokenizer.batch_decode([[i] for i in range(len(tokenizer))])
-    return torch.tensor(
-        [bool(MATH_TOKEN_CHARS.search(piece)) for piece in pieces], dtype=torch.bool
+def _decodes_to_math(piece: str) -> bool:
+    """[CUSTOM] Whether a token's decoded text counts as math for protect_math_tokens."""
+    math_chars = set(MATH_CHAR.findall(piece))
+    # A word glued to a hyphen, underscore or slash ("-shaped", "_total", "/colors") is
+    # not math, unlike "-1", "_{", "_i" or "*sin".
+    return bool(math_chars) and not (
+        math_chars <= {"-", "_", "/"} and re.search(r"[A-Za-z]{3,}", piece)
     )
+
+
+class MathTokenProtection(NamedTuple):
+    """[CUSTOM] Flags over token ids that tail_token_mask uses to never mask math."""
+
+    # Decodes to math, or is listed in extra_protected_token_ids.
+    math: torch.Tensor
+    # Byte fragment (decodes to U+FFFD on its own) found only in math characters.
+    math_fragment: torch.Tensor
+    # Any byte fragment of a multi-byte character.
+    fragment: torch.Tensor
+    # Ends with a backslash, like the "\" the tokenizer splits off "\frac".
+    backslash: torch.Tensor
+    # Letters only with no leading space: a LaTeX command name when after a backslash.
+    command: torch.Tensor
+
+
+def math_token_protection(
+    tokenizer: TokenizerType, extra_ids: Optional[list[int]] = None
+) -> MathTokenProtection:
+    """[CUSTOM] Math flags over the tokenizer's ids for tail_token_mask.protect_math_tokens.
+
+    Byte-level BPE splits many math characters (≤ ∈ √ ∞ ℝ ...) into fragments that
+    decode to U+FFFD on their own, so they are classified by encoding every assigned
+    non-ASCII character (alone, after a space and after "("): a fragment found only in
+    math characters is a math fragment. Fragments shared with other characters are
+    resolved in context by apply_tail_token_mask.
+    """
+    vocab_size = len(tokenizer)
+    pieces = tokenizer.batch_decode([[i] for i in range(vocab_size)])
+    fragment = torch.tensor(["\ufffd" in p for p in pieces], dtype=torch.bool)
+    math = torch.tensor([_decodes_to_math(p) for p in pieces], dtype=torch.bool)
+    math[[i for i in extra_ids or [] if 0 <= i < vocab_size]] = True
+
+    chars = [
+        c
+        for c in map(chr, range(128, sys.maxunicode + 1))
+        if unicodedata.category(c) not in ("Cn", "Co", "Cs")  # unassigned, private
+    ]
+    char_is_math = [bool(MATH_CHAR.match(c)) for c in chars]
+    in_math = torch.zeros(vocab_size, dtype=torch.bool)
+    in_other = torch.zeros(vocab_size, dtype=torch.bool)
+    for context in ("", " ", "("):
+        encoded = tokenizer([context + c for c in chars], add_special_tokens=False)
+        for is_math, ids in zip(char_is_math, encoded["input_ids"]):
+            (in_math if is_math else in_other)[ids] = True
+    return MathTokenProtection(
+        math=math,
+        math_fragment=fragment & in_math & ~in_other,
+        fragment=fragment,
+        backslash=torch.tensor([p.endswith("\\") for p in pieces], dtype=torch.bool),
+        command=torch.tensor(
+            [bool(re.fullmatch(r"[A-Za-z]+", p)) for p in pieces], dtype=torch.bool
+        ),
+    )
+
+
+def _fragment_is_math(tokenizer: TokenizerType, window: list[int], pos: int) -> bool:
+    """[CUSTOM] Whether the byte fragment window[pos] is part of a math character."""
+    before = tokenizer.decode(window[:pos], clean_up_tokenization_spaces=False)
+    text = tokenizer.decode(window, clean_up_tokenization_spaces=False)
+    # The fragment's character is the first non-ASCII one after the complete text
+    # of the preceding tokens.
+    rest = text[len(before.rstrip("\ufffd")) :]
+    char = next((c for c in rest if not c.isascii()), "\ufffd")
+    return bool(MATH_CHAR.match(char))
 
 
 def apply_tail_token_mask(
     train_data: BatchedDataDict,
     cfg: TailTokenMaskConfig,
-    protected: Optional[torch.Tensor] = None,
+    protection: Optional[MathTokenProtection] = None,
     tokenizer: Optional[TokenizerType] = None,
 ) -> dict[str, float]:
     """[CUSTOM] Zero the advantage of far-tail sampled tokens that would be pushed up.
@@ -1154,9 +1236,10 @@ def apply_tail_token_mask(
             "generation_logprobs", "input_ids", "token_mask" and the [B]
             "sample_mask"; "advantages" is replaced by the masked copy.
         cfg: Mask configuration.
-        protected: Bool tensor over token ids that are never masked (see
-            math_token_mask); None protects nothing.
-        tokenizer: Decodes the printed examples; None prints none.
+        protection: Flags of the token ids that are never masked (see
+            math_token_protection); None protects nothing.
+        tokenizer: Resolves byte fragments shared by math and other characters, and
+            decodes the printed examples; None does neither.
 
     Returns:
         Step metrics: masked share of all loss tokens and of the positive-advantage
@@ -1172,19 +1255,44 @@ def apply_tail_token_mask(
     tail = positive & (generation_logprobs < cfg.get("max_logprob", -9.0))
 
     input_ids = train_data["input_ids"].to(device)
-    is_protected = torch.zeros_like(tail)
-    if protected is not None:
-        protected = protected.to(device)
-        in_vocab = input_ids < protected.numel()
-        is_protected[in_vocab] = protected[input_ids[in_vocab]]
-    masked = tail & ~is_protected
+    rows, cols = torch.nonzero(tail, as_tuple=True)
+    keep = torch.zeros(rows.numel(), dtype=torch.bool, device=device)
+    if protection is not None and rows.numel() > 0:
+        ids = input_ids[rows, cols]
+        prev_ids = input_ids[rows, (cols - 1).clamp(min=0)]
+
+        def flag(table: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+            table = table.to(device)
+            in_vocab = token_ids < table.numel()
+            out = torch.zeros_like(in_vocab)
+            out[in_vocab] = table[token_ids[in_vocab]]
+            return out
+
+        is_fragment = flag(protection.fragment, ids)
+        keep = (
+            flag(protection.math, ids)
+            | flag(protection.math_fragment, ids)
+            # The rest of a character a math fragment started (≈ = math + shared).
+            | (is_fragment & flag(protection.math_fragment, prev_ids))
+            # "\frac" is tokenized as "\" + "frac".
+            | (flag(protection.command, ids) & flag(protection.backslash, prev_ids))
+        )
+        if tokenizer is not None:
+            # Fragments shared with other characters (e.g. " (" + first byte of "√"):
+            # decode the few left in the tail and check the character they form.
+            for k in torch.nonzero(is_fragment & ~keep).flatten().tolist():
+                b, i = rows[k].item(), cols[k].item()
+                window = input_ids[b, max(0, i - 2) : i + 3].tolist()
+                keep[k] = _fragment_is_math(tokenizer, window, min(i, 2))
+    masked = torch.zeros_like(tail)
+    masked[rows[~keep], cols[~keep]] = True
     train_data["advantages"] = advantages.masked_fill(masked, 0.0)
 
     num_masked = int(masked.sum())
     metrics = {
         "tail_mask/masked_frac": num_masked / max(int(loss_tokens.sum()), 1),
         "tail_mask/masked_frac_of_positive": num_masked / max(int(positive.sum()), 1),
-        "tail_mask/protected_tokens": float((tail & is_protected).sum()),
+        "tail_mask/protected_tokens": float(keep.sum()),
     }
     print(
         f"  tail token mask: {num_masked} tokens masked "
@@ -1212,20 +1320,27 @@ def apply_tail_token_mask(
 
 def _setup_tail_token_mask(
     master_config: MasterConfig, tokenizer: TokenizerType
-) -> tuple[Optional[TailTokenMaskConfig], Optional[torch.Tensor]]:
-    """[CUSTOM] The enabled tail-token mask config (None when off) and its protected ids."""
+) -> tuple[Optional[TailTokenMaskConfig], Optional[MathTokenProtection]]:
+    """[CUSTOM] The enabled tail-token mask config (None when off) and its protection."""
     cfg = master_config["grpo"].get("tail_token_mask")
     if cfg is None or not cfg["enabled"]:
         return None, None
-    protected = (
-        math_token_mask(tokenizer) if cfg.get("protect_math_tokens", True) else None
-    )
-    if protected is not None:
+    extra_ids = cfg.get("extra_protected_token_ids", [])
+    if cfg.get("protect_math_tokens", True):
+        protection = math_token_protection(tokenizer, extra_ids)
         print(
-            f"  tail token mask: {int(protected.sum())} math tokens protected",
+            f"  tail token mask: {int(protection.math.sum())} math tokens and "
+            f"{int(protection.math_fragment.sum())} math byte fragments protected",
             flush=True,
         )
-    return cfg, protected
+    elif extra_ids:
+        extra = torch.zeros(len(tokenizer), dtype=torch.bool)
+        extra[[i for i in extra_ids if 0 <= i < len(tokenizer)]] = True
+        none = torch.zeros_like(extra)
+        protection = MathTokenProtection(extra, none, none, none, none)
+    else:
+        protection = None
+    return cfg, protection
 
 
 def scale_rewards(
@@ -1726,8 +1841,8 @@ def grpo_train(
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
-    # [CUSTOM] Tail-token mask config (None when off) and its protected token ids.
-    tail_mask_cfg, tail_mask_protected = _setup_tail_token_mask(
+    # [CUSTOM] Tail-token mask config (None when off) and its math protection.
+    tail_mask_cfg, tail_mask_protection = _setup_tail_token_mask(
         master_config, tokenizer
     )
 
@@ -2210,7 +2325,7 @@ def grpo_train(
                     tail_mask_metrics = {}
                     if tail_mask_cfg is not None:
                         tail_mask_metrics = apply_tail_token_mask(
-                            train_data, tail_mask_cfg, tail_mask_protected, tokenizer
+                            train_data, tail_mask_cfg, tail_mask_protection, tokenizer
                         )
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
@@ -2925,8 +3040,8 @@ def async_grpo_train(
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
-    # [CUSTOM] Tail-token mask config (None when off) and its protected token ids.
-    tail_mask_cfg, tail_mask_protected = _setup_tail_token_mask(
+    # [CUSTOM] Tail-token mask config (None when off) and its math protection.
+    tail_mask_cfg, tail_mask_protection = _setup_tail_token_mask(
         master_config, tokenizer
     )
 
@@ -3388,7 +3503,7 @@ def async_grpo_train(
                     tail_mask_metrics = {}
                     if tail_mask_cfg is not None:
                         tail_mask_metrics = apply_tail_token_mask(
-                            train_data, tail_mask_cfg, tail_mask_protected, tokenizer
+                            train_data, tail_mask_cfg, tail_mask_protection, tokenizer
                         )
 
                 print("▶ Preparing for training...")
