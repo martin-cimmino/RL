@@ -31,7 +31,10 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig, scale_rewards
-from nemo_rl.algorithms.reward_functions import apply_reward_shaping
+from nemo_rl.algorithms.reward_functions import (
+    apply_degeneration_penalty,
+    apply_reward_shaping,
+)
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -1244,6 +1247,11 @@ class AsyncTrajectoryCollector:
             shaping_cfg = grpo_cfg.get("reward_shaping")
             if shaping_cfg and shaping_cfg.get("enabled"):
                 final_batch_cpu = apply_reward_shaping(final_batch_cpu, shaping_cfg)
+            degeneration_cfg = grpo_cfg.get("degeneration_penalty")
+            if degeneration_cfg and degeneration_cfg["enabled"]:
+                final_batch_cpu = apply_degeneration_penalty(
+                    final_batch_cpu, degeneration_cfg
+                )
             rewards = final_batch_cpu["total_reward"]
             with self._slot_cv:
                 slots = self._target_slots.get(target_weight_version)
