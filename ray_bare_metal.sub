@@ -96,9 +96,23 @@ export LD_LIBRARY_PATH="/lib64:${LD_LIBRARY_PATH:-}"
 # A100) using nothing but this plain module load. compat/ has no libnvidia-ml.so at all
 # (confirmed directly), so prepending it ahead of /lib64 above can't reintroduce the NVML
 # mismatch that /lib64 fix exists for.
+#
+# [FIXED 2026-11-02] The above is only true when `module load cuda/13.0` actually RUNS its
+# modulefile -- it's a no-op (exports nothing) when cuda/13.0 is already loaded in the
+# inherited environment, which happens here because launch.sh itself `module load cuda/13.0`s
+# before ever calling sbatch, and module state propagates with the rest of the env. When that
+# happens, LD_LIBRARY_PATH is left as whatever the /lib64 prepend above set it to -- /lib64
+# ahead of compat/, so libcuda.so.1 resolves to the too-old system driver copy instead of the
+# forward-compat shim. Confirmed via a real job's `.err` -x trace: this exact no-op happened,
+# and the driver process itself (not a Ray actor) logged "CUDA initialization: driver too old"
+# as a direct result. head_cmd/worker_cmd below don't hit this because they unconditionally
+# re-prepend compat/ themselves (via CUDA13_COMPAT_DIR_PLACEHOLDER), regardless of whether the
+# module load was a no-op -- do the same here so the explicit re-prepend doesn't depend on
+# module-load idempotency either.
 module load profile/candidate
 module load cuda/13.0
 CUDA13_COMPAT_DIR="$(dirname "$(dirname "$(which nvcc)")")/compat"
+export LD_LIBRARY_PATH="$CUDA13_COMPAT_DIR:${LD_LIBRARY_PATH:-}"
 ########################################################
 # Ports for all nodes
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}

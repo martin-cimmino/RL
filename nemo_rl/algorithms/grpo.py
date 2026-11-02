@@ -1398,6 +1398,31 @@ def dynamic_sampling(
     return batch_to_return, is_batch_complete, batch_cache, dynamic_sampling_metrics
 
 
+def apply_overlong_filtering(
+    repeated_batch: BatchedDataDict[DatumSpec],
+) -> BatchedDataDict[DatumSpec]:
+    """Zero the loss multiplier of truncated samples (DAPO overlong filtering).
+
+    Truncated samples still count toward their group's reward baseline; they are
+    only excluded from the policy-gradient loss.
+
+    Args:
+        repeated_batch: Rollout batch with "loss_multiplier" and "truncated".
+
+    Returns:
+        The same batch with "loss_multiplier" replaced by the filtered copy.
+    """
+    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+    truncated = repeated_batch["truncated"]
+
+    if isinstance(truncated, list):
+        truncated = torch.tensor(truncated, dtype=torch.bool)
+
+    loss_multiplier[truncated] = 0
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    return repeated_batch
+
+
 def scale_rewards(
     repeated_batch: BatchedDataDict[DatumSpec], reward_scaling_cfg: RewardScalingConfig
 ) -> BatchedDataDict[DatumSpec]:
@@ -2596,16 +2621,8 @@ def grpo_train(
                     del std
 
                 with timer.time("data_processing"):
-                    use_overlong_filtering = master_config.grpo["overlong_filtering"]
-                    if use_overlong_filtering:
-                        loss_multiplier = repeated_batch["loss_multiplier"].clone()
-                        truncated = repeated_batch["truncated"]
-
-                        if isinstance(truncated, list):
-                            truncated = torch.tensor(truncated, dtype=torch.bool)
-
-                        loss_multiplier[truncated] = 0
-                        repeated_batch["loss_multiplier"] = loss_multiplier
+                    if master_config.grpo["overlong_filtering"]:
+                        repeated_batch = apply_overlong_filtering(repeated_batch)
                     add_grpo_token_loss_masks_and_generation_logprobs(
                         repeated_batch["message_log"]
                     )
@@ -3913,18 +3930,8 @@ def async_grpo_train(
                 with timer.time("data_processing"):
                     # Apply overlong filtering - mask out truncated sequences from loss computation
                     with timer.time("overlong_filter"):
-                        use_overlong_filtering = master_config.grpo[
-                            "overlong_filtering"
-                        ]
-                        if use_overlong_filtering:
-                            loss_multiplier = repeated_batch["loss_multiplier"].clone()
-                            truncated = repeated_batch["truncated"]
-
-                            if isinstance(truncated, list):
-                                truncated = torch.tensor(truncated, dtype=torch.bool)
-
-                            loss_multiplier[truncated] = 0
-                            repeated_batch["loss_multiplier"] = loss_multiplier
+                        if master_config.grpo["overlong_filtering"]:
+                            repeated_batch = apply_overlong_filtering(repeated_batch)
 
                     # Add loss mask to each message
                     # Only unmask assistant messages that were actually generated (have generation_logprobs),
@@ -4208,6 +4215,24 @@ def async_grpo_train(
                     if response_advantages.numel() > 0
                     else 0.0,
                 }
+                # [CUSTOM] Dynamic sampling diagnostics: reward above only covers groups the
+                # trainer actually received (discarded groups never reach it -- see
+                # trajectory_collector.get_target_stats). filtered_reward is what's trained
+                # on; reward is overwritten with the mean over everything generated for this
+                # target, including discards, when available. Not implemented upstream at all.
+                if master_config.grpo["use_dynamic_sampling"]:
+                    target_stats = ray.get(
+                        trajectory_collector.get_target_stats.remote(weight_version)
+                    )
+                    metrics["filtered_reward"] = metrics["reward"]
+                    if "unfiltered_reward" in target_stats:
+                        metrics["reward"] = target_stats["unfiltered_reward"]
+                    metrics["dynamic_sampling_num_gen_batches"] = target_stats.get(
+                        "dynamic_sampling_num_gen_batches", 1.0
+                    )
+                    metrics["dynamic_sampling_num_discarded_groups"] = target_stats.get(
+                        "dynamic_sampling_num_discarded_groups", 0.0
+                    )
                 if "moe_metrics" in train_results:
                     metrics.update(
                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
@@ -4233,6 +4258,7 @@ def async_grpo_train(
                         "lr",
                         "wd",
                         "reward",
+                        "filtered_reward",
                         "global_valid_seqs",
                         "global_valid_toks",
                         "mean_prompt_length",

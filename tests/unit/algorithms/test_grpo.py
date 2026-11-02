@@ -33,6 +33,7 @@ from nemo_rl.algorithms.grpo import (
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
     aggregate_rollout_metrics,
+    apply_overlong_filtering,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
@@ -723,6 +724,13 @@ class StubAsyncTrajectoryCollector:
         mock.remote = MagicMock(return_value=MagicMock())
         return mock
 
+    @property
+    def get_target_stats(self):
+        """Per-target generation stats - {} like the real collector for an unknown target"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={})  # ray.get is patched to pass dicts through
+        return mock
+
 
 def mock_async_grpo_infrastructure(
     mock_batch, mock_rollout_metrics, seq_logprob_error_result=None
@@ -1275,6 +1283,26 @@ def test_dapo_dynamic_sampling_batch_caching(mock_grpo_components):
     )  # All samples from the single prompt with non-zero std
     assert is_batch_complete == True
     assert batch_cache is not None
+
+
+@pytest.mark.parametrize("truncated_as_list", [False, True])
+def test_apply_overlong_filtering_zeroes_truncated_samples(truncated_as_list):
+    truncated = [False, True, False, True]
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([1.0, 1.0, 0.0, 1.0]),
+            "truncated": truncated
+            if truncated_as_list
+            else torch.tensor(truncated, dtype=torch.bool),
+        }
+    )
+    original_multiplier = repeated_batch["loss_multiplier"]
+
+    filtered = apply_overlong_filtering(repeated_batch)
+
+    assert filtered["loss_multiplier"].tolist() == [1.0, 0.0, 0.0, 0.0]
+    # The caller's tensor is not modified in place.
+    assert original_multiplier.tolist() == [1.0, 1.0, 0.0, 1.0]
 
 
 def test_dapo_dynamic_sampling_disabled(mock_grpo_components):
