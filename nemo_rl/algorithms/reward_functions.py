@@ -134,17 +134,41 @@ def apply_reward_shaping(
         "The number of messages in the batch must match the number of rewards"
     )
 
+    # [CUSTOM-PORTED 2026-11-02] Hand-ported from upstream commit e12d18ba8
+    # "fix(training): exclude prompt history from reward lengths and loss masks"
+    # (NVIDIA-NeMo/RL PR #4487, merged 2026-10-18) -- not yet in our fork's base
+    # (c8d167a73, pre-v0.6.0). Hand-ported rather than cherry-picked: the full PR
+    # also touches ppo.py/sync_rollout_actor.py/decompose_message_log, none of
+    # which exist on our branch (we don't use upstream's PPO path or its data-plane
+    # transfer queue), so a straight cherry-pick produced spurious modify/delete
+    # conflicts on files we never had. Only this function's fix applies to us.
+    #
+    # Original bug: measured only the FIRST "assistant"-role message in
+    # message_log and used its length alone -- correct for upstream's assumed
+    # single-turn layout (message_log == [prompt, response]), silently wrong for
+    # our multi-turn swe_agents/NeMo-Gym rollouts (break on turn 1, ignoring every
+    # later turn, including the one that actually runs long/degenerates).
+    # Fix: sum token_ids across every assistant message that carries
+    # "generation_logprobs" (i.e. was actually generated this rollout, not part
+    # of prompt history) -- confirmed this key is already set by rollouts.py at
+    # generation time and only backfilled with zeros later in grpo.py (after this
+    # function runs), so the presence check correctly separates real generations
+    # from prompt-history turns in our pipeline too, not just upstream's.
+    #
+    # Safe to delete this patch (and this comment) once this fork's RL base moves
+    # past e12d18ba8 -- diff this function against upstream at that point first to
+    # confirm it already matches before removing.
     updated_rewards = torch.zeros_like(rewards)
     for i, message_log in enumerate(batch["message_log"]):
-        # Get the assistant response length (index 1 is the assistant response)
-        message_response_length = None
-        for message in message_log:
-            if message["role"] == "assistant":
-                message_response_length = message["token_ids"].shape[0]
-                break
-        assert message_response_length is not None, (
+        assistant_lengths = [
+            message["token_ids"].shape[0]
+            for message in message_log
+            if message["role"] == "assistant" and "generation_logprobs" in message
+        ]
+        assert assistant_lengths, (
             "Assistant response not found during reward shaping"
         )
+        message_response_length = sum(assistant_lengths)
 
         # Calculate the exceed length and the corresponding reward penalty
         exceed_length = message_response_length - expected_response_length
