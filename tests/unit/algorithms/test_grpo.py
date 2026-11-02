@@ -75,7 +75,9 @@ class StubReplayBuffer:
     def sample(self):
         """Return a mock that returns sample result when .remote() is called"""
 
-        def _sample(num_prompt_groups, current_weight_version, max_age_steps):
+        def _sample(
+            num_prompt_groups, current_weight_version, max_age_steps, flexible=False
+        ):
             # Return proper trajectory structure expected by async GRPO
             trajectories = [
                 {
@@ -87,6 +89,8 @@ class StubReplayBuffer:
             return {
                 "trajectories": trajectories,
                 "avg_trajectory_age": 0.5,
+                "target_weight_versions": [current_weight_version]
+                * num_prompt_groups,
             }
 
         mock = MagicMock()
@@ -156,6 +160,27 @@ class StubAsyncTrajectoryCollector:
         """Per-target generation stats - {} like the real collector for an unknown target"""
         mock = MagicMock()
         mock.remote = MagicMock(return_value={})  # ray.get is patched to pass dicts through
+        return mock
+
+    @property
+    def update_prompt_status(self):
+        """Prompt bookkeeping after a step - {} (no metrics) like the real one without skip_solved_prompts"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={})
+        return mock
+
+    @property
+    def is_finished(self):
+        """Whether the dataloader is used up - never in these tests"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=False)
+        return mock
+
+    @property
+    def release_consumed(self):
+        """Let later targets replace groups taken early (flexible_sampling) - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
         return mock
 
     @property
