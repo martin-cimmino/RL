@@ -60,7 +60,6 @@ from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, VLMMessageLogType
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
-    get_keys_from_message_log,
 )
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
@@ -102,7 +101,6 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
-    print_message_log_samples,
 )
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
@@ -177,6 +175,11 @@ class GRPOConfig(TypedDict):
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     max_val_samples: int | None  # None for NeMo-Gym compatibility
+    # [CUSTOM] Per-call override for validation rollouts' max new tokens (NeMo-Gym path only).
+    # generation_config["max_new_tokens"] is NOT applied on the NeMo-Gym rollout path, so
+    # without this a validation call can run all the way to the engine's max_model_len.
+    # Default: null (no override, validation uses the same bound as training).
+    val_max_new_tokens: NotRequired[int | None]
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
@@ -1026,7 +1029,14 @@ def setup(
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
 
         ## make vllm hf overrides match the training policy
-        vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
+        # [CUSTOM] dict(...) copy: vllm_kwargs["hf_overrides"] is mutated below
+        # (trained_vocab_size) -- without the copy that would silently mutate
+        # policy_config["hf_config_overrides"] itself via the shared dict reference.
+        vllm_kwargs["hf_overrides"] = dict(policy_config.get("hf_config_overrides", {}))
+        if policy_config.get("trained_vocab_size") is not None:
+            vllm_kwargs["hf_overrides"]["trained_vocab_size"] = policy_config[
+                "trained_vocab_size"
+            ]
 
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
@@ -2133,6 +2143,43 @@ def compute_and_apply_seq_logprob_error_masking(
 # ===============================================================================
 
 
+def _add_decoded_rollout_text(log_data: dict[str, Any], tokenizer: Any) -> None:
+    """[CUSTOM] Give NemoGym training dumps readable text.
+
+    Adds ``prompt_text`` and ``generated_text``; leaves ``content`` untouched.
+    No-op when ``content`` already holds text (non-gym runs), so dumps that are
+    already readable don't pay for a second copy of every rollout.
+    """
+    if tokenizer is None or "token_ids" not in log_data:
+        return
+
+    def _is_empty(entry: Any) -> bool:
+        if isinstance(entry, str):
+            return not entry
+        if isinstance(entry, list):
+            return all(_is_empty(e) for e in entry)
+        if isinstance(entry, dict):
+            return not entry.get("content")
+        return entry is None
+
+    content = log_data.get("content") or []
+    if content and not all(_is_empty(c) for c in content):
+        return
+
+    prompts, generations = [], []
+    for ids, mask in zip(log_data["token_ids"], log_data["token_loss_mask"]):
+        gen_ids = [t for t, m in zip(ids, mask) if m]
+        prompt_ids = [t for t, m in zip(ids, mask) if not m]
+        try:
+            prompts.append(tokenizer.decode(prompt_ids, skip_special_tokens=False))
+            generations.append(tokenizer.decode(gen_ids, skip_special_tokens=False))
+        except Exception:  # noqa: BLE001 - a dump must never fail a training step
+            prompts.append("")
+            generations.append("")
+    log_data["prompt_text"] = prompts
+    log_data["generated_text"] = generations
+
+
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -2430,6 +2477,28 @@ def grpo_train(
                 with timer.time("reward_calculation"):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
+
+                    # [CUSTOM] per-step TRAINING rollout logging (decoded text):
+                    #   stdout: num_val_samples_to_print samples; jsonl: complete dump (train/)
+                    #   Bypassed when NRL_ROLLOUT_LOG_MODE=wandb. Never breaks the step.
+                    try:
+                        from nemo_rl.utils.logger import log_rollouts as _log_rollouts
+
+                        _log_rollouts(
+                            repeated_batch["message_log"],
+                            rewards,
+                            tokenizer=tokenizer,
+                            num_print=master_config.logger.get(
+                                "num_val_samples_to_print", 3
+                            ),
+                            step=total_steps + 1,
+                            tag="train",
+                        )
+                    except Exception as _e:
+                        print(
+                            f"  ⚠️  per-step train rollout logging failed: {_e}",
+                            flush=True,
+                        )
 
                     print("▶ Computing advantages...", flush=True)
                     # For DAPO with reward shaping, compute std on the raw
@@ -2993,6 +3062,7 @@ def grpo_train(
                 ].tolist()
                 log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
 
+                _add_decoded_rollout_text(log_data, tokenizer)
                 logger.log_batched_dict_as_jsonl(
                     log_data, f"train_data_step{total_steps + 1}.jsonl"
                 )
@@ -3180,6 +3250,15 @@ def validate(
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
                 generation_config = master_config.policy["generation"]
+                # [CUSTOM] val_max_new_tokens: override max_new_tokens for validation rollouts
+                # only, via a shallow copy so the shared master_config.policy["generation"]
+                # dict (also used by training rollouts) isn't mutated in place.
+                val_max_new_tokens = master_config.grpo.get("val_max_new_tokens")
+                if val_max_new_tokens is not None:
+                    generation_config = {
+                        **generation_config,
+                        "max_new_tokens": val_max_new_tokens,
+                    }
                 nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                     policy_generation=policy_generation,
                     input_batch=val_batch,
@@ -3219,12 +3298,30 @@ def validate(
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
             # Collect message logs for later display
-            to_env = [
-                get_keys_from_message_log(
-                    val_batch["message_log"][i], ["role", "content"]
-                )
-                for i in range(len(val_batch["message_log"]))
-            ]
+            # [CUSTOM] decode gym token_ids -> text inline so all_message_logs holds
+            # only strings (json-safe for stock log_batched_dict_as_jsonl below).
+            to_env = []
+            for _i in range(len(val_batch["message_log"])):
+                _decoded = []
+                for _m in val_batch["message_log"][_i]:
+                    _role = _m.get("role", "") if isinstance(_m, dict) else ""
+                    _content = _m.get("content", "") if isinstance(_m, dict) else ""
+                    if (
+                        not _content
+                        and isinstance(_m, dict)
+                        and "token_ids" in _m
+                        and tokenizer is not None
+                    ):
+                        try:
+                            _tok = _m["token_ids"]
+                            _ids = (
+                                _tok.tolist() if hasattr(_tok, "tolist") else list(_tok)
+                            )
+                            _content = tokenizer.decode(_ids, skip_special_tokens=False)
+                        except Exception:
+                            pass
+                    _decoded.append({"role": _role, "content": _content})
+                to_env.append(_decoded)
 
             all_message_logs.extend(to_env)
 
@@ -3240,6 +3337,17 @@ def validate(
             sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
         )
 
+        # [CUSTOM] See the full_result opt-in in grpo_train/async_grpo_train: same for
+        # validation -- per-agent full_result Tables hold every rollout's whole NeMo-Gym
+        # response, which makes offline wandb dirs huge to sync. The rollouts/ and
+        # val_data_step*.jsonl dumps keep the content.
+        if not _should_log_nemo_gym_responses(master_config):
+            additional_metrics_to_report = {
+                k: v
+                for k, v in additional_metrics_to_report.items()
+                if "full_result" not in k
+            }
+
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
@@ -3248,14 +3356,15 @@ def validate(
 
         # Print sample conversations only once at the end of validation
         try:
-            print_message_log_samples(
+            from nemo_rl.utils.logger import log_rollouts as _log_rollouts
+
+            _log_rollouts(
                 all_message_logs,
                 total_rewards,
-                num_samples=min(
-                    master_config.logger["num_val_samples_to_print"],
-                    len(all_message_logs),
-                ),
+                tokenizer=None,  # already decoded inline
+                num_print=master_config.logger["num_val_samples_to_print"],
                 step=step,
+                tag="val",
             )
         except Exception as e:
             print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
@@ -3779,6 +3888,27 @@ def async_grpo_train(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
                     )
 
+                    # [CUSTOM] per-step TRAINING rollout logging (decoded text): see
+                    # grpo_train's identical block for the full rationale. Never breaks the step.
+                    try:
+                        from nemo_rl.utils.logger import log_rollouts as _log_rollouts
+
+                        _log_rollouts(
+                            repeated_batch["message_log"],
+                            rewards,
+                            tokenizer=tokenizer,
+                            num_print=master_config.logger.get(
+                                "num_val_samples_to_print", 3
+                            ),
+                            step=step + 1,
+                            tag="train",
+                        )
+                    except Exception as _e:
+                        print(
+                            f"  ⚠️  per-step train rollout logging failed: {_e}",
+                            flush=True,
+                        )
+
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
                     # Apply overlong filtering - mask out truncated sequences from loss computation
@@ -4227,6 +4357,7 @@ def async_grpo_train(
             log_data["advantages"] = train_data["advantages"].tolist()
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+            _add_decoded_rollout_text(log_data, tokenizer)
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{step + 1}.jsonl"
             )
