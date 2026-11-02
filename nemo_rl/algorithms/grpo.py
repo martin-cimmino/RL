@@ -136,6 +136,10 @@ class AsyncGRPOConfig(TypedDict):
     # [CUSTOM] Reward every sample of a group must reach for its prompt to be
     # skipped (skip_solved_prompts). Default 1.0.
     solved_reward_threshold: NotRequired[float]
+    # [CUSTOM-ASYNC-BURST-CAP 2026-10-12] Caps AsyncTrajectoryCollector's own in-flight
+    # generation-request semaphore (see async_utils.py's _inflight_sema). Without this, that
+    # semaphore defaults to `num_prompts_per_step * max_trajectory_age_steps`.
+    max_concurrent_generations: NotRequired[int]
 
 
 class AdvEstimatorConfig(TypedDict):

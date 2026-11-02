@@ -40,6 +40,7 @@ class NemoGym(EnvironmentInterface):
         self.head_server_port = _get_free_port_local()
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
+        from nemo_gym.global_config import DEFAULT_HOST_KEY_NAME
         from nemo_gym.rollout_collection import RolloutCollectionHelper
         from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
         from omegaconf import DictConfig
@@ -56,6 +57,15 @@ class NemoGym(EnvironmentInterface):
             "dummy_key"  # No key necessary for training.
         )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
+
+        # [CUSTOM-HOSTRESOLVE-FIX 2026-10-12] Explicitly supply `default_host` using Ray's own
+        # node-IP mechanism instead of relying on nemo_gym's `use_absolute_ip` path, which
+        # calls the stdlib's `socket.gethostbyname(socket.gethostname())` fresh on every job
+        # launch.
+        # This is needed because `use_absolute_ip` intermittently (~35% of launches) resolves
+        # to `127.0.0.1` instead of the node's real routable IP, breaking every rollout in the
+        # job. `use_absolute_ip` must stay `false`/unset in the training YAML for this to take effect.
+        initial_global_config_dict[DEFAULT_HOST_KEY_NAME] = self.node_ip
 
         initial_global_config_dict.setdefault(
             "global_aiohttp_connector_limit_per_host", 16_384
@@ -234,6 +244,22 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 
         if not nemo_rl_message_log:
             input_messages = nemo_gym_result["responses_create_params"]["input"]
+            if not input_messages:
+                # [CUSTOM]
+                # `input_messages` itself can be empty for agentic envs (e.g. swe_agents)
+                # where the actual oversized prompt is built up internally across many
+                # tool-call turns inside one Gym-level turn and never echoed back here on
+                # failure -- tokenizer.apply_chat_template([]) raises an unrelated
+                # IndexError (transformers indexes conversation[0] unconditionally),
+                # masking the actually-useful diagnostic below. Fail loudly with the raw
+                # result instead of crashing on an empty list.
+                raise ValueError(
+                    "NeMo Gym returned a result with no generation data AND no input "
+                    "messages to measure -- likely a total request failure (e.g. a "
+                    "downstream agent/env error) rather than a simple prompt-too-long "
+                    "rejection. Raw nemo_gym_result (truncated): "
+                    f"{str(nemo_gym_result)[:2000]}"
+                )
             prompt_token_ids = tokenizer.apply_chat_template(
                 input_messages, tokenize=True
             )

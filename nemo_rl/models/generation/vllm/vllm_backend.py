@@ -326,6 +326,14 @@ class VllmInternalWorkerExtension:
         load_model_weight_func = lambda x: _load_model_weights(x, self.model_runner)
 
         try:
+            # [CUSTOM-REFIT-ALLOCATOR-RELEASE] packed_broadcast_consumer allocates its receive
+            # buffer via raw NCCL cudaMalloc, outside PyTorch's caching allocator -- blocks the
+            # allocator is holding but not using can starve that call on memory-tight configs.
+            # Ports the fix idea from upstream commit daf32a3ca ("refit: release cached allocator
+            # blocks between bulk reshard and misc broadcast"), adapted to our single-call
+            # structure (our checkout predates that commit's bulk/misc broadcast split).
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
             packed_broadcast_consumer(
                 iterator=iter(self.state_dict_info.items()),
                 group=self.model_update_group,

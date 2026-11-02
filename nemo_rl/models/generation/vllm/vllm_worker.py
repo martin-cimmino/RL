@@ -107,17 +107,20 @@ class BaseVllmGenerationWorker:
             # Need to give each DP group its own vllm cache to address:
             # https://github.com/vllm-project/vllm/issues/18851
             # [CUSTOM] Keep these per-replica caches (~140MB each) off a small home
-            # quota: under NRL_VLLM_CACHE_BASE when set, else suffix the launcher's
-            # VLLM_CACHE_ROOT; upstream's ~/.cache/vllm when neither is set.
+            # quota: under NRL_VLLM_CACHE_BASE when set (domyn-rl's launcher).
+            # [CUSTOM-VLLM-CACHE-ROOT 2026-10-23] Otherwise a subfolder of
+            # VLLM_CACHE_ROOT, upstream's ~/.cache/vllm when it is unset.
             if cache_base := os.environ.get("NRL_VLLM_CACHE_BASE"):
                 env_vars["VLLM_CACHE_ROOT"] = os.path.join(
                     os.path.expanduser(cache_base), f"vllm_{seed}"
                 )
             else:
-                cache_base = os.environ.get(
+                cache_root = os.environ.get(
                     "VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm")
                 )
-                env_vars["VLLM_CACHE_ROOT"] = f"{cache_base}_{seed}"
+                env_vars["VLLM_CACHE_ROOT"] = os.path.join(
+                    cache_root, f"seed_{seed}"
+                )
 
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)
