@@ -1,8 +1,6 @@
-# Custom override of nemo_rl.algorithms.async_utils
-# Adds NemoGym rollout support to AsyncTrajectoryCollector._run_prompt_group_worker
-#
-# This file is mounted over the upstream module via sys.modules patching
-# in custom/script/run_grpo.py.
+# [CUSTOM] Adds dynamic sampling (drop/replace zero-advantage prompt groups, DAPO-style)
+# and overlong filtering to AsyncTrajectoryCollector, neither of which upstream NeMo-RL
+# supports on the async GRPO path (see _reserve_slot/_settle_slot/get_target_stats).
 
 
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
