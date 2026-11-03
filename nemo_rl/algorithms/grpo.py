@@ -4072,6 +4072,27 @@ def async_grpo_train(
                         and adv_estimator.last_metrics
                     ):
                         rollout_metrics.update(adv_estimator.last_metrics)
+
+                    # [CUSTOM-ADDED 2026-11-03] async_grpo_train never computed this on
+                    # its own (unlike grpo_train's baseline_for_log) -- added so
+                    # baseline_reward/pct_0, pct_1, pct_mixed (the zero- vs
+                    # non-zero-advantage group counts) get logged for async GRPO too, not
+                    # just the sync path. Confirmed missing upstream too: as of v0.7.0 and
+                    # current origin/main, async_grpo_train still only logs
+                    # advantages/mean|max|min (whole-batch aggregates), never calls
+                    # _log_mixed_rewards_and_advantages_information -- nothing to port,
+                    # this is net-new. Grouping by prompt_ids_for_adv matches exactly what
+                    # adv_estimator.compute_advantage itself just grouped by, so this is
+                    # the same authoritative grouping used for real training, not a
+                    # reconstructed-after-the-fact guess.
+                    baseline_for_log, _ = calculate_baseline_and_std_per_prompt(
+                        prompt_ids_for_adv,
+                        rewards,
+                        torch.ones_like(rewards),
+                        leave_one_out_baseline=master_config["grpo"][
+                            "use_leave_one_out_baseline"
+                        ],
+                    )
                     del prompt_ids_for_adv
 
                     # Log advantages stats
@@ -4198,7 +4219,25 @@ def async_grpo_train(
                     flat_advantages, flat_token_mask.bool()
                 )
 
+                # [CUSTOM-ADDED 2026-11-03] Logged into a scratch dict, not directly into
+                # `metrics`, because _log_mixed_rewards_and_advantages_information also
+                # sets "advantages/mean"/"advantages/sum" from the *unmasked* advantages
+                # tensor -- spreading it first lets the masked, token-level
+                # "advantages/mean"/"max"/"min" set below win, matching grpo_train's own
+                # final values (same dict-merge pattern grpo_train itself uses at its
+                # second metrics block to let the masked mean override the unmasked one).
+                baseline_metrics: dict[str, Any] = {}
+                _log_mixed_rewards_and_advantages_information(
+                    logger=logger,
+                    total_steps=step,
+                    metrics=baseline_metrics,
+                    baseline=baseline_for_log,
+                    advantages=train_data["advantages"],
+                )
+                del baseline_for_log
+
                 metrics = {
+                    **baseline_metrics,
                     "loss": train_results["loss"].numpy(),
                     "reward": rewards.numpy(),
                     "grad_norm": train_results["grad_norm"].numpy(),

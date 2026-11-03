@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [CUSTOM] Adds dynamic sampling (drop zero-advantage prompt groups and let upstream's own
+# gap-filling retry relaunch a replacement, DAPO-style) to AsyncTrajectoryCollector -- upstream
+# NeMo-RL does not support this on the async GRPO path. See `_process_batch`'s `filterable`
+# computation, `_run_prompt_group_worker`'s discard check, and `get_target_stats` for the
+# mechanism. Confirmed via `git grep` against both the v0.7.0 tag and current origin/main:
+# this feature doesn't exist upstream at all, old or new -- not a temporary gap to wait out.
+
 from __future__ import annotations
 
 import concurrent.futures
