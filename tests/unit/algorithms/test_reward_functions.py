@@ -483,5 +483,8 @@ def test_degeneration_penalty_requires_generation_logprobs():
     batch = create_mock_batch_with_responses(
         num_samples=1, response_lengths=[10], initial_rewards=[1.0]
     )
+    for message_log in batch["message_log"]:
+        for message in message_log:
+            message.pop("generation_logprobs", None)
     with pytest.raises(AssertionError, match="generation_logprobs"):
         apply_degeneration_penalty(batch, _degeneration_cfg())

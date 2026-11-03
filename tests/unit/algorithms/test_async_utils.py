@@ -1452,7 +1452,12 @@ class TestAsyncRewardShaping:
                 "message_log": [
                     [
                         {"role": "user", "token_ids": torch.zeros(5)},
-                        {"role": "assistant", "token_ids": torch.zeros(n)},
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.zeros(n),
+                            # reward shaping counts only generated turns
+                            "generation_logprobs": torch.zeros(n),
+                        },
                     ]
                     for n in response_lengths
                 ],
