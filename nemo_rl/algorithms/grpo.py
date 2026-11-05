@@ -4194,7 +4194,7 @@ def async_grpo_train(
                         prompt_ids_for_adv,
                         rewards,
                         torch.ones_like(rewards),
-                        leave_one_out_baseline=master_config["grpo"][
+                        leave_one_out_baseline=master_config.grpo[
                             "use_leave_one_out_baseline"
                         ],
                     )
