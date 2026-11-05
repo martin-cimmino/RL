@@ -12,18 +12,12 @@ from typing import NotRequired, TypedDict
 
 logger = logging.getLogger(__name__)
 
-# Covers every cluster-internal address (all node IPs here are 10.x.x.x), so
-# internal traffic (vLLM policy, Ray, NemoGym) is never accidentally routed
-# through the proxy -- only genuine internet-bound requests are affected.
-#
-# [CUSTOM-NOPROXY-WILDCARD-HOST 2026-10-24] `0.0.0.0` must be listed explicitly, not just
-# `10.0.0.0/8`: NeMo-Gym's `NemoGym` Ray actor binds its head server to `0.0.0.0` AND
-# reuses that same literal string as the "host" it later polls via
-# `requests.get("http://0.0.0.0:<port>")` to check readiness. Without this entry
-# `requests`'s proxy-bypass check routes that poll through the proxy, which cannot 
-# forward to `0.0.0.0`, causing an infinite `connection_error` loop at job startup
-# ("Head server is not up yet ... Sleeping...").
-_NO_PROXY = "localhost,127.0.0.1,10.0.0.0/8,0.0.0.0"
+# Exempts the full RFC1918 private range plus loopback/::1/0.0.0.0 so cluster-internal
+# traffic (vLLM policy, Ray, NemoGym) is never routed through the proxy -- only genuine
+# internet-bound requests are affected. `0.0.0.0` must be listed explicitly (not just
+# covered by 10.0.0.0/8): NeMo-Gym's head server binds to it and also polls that literal
+# string for its own readiness check, and the proxy can't forward to `0.0.0.0`.
+_NO_PROXY = "localhost,127.0.0.1,::1,0.0.0.0,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 
 
 class ProxyConfig(TypedDict):
