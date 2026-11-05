@@ -166,9 +166,16 @@ the whole batch. With A_t = log π_T − log π_S on the sampled token:
 | `gen_len_mean`, `gen_len_p90`, `trunc_rate`, `n_samples`, `tok_share` | Response length and truncation over all samples, including overlong-filtered ones |
 | `acc`, `k1_tok_correct`, `k1_tok_wrong` | Verifier accuracy (reward ≥ 0.5) and reverse KL split by it |
 | `k1_tok_pos_<bucket>`, `abs_adv_pos_<bucket>` | The same by position in the response: 0-1k, 1k-4k, 4k-16k, 16k-64k, 64k+ tokens |
+| `budget_share` | The teacher's share of Σ\|A\| over loss tokens (= `tok_share` × `abs_adv`, normalised): with a token-mean loss, the share of the update it drives. Short-answer teachers get little even with a large gap |
 
 KL, advantage and entropy metrics use the loss tokens, so overlong-filtered samples are excluded from them. The same
 keys can be recomputed offline from the `train_data_step*.jsonl` dumps with the same function.
+
+The policy loss also logs `train/stale_kl/update_<k>` (DTensor v2 worker; other backends log a plain `stale_kl`
+summed over the step's updates): KL(π_prev ‖ π_current), k3 estimate on the loss tokens, at the k-th optimizer update
+of the step. The OPD advantage is built from `prev_logprobs`, frozen for the whole step, so this is how stale the
+advantage has become by that update. Update 0 should be ≈ 0; growth with k says the step's later updates follow an
+outdated target.
 
 ## References
 

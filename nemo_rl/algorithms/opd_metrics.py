@@ -16,6 +16,8 @@
 Shared by OPDAdvantageEstimator (online, logged every step) and scripts/mopd_metrics.py (offline, from the
 train_data_step*.jsonl dumps), so both report identical keys. With A_t = log pi_T(y_t) - log pi_S(y_t) on the sampled
 token: k1 = -A and k3 = exp(A) - 1 - A are reverse-KL(S||T) estimators; -mean(log pi_gen) estimates student entropy.
+budget_share = the group's share of sum|A| over loss tokens (= tok_share * abs_adv, normalised across teachers): with a
+token-mean loss this is the share of the update each teacher actually drives (Open-MOPD, arXiv:2608.19098, B_d).
 """
 
 import os
@@ -97,6 +99,7 @@ def compute_opd_metrics(
         else None
     )
     n_tok_total = max(len(adv), 1)
+    abs_total = float(adv.abs().sum()) or 1.0
 
     def row_select(names: Sequence[str], value: str) -> torch.Tensor:
         return torch.tensor([n == value for n in names], device=gen_len.device)
@@ -106,7 +109,7 @@ def compute_opd_metrics(
     groups += [(t, row_select(teachers, t)) for t in sorted(set(teachers))]
     for name, sel_rows in groups:
         m = _group_metrics(
-            tok, sel_rows, gen_len, correct, trunc, n_tok_total, full=True
+            tok, sel_rows, gen_len, correct, trunc, n_tok_total, abs_total, full=True
         )
         out.update({f"{PREFIX}/{name}/{k}": v for k, v in m.items()})
     for agent in sorted(set(agents or [])):
@@ -117,6 +120,7 @@ def compute_opd_metrics(
             correct,
             trunc,
             n_tok_total,
+            abs_total,
             full=False,
         )
         out.update({f"{PREFIX}/agent/{agent}/{k}": v for k, v in m.items()})
@@ -124,7 +128,7 @@ def compute_opd_metrics(
 
 
 def _group_metrics(
-    tok, sel_rows, gen_len, correct, trunc, n_tok_total, full: bool
+    tok, sel_rows, gen_len, correct, trunc, n_tok_total, abs_total, full: bool
 ) -> dict[str, float]:
     m = {"n_samples": float(sel_rows.sum()), "gen_len_mean": _mean(gen_len[sel_rows])}
     if trunc is not None:
@@ -152,6 +156,7 @@ def _group_metrics(
         frac_tok_neg=float((adv < NEG_ADV).double().mean()),
         frac_tok_big=float((adv.abs() > BIG_ADV).double().mean()),
         tok_share=len(adv) / n_tok_total,
+        budget_share=float(adv.abs().sum()) / abs_total,
         teacher_xent=float(-tok["teacher_lp"][sel].mean()),
         gen_len_p90=float(torch.quantile(gen_len[sel_rows], 0.9)),
     )

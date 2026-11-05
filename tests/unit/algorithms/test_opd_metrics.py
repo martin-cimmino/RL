@@ -62,6 +62,10 @@ def test_compute_opd_metrics_values():
     assert m[f"{P}/a/frac_tok_neg"] == pytest.approx(1 / 3)
     assert m[f"{P}/a/frac_tok_big"] == 0.0
     assert m[f"{P}/a/tok_share"] == pytest.approx(3 / 5)
+    # sum|A|: teacher a 2.005, teacher b 2.0
+    assert m[f"{P}/a/budget_share"] == pytest.approx(2.005 / 4.005)
+    assert m[f"{P}/b/budget_share"] == pytest.approx(2.0 / 4.005)
+    assert m[f"{P}/all/budget_share"] == pytest.approx(1.0)
     assert m[f"{P}/a/student_nll"] == pytest.approx(0.5)
     assert m[f"{P}/a/teacher_xent"] == pytest.approx(-sum(a_adv) / 3)
     # length / truncation count the filtered sample, KL metrics don't
