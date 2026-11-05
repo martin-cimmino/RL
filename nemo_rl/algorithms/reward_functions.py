@@ -50,6 +50,29 @@ class RewardShapingConfig(TypedDict):
     stop_properly_penalty_coef: NotRequired[float | None]
 
 
+class DegenerationPenaltyConfig(TypedDict):
+    """[CUSTOM] Penalty for responses that degenerate into word salad.
+
+    Word salad shows up as a burst of tokens the generator itself found very
+    unlikely: a response is flagged when some window of `window_tokens`
+    generated tokens holds at least `min_low_logprob_tokens` tokens whose
+    generation logprob is below `logprob_threshold`. Flagged responses get
+    reward min(reward, penalty_reward). Repetition loops (near-zero surprisal)
+    are not detected; they run to the length cap and get the overlong penalty.
+    """
+
+    enabled: bool
+    # Generation logprob below which a sampled token counts as unlikely (e.g. -10).
+    logprob_threshold: float
+    # Sliding-window size in generated tokens (e.g. 2000).
+    window_tokens: int
+    # Unlikely tokens within one window that flag the response (e.g. 50; healthy
+    # code-teacher responses peak at ~15 per 2000 tokens at the 99th percentile).
+    min_low_logprob_tokens: int
+    # Reward a flagged response is capped at (e.g. -1.0).
+    penalty_reward: float
+
+
 def apply_reward_shaping(
     batch: BatchedDataDict, cfg: RewardShapingConfig
 ) -> BatchedDataDict:
@@ -180,4 +203,57 @@ def apply_reward_shaping(
     # Update the rewards in the batch
     batch["total_reward"] = updated_rewards
 
+    return batch
+
+
+def max_low_logprob_tokens_in_window(
+    generation_logprobs: torch.Tensor, logprob_threshold: float, window_tokens: int
+) -> int:
+    """Largest number of tokens below `logprob_threshold` in any window of `window_tokens` tokens."""
+    low = (generation_logprobs.float() < logprob_threshold).to(torch.int64)
+    if low.numel() <= window_tokens:
+        return int(low.sum())
+    csum = torch.cat([low.new_zeros(1), low.cumsum(0)])
+    return int((csum[window_tokens:] - csum[:-window_tokens]).max())
+
+
+def apply_degeneration_penalty(
+    batch: BatchedDataDict, cfg: DegenerationPenaltyConfig
+) -> BatchedDataDict:
+    """[CUSTOM] Cap the reward of word-salad responses at cfg["penalty_reward"].
+
+    Needs the generators' per-token logprobs ("generation_logprobs") on the
+    assistant messages, which both the vLLM and the NeMo-Gym rollouts provide.
+    See DegenerationPenaltyConfig for the detection rule.
+    """
+    if not cfg["enabled"]:
+        return batch
+    rewards = batch["total_reward"]
+    assert len(batch["message_log"]) == len(rewards), (
+        "The number of messages in the batch must match the number of rewards"
+    )
+    flagged = torch.zeros_like(rewards, dtype=torch.bool)
+    for i, message_log in enumerate(batch["message_log"]):
+        logprobs = [
+            m["generation_logprobs"]
+            for m in message_log
+            if m["role"] == "assistant" and "generation_logprobs" in m
+        ]
+        assert logprobs, "Assistant generation_logprobs not found during degeneration check"
+        worst = max_low_logprob_tokens_in_window(
+            torch.cat([torch.as_tensor(lp).flatten() for lp in logprobs]),
+            cfg["logprob_threshold"],
+            cfg["window_tokens"],
+        )
+        flagged[i] = worst >= cfg["min_low_logprob_tokens"]
+    if flagged.any():
+        penalty = torch.full_like(rewards, cfg["penalty_reward"])
+        batch["total_reward"] = torch.where(
+            flagged, torch.minimum(rewards, penalty), rewards
+        )
+        print(
+            f"[INFO] degeneration penalty: {int(flagged.sum())}/{len(rewards)} responses flagged, "
+            f"original rewards {[round(float(r), 3) for r in rewards[flagged]]}",
+            flush=True,
+        )
     return batch

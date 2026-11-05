@@ -387,7 +387,14 @@ class ClippedPGLossFn(LossFunction):
             ratios = log_ratios.exp()  # = exp(0) = 1.0, but depends on curr_logprobs
             ratios_clamped = ratios
         elif not self.disable_ppo_ratio:
-            log_ratios = curr_logprobs - prev_logprobs
+            # [CUSTOM] Zero the log-ratio of masked-out tokens before exp(): a
+            # sequence masked by seq_logprob_error_threshold can hold corrupted
+            # prev_logprobs (~-700 from a faulty GPU, 2026-10-23), whose
+            # ratio overflows to inf; 0 * inf in the masked reduction then
+            # turned the loss, the gradients and the weights into NaN.
+            log_ratios = torch.where(
+                mask.bool(), curr_logprobs - prev_logprobs, 0.0
+            )
             if self.sequence_level_importance_ratios:
                 seq_log_ratio_mean = masked_mean(
                     log_ratios,

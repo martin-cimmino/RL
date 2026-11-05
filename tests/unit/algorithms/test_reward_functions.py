@@ -17,8 +17,11 @@ import torch
 
 from nemo_rl.algorithms.grpo import RewardScalingConfig, scale_rewards
 from nemo_rl.algorithms.reward_functions import (
+    DegenerationPenaltyConfig,
     RewardShapingConfig,
+    apply_degeneration_penalty,
     apply_reward_shaping,
+    max_low_logprob_tokens_in_window,
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -402,3 +405,86 @@ def test_stop_properly_penalty_error_cases():
     config["stop_properly_penalty_coef"] = 1.5
     with pytest.raises(AssertionError, match="stop_properly_penalty_coef must be in"):
         apply_reward_shaping(batch, config)
+
+
+def _degeneration_cfg(**overrides) -> DegenerationPenaltyConfig:
+    cfg = DegenerationPenaltyConfig(
+        enabled=True,
+        logprob_threshold=-10.0,
+        window_tokens=100,
+        min_low_logprob_tokens=20,
+        penalty_reward=-1.0,
+    )
+    cfg.update(overrides)
+    return cfg
+
+
+def _with_generation_logprobs(batch, logprobs_per_sample):
+    for message_log, logprobs in zip(batch["message_log"], logprobs_per_sample):
+        for message in message_log:
+            if message["role"] == "assistant":
+                message["generation_logprobs"] = logprobs
+    return batch
+
+
+def test_max_low_logprob_tokens_in_window():
+    lp = torch.full((1000,), -0.5)
+    lp[500:530] = -12.0  # a dense burst of 30
+    lp[::150] = -11.0  # sparse background: one more inside any 100-token window
+    assert max_low_logprob_tokens_in_window(lp, -10.0, 100) == 31
+    # a sequence shorter than the window counts all of it
+    assert max_low_logprob_tokens_in_window(lp[:50], -10.0, 100) == 1
+
+
+def test_degeneration_penalty_flags_only_dense_bursts():
+    batch = create_mock_batch_with_responses(
+        num_samples=4,
+        response_lengths=[1000, 1000, 1000, 50],
+        initial_rewards=[1.0, 0.0, -1.16, 0.0],
+    )
+    healthy = torch.full((1000,), -0.5)
+    healthy[::97] = -11.0  # background tail sampling, never 20 in a window
+    salad = healthy.clone()
+    salad[600:700] = -12.0
+    truncated_salad = salad.clone()
+    short = torch.full((50,), -0.5)
+    _with_generation_logprobs(batch, [healthy, salad, truncated_salad, short])
+
+    result = apply_degeneration_penalty(batch, _degeneration_cfg())
+
+    # healthy and short keep their rewards; salad drops to -1; a reward already
+    # below the cap (truncated, -1.16) is not raised
+    expected = torch.tensor([1.0, -1.0, -1.16, 0.0])
+    assert torch.allclose(result["total_reward"], expected)
+
+
+def test_degeneration_penalty_caps_a_rewarded_salad_response():
+    batch = create_mock_batch_with_responses(
+        num_samples=1, response_lengths=[300], initial_rewards=[1.0]
+    )
+    lp = torch.full((300,), -0.5)
+    lp[100:150] = -15.0
+    _with_generation_logprobs(batch, [lp])
+    result = apply_degeneration_penalty(batch, _degeneration_cfg(penalty_reward=-0.5))
+    assert torch.allclose(result["total_reward"], torch.tensor([-0.5]))
+
+
+def test_degeneration_penalty_disabled_is_a_no_op():
+    batch = create_mock_batch_with_responses(
+        num_samples=1, response_lengths=[300], initial_rewards=[1.0]
+    )
+    lp = torch.full((300,), -15.0)
+    _with_generation_logprobs(batch, [lp])
+    result = apply_degeneration_penalty(batch, _degeneration_cfg(enabled=False))
+    assert torch.allclose(result["total_reward"], torch.tensor([1.0]))
+
+
+def test_degeneration_penalty_requires_generation_logprobs():
+    batch = create_mock_batch_with_responses(
+        num_samples=1, response_lengths=[10], initial_rewards=[1.0]
+    )
+    for message_log in batch["message_log"]:
+        for message in message_log:
+            message.pop("generation_logprobs", None)
+    with pytest.raises(AssertionError, match="generation_logprobs"):
+        apply_degeneration_penalty(batch, _degeneration_cfg())
