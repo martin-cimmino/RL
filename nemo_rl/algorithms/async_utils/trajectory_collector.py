@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [CUSTOM] Adds dynamic sampling (drop zero-advantage prompt groups and let upstream's own
+# gap-filling retry relaunch a replacement, DAPO-style) to AsyncTrajectoryCollector -- upstream
+# NeMo-RL does not support this on the async GRPO path. See `_process_batch`'s `filterable`
+# computation, `_run_prompt_group_worker`'s discard check, and `get_target_stats` for the
+# mechanism. Confirmed via `git grep` against both the v0.7.0 tag and current origin/main:
+# this feature doesn't exist upstream at all, old or new -- not a temporary gap to wait out.
+
 from __future__ import annotations
 
 import concurrent.futures
@@ -119,6 +126,30 @@ class AsyncTrajectoryCollector:
         self._spawning_targets: set[int] = set()
         self._counter_lock: _threading.Lock = _threading.Lock()
 
+        # [CUSTOM] Dynamic sampling (DAPO-style): drop prompt groups whose rewards are all
+        # equal (zero advantage, no training signal) and relaunch a replacement for the same
+        # target, relying on _get_next_target_for_generation's existing gap-filling (via
+        # ReplayBuffer.get_trajectories_needed) to pick the slack back up automatically. After
+        # dynamic_sampling_max_gen_batches * num_prompts_per_step launches for one target,
+        # groups are accepted unfiltered so training cannot stall. Not implemented upstream at
+        # all (checked v0.7.0 and current upstream main as of 2026-11-02) -- not a stopgap.
+        grpo_cfg = self.master_config.grpo
+        self._use_dynamic_sampling = bool(grpo_cfg.get("use_dynamic_sampling", False))
+        num_prompts_per_step = int(grpo_cfg["num_prompts_per_step"])
+        self._max_filtered_launches_per_target = (
+            num_prompts_per_step * int(grpo_cfg["dynamic_sampling_max_gen_batches"])
+            if self._use_dynamic_sampling
+            else 0
+        )
+        # These persist across _maybe_release_target's per-round counter resets (unlike
+        # _spawned_per_target/_buffered_per_target/_completed_per_target) because the trainer
+        # reads them later, via get_target_stats, after sampling the target from the replay
+        # buffer -- pruned in set_weight_version once the trainer has moved past a target.
+        self._dynsample_spawned_per_target: dict[int, int] = {}
+        self._discarded_per_target: dict[int, int] = {}
+        self._unfiltered_reward_sum: dict[int, float] = {}
+        self._unfiltered_reward_count: dict[int, int] = {}
+
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
 
@@ -191,6 +222,18 @@ class AsyncTrajectoryCollector:
     def set_weight_version(self, version: int) -> None:
         self.current_weight_version = version
 
+        # [CUSTOM] Prune dynamic-sampling counters for targets the trainer has moved past --
+        # these aren't cleared by _maybe_release_target (see get_target_stats), so without
+        # this they'd grow unbounded over a long run.
+        with self._counter_lock:
+            for consumed_target in [
+                t for t in self._dynsample_spawned_per_target if t < version
+            ]:
+                self._dynsample_spawned_per_target.pop(consumed_target, None)
+                self._discarded_per_target.pop(consumed_target, None)
+                self._unfiltered_reward_sum.pop(consumed_target, None)
+                self._unfiltered_reward_count.pop(consumed_target, None)
+
         # Resume collection if it was paused due to generation limits
         was_paused = not self._generation_limit_cleared.is_set()
         if was_paused:
@@ -198,6 +241,33 @@ class AsyncTrajectoryCollector:
             print(f"🔄 Updated weight version to {version}, resuming collection")
         else:
             print(f"🔄 Updated weight version to {version}")
+
+    def get_target_stats(self, target_weight: int) -> dict[str, float]:
+        """Return dynamic-sampling generation statistics for a consumed target weight.
+
+        Called by the trainer after it has sampled target_weight's groups from the replay
+        buffer, once no more generation for that target will happen. Unlike
+        _spawned_per_target/_buffered_per_target/_completed_per_target (cleared by
+        _maybe_release_target as soon as the collector's own in-flight round finishes), the
+        dynamic-sampling counters persist across however many rounds of gap-filling a target
+        needed -- the trainer reads them at a later point in time. Pruned in
+        set_weight_version once the trainer has moved past a target.
+        """
+        with self._counter_lock:
+            spawned = self._dynsample_spawned_per_target.get(target_weight, 0)
+            discarded = self._discarded_per_target.get(target_weight, 0)
+            reward_sum = self._unfiltered_reward_sum.get(target_weight, 0.0)
+            reward_count = self._unfiltered_reward_count.get(target_weight, 0)
+        if spawned == 0:
+            return {}
+        num_prompts_per_step = int(self.master_config.grpo["num_prompts_per_step"])
+        stats = {
+            "dynamic_sampling_num_gen_batches": spawned / num_prompts_per_step,
+            "dynamic_sampling_num_discarded_groups": float(discarded),
+        }
+        if reward_count > 0:
+            stats["unfiltered_reward"] = reward_sum / reward_count
+        return stats
 
     def _should_pause_for_generation_limits(self) -> bool:
         """Check if collection should be paused due to generation limits."""
@@ -379,6 +449,21 @@ class AsyncTrajectoryCollector:
                         num_generations
                     )
 
+                    # [CUSTOM] Decide at launch time whether this particular group is
+                    # allowed to be discarded by dynamic sampling (see get_target_stats),
+                    # mirroring the per-target launch cap: once dynamic_sampling_max_gen_batches
+                    # * num_prompts_per_step groups have been launched for this target, further
+                    # ones are accepted unconditionally so training cannot stall.
+                    with self._counter_lock:
+                        self._dynsample_spawned_per_target[target_weight] = (
+                            self._dynsample_spawned_per_target.get(target_weight, 0) + 1
+                        )
+                        total_spawned = self._dynsample_spawned_per_target[target_weight]
+                    filterable = (
+                        self._use_dynamic_sampling
+                        and total_spawned <= self._max_filtered_launches_per_target
+                    )
+
                     worker = _threading.Thread(
                         target=self._run_prompt_group_worker,
                         args=(
@@ -386,6 +471,7 @@ class AsyncTrajectoryCollector:
                             generation_weight_version,
                             target_weight,
                             prompt_idx,
+                            filterable,
                         ),
                         daemon=True,
                     )
@@ -417,6 +503,19 @@ class AsyncTrajectoryCollector:
                                     )
                                 else:
                                     self._spawned_per_target.pop(target_weight, None)
+                        with self._counter_lock:
+                            updated_total = (
+                                self._dynsample_spawned_per_target.get(target_weight, 0)
+                                - 1
+                            )
+                            if updated_total > 0:
+                                self._dynsample_spawned_per_target[target_weight] = (
+                                    updated_total
+                                )
+                            else:
+                                self._dynsample_spawned_per_target.pop(
+                                    target_weight, None
+                                )
                         self._inflight_sema.release()
                         raise
                     started += 1
@@ -721,6 +820,7 @@ class AsyncTrajectoryCollector:
         generation_weight_version: int,
         target_weight_version: int,
         prompt_idx: int,
+        filterable: bool = False,
     ) -> None:
         try:
             # Import here to avoid circular dependency
@@ -759,81 +859,128 @@ class AsyncTrajectoryCollector:
             final_batch_cpu = final_batch.to("cpu")
             del final_batch
 
-            # Compute teacher logprobs at collection time (overlapped with async rollouts)
-            if self._has_distillation_teachers and "agent_ref" in final_batch_cpu:
-                agent_refs = final_batch_cpu["agent_ref"]
-                if isinstance(agent_refs, list):
-                    from nemo_rl.data.llm_message_utils import (
-                        batched_message_log_to_flat_message,
+            # [CUSTOM] Dynamic sampling: drop this group instead of pushing it if its
+            # rewards are all equal (zero advantage, no training signal) and we're still
+            # under the per-target launch cap decided at spawn time (see _process_batch).
+            # _get_next_target_for_generation's existing gap-filling (via
+            # ReplayBuffer.get_trajectories_needed) picks up the slack and launches a
+            # replacement automatically on its next pass -- no bespoke retry logic needed.
+            discarded = False
+            if filterable:
+                rewards = final_batch_cpu.get("total_reward")
+                if rewards is not None:
+                    reward_values = (
+                        rewards.flatten().tolist()
+                        if hasattr(rewards, "flatten")
+                        else list(rewards)
                     )
-
-                    flat_for_teacher, teacher_input_lengths = (
-                        batched_message_log_to_flat_message(
-                            final_batch_cpu["message_log"],
-                            pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
-                            make_sequence_length_divisible_by=self._teacher_seq_pad_multiple,
+                    with self._counter_lock:
+                        self._unfiltered_reward_sum[target_weight_version] = (
+                            self._unfiltered_reward_sum.get(target_weight_version, 0.0)
+                            + sum(reward_values)
                         )
-                    )
-                    teacher_logprobs, teacher_logprob_time = (
-                        self._compute_teacher_logprobs(
-                            flat_for_teacher["token_ids"],
-                            agent_refs,
-                            input_lengths=teacher_input_lengths,
+                        self._unfiltered_reward_count[target_weight_version] = (
+                            self._unfiltered_reward_count.get(target_weight_version, 0)
+                            + len(reward_values)
                         )
-                    )
-                    # Store inside batch dict so from_batches handles
-                    # variable-length padding across prompt groups
-                    final_batch_cpu["teacher_reference_logprobs"] = teacher_logprobs
-                    rollout_metrics = dict(rollout_metrics)
-                    rollout_metrics["teacher_logprob_time"] = teacher_logprob_time
-
-            trajectory_group = {
-                "batch": final_batch_cpu,
-                "rollout_metrics": rollout_metrics,
-                "timestamp": time.time(),
-            }
-
-            # Use exponential backoff when buffer is full
-            try:
-                backoff_delay = 0.01
-                while self.running:
-                    status = ray.get(
-                        self.replay_buffer.add.remote(
-                            trajectory_group,
-                            generation_weight_version,
-                            target_weight_version,
-                        )
-                    )
-                    if status == "success":
+                    if reward_values and max(reward_values) == min(reward_values):
+                        discarded = True
                         with self._counter_lock:
-                            self._buffered_per_target[target_weight_version] = (
-                                self._buffered_per_target.get(target_weight_version, 0)
+                            self._discarded_per_target[target_weight_version] = (
+                                self._discarded_per_target.get(
+                                    target_weight_version, 0
+                                )
                                 + 1
                             )
-                            buffered_count = self._buffered_per_target[
-                                target_weight_version
-                            ]
-                            spawned_count = self._spawned_per_target.get(
-                                target_weight_version, 0
-                            )
-                        print(
-                            f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, "
-                            f"target_weight {target_weight_version}) "
-                            f"[{buffered_count}/{spawned_count} buffered]"
-                        )
-                        break
-                    elif status == "full":
-                        # Exponential backoff up to 0.5 second
-                        time.sleep(min(backoff_delay, 0.5))
-                        backoff_delay *= 1.5
-                    else:
-                        # Unexpected status, wait briefly
-                        time.sleep(0.01)
-            except Exception as e:
-                print(f"❌ Failed to enqueue per-prompt group to buffer: {e}")
-                import traceback
 
-                traceback.print_exc()
+            if discarded:
+                print(
+                    f"🎲 Discarded zero-advantage group (prompt_idx {prompt_idx}, "
+                    f"target_weight {target_weight_version}): dynamic sampling will "
+                    "relaunch a replacement."
+                )
+            else:
+                # Compute teacher logprobs at collection time (overlapped with async rollouts)
+                if self._has_distillation_teachers and "agent_ref" in final_batch_cpu:
+                    agent_refs = final_batch_cpu["agent_ref"]
+                    if isinstance(agent_refs, list):
+                        from nemo_rl.data.llm_message_utils import (
+                            batched_message_log_to_flat_message,
+                        )
+
+                        flat_for_teacher, teacher_input_lengths = (
+                            batched_message_log_to_flat_message(
+                                final_batch_cpu["message_log"],
+                                pad_value_dict={
+                                    "token_ids": self.tokenizer.pad_token_id
+                                },
+                                make_sequence_length_divisible_by=self._teacher_seq_pad_multiple,
+                            )
+                        )
+                        teacher_logprobs, teacher_logprob_time = (
+                            self._compute_teacher_logprobs(
+                                flat_for_teacher["token_ids"],
+                                agent_refs,
+                                input_lengths=teacher_input_lengths,
+                            )
+                        )
+                        # Store inside batch dict so from_batches handles
+                        # variable-length padding across prompt groups
+                        final_batch_cpu["teacher_reference_logprobs"] = (
+                            teacher_logprobs
+                        )
+                        rollout_metrics = dict(rollout_metrics)
+                        rollout_metrics["teacher_logprob_time"] = teacher_logprob_time
+
+                trajectory_group = {
+                    "batch": final_batch_cpu,
+                    "rollout_metrics": rollout_metrics,
+                    "timestamp": time.time(),
+                }
+
+                # Use exponential backoff when buffer is full
+                try:
+                    backoff_delay = 0.01
+                    while self.running:
+                        status = ray.get(
+                            self.replay_buffer.add.remote(
+                                trajectory_group,
+                                generation_weight_version,
+                                target_weight_version,
+                            )
+                        )
+                        if status == "success":
+                            with self._counter_lock:
+                                self._buffered_per_target[target_weight_version] = (
+                                    self._buffered_per_target.get(
+                                        target_weight_version, 0
+                                    )
+                                    + 1
+                                )
+                                buffered_count = self._buffered_per_target[
+                                    target_weight_version
+                                ]
+                                spawned_count = self._spawned_per_target.get(
+                                    target_weight_version, 0
+                                )
+                            print(
+                                f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, "
+                                f"target_weight {target_weight_version}) "
+                                f"[{buffered_count}/{spawned_count} buffered]"
+                            )
+                            break
+                        elif status == "full":
+                            # Exponential backoff up to 0.5 second
+                            time.sleep(min(backoff_delay, 0.5))
+                            backoff_delay *= 1.5
+                        else:
+                            # Unexpected status, wait briefly
+                            time.sleep(0.01)
+                except Exception as e:
+                    print(f"❌ Failed to enqueue per-prompt group to buffer: {e}")
+                    import traceback
+
+                    traceback.print_exc()
         except Exception as e:
             print(f"❌ Error in prompt group worker: {e}")
             import traceback
