@@ -724,8 +724,11 @@ class TestCollectorSlotScheduling:
         max_age: int = 1,
         groups_multiplier: Optional[float] = None,
         flexible_sampling: bool = False,
+        max_prompt_retries: Optional[int] = None,
     ):
         async_cfg = {"max_trajectory_age_steps": max_age}
+        if max_prompt_retries is not None:
+            async_cfg["max_prompt_retries"] = max_prompt_retries
         if groups_multiplier is not None:
             async_cfg["groups_multiplier"] = groups_multiplier
         if flexible_sampling:
@@ -1232,6 +1235,66 @@ class TestPromptBookkeeping:
 
         assert list(collector._retry_uids) == [uid]
         assert collector._num_requeued_prompts == 1
+
+    @staticmethod
+    def fail_once(collector, uid):
+        collector._reserve_slot()
+        collector._inflight_sema.acquire()
+        with mock.patch(
+            "nemo_rl.algorithms.async_utils.run_async_multi_turn_rollout",
+            side_effect=RuntimeError("rollout failed"),
+        ):
+            collector._run_prompt_group_worker(BatchedDataDict({}), 0, 0, 0, True, uid)
+
+    def test_prompt_that_keeps_failing_is_dropped_after_max_retries(self):
+        _, collector, _ = self.setup(max_prompt_retries=2)
+        uid = self.register(collector, "a")
+        collector._data_exhausted = True
+
+        for _ in range(2):
+            self.fail_once(collector, uid)
+            assert list(collector._retry_uids) == [uid]
+            assert not collector.is_finished()
+            collector._take_retry_prompts()
+        self.fail_once(collector, uid)  # third failure > max_prompt_retries
+
+        assert uid not in collector._pending_prompts
+        assert not collector._retry_uids
+        assert collector.is_finished()
+        assert collector.update_prompt_status([], [])["async_num_dropped_prompts_total"] == 1.0
+
+    def test_expired_groups_count_towards_max_retries(self):
+        _, collector, _ = self.setup(max_prompt_retries=1)
+        uid = self.register(collector, "a")
+
+        collector.update_prompt_status([], [uid])
+        assert collector._take_retry_prompts()[0][0] == uid
+        collector.update_prompt_status([], [uid])
+
+        assert uid not in collector._pending_prompts
+        assert not collector._retry_uids
+
+    def test_surplus_requeues_do_not_count_as_failures(self):
+        _, collector, _ = self.setup(max_prompt_retries=0)
+        uid = self.register(collector, "a")
+
+        for _ in range(5):
+            collector._requeue_prompt(uid)
+            collector._take_retry_prompts()
+
+        assert uid in collector._pending_prompts
+        assert collector._num_dropped_prompts == 0
+
+    def test_trained_prompt_forgets_its_failures(self):
+        _, collector, _ = self.setup(max_prompt_retries=1)
+        uid = self.register(collector, "a")
+        collector.update_prompt_status([], [uid])
+        collector._take_retry_prompts()
+        assert collector._prompt_failures == {uid: 1}
+
+        collector.update_prompt_status([uid], [])
+
+        assert collector._prompt_failures == {}
 
     def test_checkpoint_saves_pending_prompts_and_resume_queues_them_first(self):
         _, collector, _ = self.setup()

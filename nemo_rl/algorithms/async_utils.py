@@ -313,7 +313,8 @@ class ReplayBuffer:
 
     def _take_expired_prompt_uids(self) -> list[int]:
         """Return and forget the prompt ids of expired groups. Caller holds the lock."""
-        uids, self.expired_prompt_uids = self.expired_prompt_uids, []
+        uids = self.expired_prompt_uids
+        self.expired_prompt_uids = []
         return uids
 
     def size(self) -> int:
@@ -465,6 +466,14 @@ class AsyncTrajectoryCollector:
         self._retry_uids: collections.deque[int] = collections.deque()
         self._next_prompt_uid = 0
         self._num_requeued_prompts = 0
+        # [CUSTOM] A prompt whose generation fails, or whose group expires, more
+        # than max_prompt_retries times is dropped, as before prompts were
+        # requeued: a prompt that always fails would otherwise take up slots
+        # forever and keep is_finished() False. Surplus groups do not count, and
+        # the counts restart on resume.
+        self._max_prompt_retries = int(async_cfg.get("max_prompt_retries", 3))
+        self._prompt_failures: dict[int, int] = {}
+        self._num_dropped_prompts = 0
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
@@ -907,15 +916,33 @@ class AsyncTrajectoryCollector:
             return
         with self._pending_lock:
             self._pending_prompts.pop(uid, None)
+            self._prompt_failures.pop(uid, None)
 
-    def _requeue_prompt(self, uid: Optional[int]) -> None:
-        """Send a still-pending prompt back for generation."""
+    def _requeue_prompt(self, uid: Optional[int], failed: bool = False) -> None:
+        """Send a still-pending prompt back for generation.
+
+        failed: the generation failed or the group expired. Such a prompt is
+        dropped once it has failed more than max_prompt_retries times.
+        """
         if uid is None:
             return
         with self._pending_lock:
-            if uid in self._pending_prompts and uid not in self._retry_uids:
-                self._retry_uids.append(uid)
-                self._num_requeued_prompts += 1
+            if uid not in self._pending_prompts or uid in self._retry_uids:
+                return
+            if failed:
+                failures = self._prompt_failures.get(uid, 0) + 1
+                if failures > self._max_prompt_retries:
+                    self._pending_prompts.pop(uid)
+                    self._prompt_failures.pop(uid, None)
+                    self._num_dropped_prompts += 1
+                    print(
+                        f"🗑️ Dropped prompt uid {uid}: failed or expired {failures} times "
+                        f"(max_prompt_retries {self._max_prompt_retries})"
+                    )
+                    return
+                self._prompt_failures[uid] = failures
+            self._retry_uids.append(uid)
+            self._num_requeued_prompts += 1
 
     def _take_retry_prompts(self) -> list[tuple[int, BatchedDataDict[DatumSpec]]]:
         """Pop every prompt waiting in the retry queue."""
@@ -959,11 +986,12 @@ class AsyncTrajectoryCollector:
         for uid in consumed_uids:
             self._finish_prompt(uid)
         for uid in requeue_uids:
-            self._requeue_prompt(uid)
+            self._requeue_prompt(uid, failed=True)
         with self._pending_lock:
             stats = {
                 "async_num_pending_prompts": float(len(self._pending_prompts)),
                 "async_num_requeued_prompts_total": float(self._num_requeued_prompts),
+                "async_num_dropped_prompts_total": float(self._num_dropped_prompts),
                 "async_data_epoch": float(self.current_epoch),
             }
             if self._skip_solved:
@@ -1355,9 +1383,10 @@ class AsyncTrajectoryCollector:
                     f"🧹 Released unfilled slot for target weight {target_weight_version} (prompt_idx {prompt_idx})"
                 )
                 # [CUSTOM] Error or shutdown: the prompt stays pending (saved at the
-                # next checkpoint) and, while running, is generated again.
+                # next checkpoint) and, while running, is generated again, up to
+                # max_prompt_retries times.
                 if self.running:
-                    self._requeue_prompt(prompt_uid)
+                    self._requeue_prompt(prompt_uid, failed=True)
 
             # Detach thread record when finished
             with self._threads_lock:
