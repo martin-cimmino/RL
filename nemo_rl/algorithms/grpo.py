@@ -38,7 +38,9 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.reward_functions import (
+    DegenerationPenaltyConfig,
     RewardShapingConfig,
+    apply_degeneration_penalty,
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
@@ -119,6 +121,26 @@ class AsyncGRPOConfig(TypedDict):
     in_flight_weight_updates: NotRequired[bool]
     # Recomputes the KV cache after the in-flight weight updates.
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    # [CUSTOM] Launch up to this many times the prompt groups a target still
+    # needs and keep the first ones to finish (surplus groups are dropped), so
+    # dynamic-sampling replacements no longer wait on each other. Default 1.
+    groups_multiplier: NotRequired[float]
+    # [CUSTOM] Let a training step take any group inside the age window, oldest
+    # first, instead of only groups assigned to that exact step; groups that
+    # finish after their target is full are reassigned to a later target
+    # instead of being dropped. Default False.
+    flexible_sampling: NotRequired[bool]
+    # [CUSTOM] Skip, in every later epoch, prompts whose whole group reached
+    # solved_reward_threshold (all-1); all-0 prompts stay in. max_num_epochs
+    # then counts passes over the shrinking data, and the run ends when those
+    # are used up instead of at a fixed step. Default False.
+    skip_solved_prompts: NotRequired[bool]
+    # [CUSTOM] Reward every sample of a group must reach for its prompt to be
+    # skipped (skip_solved_prompts). Default 1.0.
+    solved_reward_threshold: NotRequired[float]
+    # [CUSTOM] Times a prompt may fail (generation error) or expire in the
+    # replay buffer and be generated again before it is dropped. Default 3.
+    max_prompt_retries: NotRequired[int]
     # [CUSTOM-ASYNC-BURST-CAP 2026-10-12] Caps AsyncTrajectoryCollector's own in-flight
     # generation-request semaphore (see async_utils.py's _inflight_sema). Without this, that
     # semaphore defaults to `num_prompts_per_step * max_trajectory_age_steps`.
@@ -190,6 +212,10 @@ class GRPOConfig(TypedDict):
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
     overlong_filtering: NotRequired[bool]
+    # [CUSTOM] When true (and overlong_filtering is false), each truncated sample
+    # trains with the loss weight of one typical finished sample instead of its
+    # own, much larger, token count (see apply_overlong_length_normalization).
+    overlong_length_normalization: NotRequired[bool]
     # [CUSTOM] Truncated rollouts that end in a repetition loop stay in the loss (at reward 0)
     # instead of being filtered, so loops are pushed down; see apply_overlong_filtering.
     overlong_repetition: NotRequired["OverlongRepetitionConfig"]
@@ -203,6 +229,8 @@ class GRPOConfig(TypedDict):
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: NotRequired[float]
     reward_shaping: RewardShapingConfig
+    # [CUSTOM] Reward cap for word-salad responses, applied after reward_shaping.
+    degeneration_penalty: NotRequired[DegenerationPenaltyConfig]
     reward_scaling: RewardScalingConfig
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: NotRequired[bool]
@@ -358,7 +386,26 @@ def setup(
             dataloader_state_dict = torch.load(
                 os.path.join(last_checkpoint_path, f"train_dataloader{suffix}.pt")
             )
+            # [CUSTOM] Async GRPO saves the collector's wrapped state
+            # ({"current_epoch", "dataloader_state"}, see
+            # AsyncTrajectoryCollector.get_dataloader_state). Loading the wrapper
+            # as-is left the real state one level down, so the collector found
+            # no "_snapshot", discarded it and every resume replayed the data
+            # from the start of the shuffle order.
+            if isinstance(dataloader_state_dict, dict) and "dataloader_state" in (
+                dataloader_state_dict
+            ):
+                dataloader_state_dict = dataloader_state_dict["dataloader_state"]
             dataloader.load_state_dict(dataloader_state_dict)
+            snapshot = dataloader_state_dict.get("_snapshot", {}) if isinstance(
+                dataloader_state_dict, dict
+            ) else {}
+            yielded = (
+                snapshot.get("_main_snapshot", {})
+                .get("_sampler_iter_state", {})
+                .get("samples_yielded")
+            )
+            print(f"  ✓ Restored train dataloader state (samples_yielded={yielded})")
         return dataloader
 
     if data_config["use_multiple_dataloader"]:
@@ -1069,6 +1116,59 @@ def apply_overlong_filtering(
 
     loss_multiplier[truncated] = loss_multiplier[truncated] * keep[truncated]
     repeated_batch["loss_multiplier"] = loss_multiplier
+    return repeated_batch
+
+
+def apply_overlong_length_normalization(
+    repeated_batch: BatchedDataDict[DatumSpec],
+) -> BatchedDataDict[DatumSpec]:
+    """[CUSTOM] Scale truncated samples' loss weight down to one typical sample.
+
+    With token-level loss a sample's weight in the update is its token count. A
+    truncated sample sits at the length cap, often several times longer than the
+    rest, and its negative advantage can then dominate the step (the 2026-10-28
+    code-teacher run collapsed this way with overlong filtering off). Each
+    truncated sample's loss_multiplier is scaled by min(1, L_ref / L), where L is
+    its response length and L_ref the mean response length of the batch's
+    finished samples (of all samples if none finished). The token normalizer is
+    sum(token_mask * sample_mask), so a scaled sample counts as L_ref tokens.
+    Like overlong filtering, truncated samples keep their reward and their place
+    in the group baseline.
+
+    Args:
+        repeated_batch: Rollout batch with "loss_multiplier", "truncated" and
+            "message_log".
+
+    Returns:
+        The same batch with "loss_multiplier" replaced by the scaled copy.
+    """
+    loss_multiplier = repeated_batch["loss_multiplier"].clone().float()
+    truncated = repeated_batch["truncated"]
+    if isinstance(truncated, list):
+        truncated = torch.tensor(truncated, dtype=torch.bool)
+    truncated = truncated.to(loss_multiplier.device)
+    if not truncated.any():
+        return repeated_batch
+
+    lengths = torch.tensor(
+        [
+            sum(len(m["token_ids"]) for m in log if m["role"] == "assistant")
+            for log in repeated_batch["message_log"]
+        ],
+        dtype=torch.float32,
+        device=loss_multiplier.device,
+    )
+    reference = lengths[~truncated] if (~truncated).any() else lengths
+    ref_len = reference.mean()
+    scale = torch.clamp(ref_len / lengths.clamp(min=1), max=1.0)
+    loss_multiplier[truncated] = loss_multiplier[truncated] * scale[truncated]
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    print(
+        f"  📏 Overlong length normalization: {int(truncated.sum())} truncated samples, "
+        f"reference length {ref_len.item():.0f} tokens, mean loss weight "
+        f"{scale[truncated].mean().item():.3f}",
+        flush=True,
+    )
     return repeated_batch
 
 
@@ -1794,6 +1894,11 @@ def grpo_train(
                     repeated_batch = apply_reward_shaping(
                         repeated_batch, master_config["grpo"]["reward_shaping"]
                     )
+                degeneration_cfg = master_config["grpo"].get("degeneration_penalty")
+                if degeneration_cfg and degeneration_cfg["enabled"]:
+                    repeated_batch = apply_degeneration_penalty(
+                        repeated_batch, degeneration_cfg
+                    )
 
                 # Calculate rewards & advantages
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
@@ -1926,6 +2031,10 @@ def grpo_train(
                         repeated_batch = apply_overlong_filtering(
                             repeated_batch,
                             master_config["grpo"].get("overlong_repetition"),
+                        )
+                    elif master_config["grpo"].get("overlong_length_normalization"):
+                        repeated_batch = apply_overlong_length_normalization(
+                            repeated_batch
                         )
                     # Add loss mask to each message in LLMMessageLogType
                     for i, message_log in enumerate(repeated_batch["message_log"]):
@@ -2720,6 +2829,12 @@ def async_grpo_train(
     val_at_start = master_config["grpo"]["val_at_start"]
     val_at_end = master_config["grpo"]["val_at_end"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    flexible_sampling = bool(
+        master_config["grpo"]["async_grpo"].get("flexible_sampling", False)
+    )
+    # Buffer's running count of informative groups dropped for exceeding the
+    # age window (flexible sampling only); logged per step as a difference.
+    expired_dropped_seen = 0
 
     # ── Multi-epoch support ──────────────────────────────────────────────────
     # The async trainer samples from the replay buffer rather than iterating the
@@ -2754,6 +2869,18 @@ def async_grpo_train(
             f"📐 Async multi-epoch bound: max_num_epochs={max_num_epochs} × "
             f"steps_per_epoch={steps_per_epoch} = {max_num_epochs * steps_per_epoch}, "
             f"max_num_steps={max_num_steps} → effective_max_steps={effective_max_steps}"
+        )
+    # [CUSTOM] Skipping solved prompts shrinks each epoch, so max_num_epochs
+    # counts the collector's passes over the data instead: the run ends when
+    # those are used up (AsyncTrajectoryCollector.is_finished), not at a step.
+    skip_solved = bool(
+        master_config["grpo"]["async_grpo"].get("skip_solved_prompts", False)
+    )
+    if skip_solved:
+        effective_max_steps = max_num_steps
+        print(
+            f"📐 skip_solved_prompts: running {max_num_epochs} data epochs "
+            f"(max_num_steps={max_num_steps} still caps the run)"
         )
 
     # Initialize advantage estimator
@@ -2842,6 +2969,26 @@ def async_grpo_train(
     )
 
     # Start trajectory collection in background
+    # [CUSTOM] Resume: regenerate the prompts that were pending at the checkpoint
+    # (in flight, buffered or queued) before reading new ones.
+    _last_ckpt = checkpointer.get_latest_checkpoint_path()
+    if _last_ckpt is not None:
+        # [CUSTOM] Data epochs read and solved prompts live in the collector's
+        # wrapped train_dataloader.pt (see get_dataloader_state).
+        _dl_path = os.path.join(_last_ckpt, "train_dataloader.pt")
+        if os.path.exists(_dl_path):
+            _dl_state = torch.load(_dl_path)
+            if isinstance(_dl_state, dict) and "dataloader_state" in _dl_state:
+                ray.get(
+                    trajectory_collector.restore_collection_state.remote(_dl_state)
+                )
+        _pending_path = os.path.join(_last_ckpt, "pending_prompts.pt")
+        if os.path.exists(_pending_path):
+            ray.get(
+                trajectory_collector.restore_pending_prompts.remote(
+                    torch.load(_pending_path, weights_only=False)
+                )
+            )
     collection_task = trajectory_collector.start_collection.remote(dataloader)
 
     # Ensure collector knows initial weight version
@@ -2920,6 +3067,11 @@ def async_grpo_train(
         f"⏳ Waiting for replay buffer to have sufficient trajectories ({min_trajectories_needed} trajectories)..."
     )
     wait_iterations = 0
+    # [CUSTOM] Set when the data is used up (skip_solved_prompts) and the
+    # remaining groups cannot fill a step; last_saved_step tells whether the
+    # steps trained since the last checkpoint still need saving.
+    data_finished = False
+    last_saved_step = step
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
 
@@ -2929,15 +3081,145 @@ def async_grpo_train(
 
         if buffer_size_current >= min_trajectories_needed:
             break
+        if skip_solved and ray.get(trajectory_collector.is_finished.remote()):
+            print("🏁 All data epochs are done; nothing left to train")
+            data_finished = True
+            break
 
         time.sleep(1.0)
 
     print("✅ Buffer ready! Starting training loop...")
 
+    # [CUSTOM] Validation and checkpointing as functions, so a run that ends on
+    # used-up data (skip_solved_prompts) while waiting for a step that will never
+    # fill can still validate and save its last steps.
+    def run_validation(completed_steps: int) -> dict[str, Any]:
+        nonlocal POLICY_GENERATION_STALE
+        # Pause trajectory collection during validation to reduce memory pressure
+        trajectory_collector.pause.remote()
+
+        if NEED_REFIT and POLICY_GENERATION_STALE:
+            refit_policy_generation(
+                policy, policy_generation, colocated_inference
+            )
+            POLICY_GENERATION_STALE = False
+        else:
+            policy_generation.prepare_for_generation()
+        val_metrics, validation_timings = validate(
+            policy_generation,
+            val_dataloader,
+            tokenizer,
+            val_task_to_env,
+            step=completed_steps,
+            master_config=master_config,
+            logger=logger,
+        )
+        policy_generation.finish_generation()
+        logger.log_metrics(
+            validation_timings, completed_steps, prefix="timing/validation"
+        )
+        logger.log_metrics(val_metrics, completed_steps, prefix="validation")
+
+        # Explicit GPU memory cleanup after validation in async mode
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Resume trajectory collection after validation
+        trajectory_collector.resume.remote()
+        return val_metrics
+
+    def save_checkpoint(
+        completed_steps: int,
+        train_metrics: Optional[dict[str, Any]],
+        val_metrics: Optional[dict[str, Any]],
+    ) -> None:
+        nonlocal last_saved_step
+        grpo_save_state["current_step"] = completed_steps
+        if steps_per_epoch and not skip_solved:
+            grpo_save_state["current_epoch"] = completed_steps // steps_per_epoch
+        grpo_save_state["total_valid_tokens"] = total_valid_tokens
+        if val_metrics is not None:
+            grpo_save_state["val_reward"] = val_metrics["accuracy"]
+        elif "val_reward" in grpo_save_state:
+            del grpo_save_state["val_reward"]
+        grpo_save_state["consumed_samples"] = consumed_samples
+
+        full_metric_name = master_config["checkpointing"]["metric_name"]
+        if full_metric_name is not None:
+            assert full_metric_name.startswith(
+                "train:"
+            ) or full_metric_name.startswith("val:"), (
+                f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
+                f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
+                f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
+                f" e.g. 'val_reward --> 'val:accuracy'"
+            )
+            prefix, metric_name = full_metric_name.split(":", 1)
+            metrics_source = train_metrics if prefix == "train" else val_metrics
+            if not metrics_source:
+                warnings.warn(
+                    f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
+                    "This checkpoint will not be saved as top-k.",
+                    stacklevel=2,
+                )
+                if full_metric_name in grpo_save_state:
+                    del grpo_save_state[full_metric_name]
+            elif metric_name not in metrics_source:
+                raise ValueError(
+                    f"Metric {metric_name} not found in {prefix} metrics"
+                )
+            else:
+                grpo_save_state[full_metric_name] = metrics_source[
+                    metric_name
+                ]
+
+        with timer.time("checkpointing"):
+            print(f"Saving checkpoint for step {completed_steps}...")
+            checkpoint_path = checkpointer.init_tmp_checkpoint(
+                completed_steps, grpo_save_state, master_config
+            )
+            policy.save_checkpoint(
+                weights_path=os.path.join(
+                    checkpoint_path, "policy", "weights"
+                ),
+                optimizer_path=os.path.join(
+                    checkpoint_path, "policy", "optimizer"
+                )
+                if checkpointer.save_optimizer
+                else None,
+                tokenizer_path=os.path.join(
+                    checkpoint_path, "policy", "tokenizer"
+                ),
+                checkpointing_cfg=master_config["checkpointing"],
+            )
+            # Get dataloader state from trajectory collector
+            actual_dataloader_state = ray.get(
+                trajectory_collector.get_dataloader_state.remote()
+            )
+            # [CUSTOM] Pending prompts hold non-tensor objects, so they go
+            # in their own file: train_dataloader.pt is read back with
+            # torch.load's default weights_only=True.
+            pending_prompts = actual_dataloader_state.pop(
+                "pending_prompts", None
+            )
+            torch.save(
+                actual_dataloader_state,
+                os.path.join(checkpoint_path, "train_dataloader.pt"),
+            )
+            if pending_prompts is not None:
+                torch.save(
+                    pending_prompts,
+                    os.path.join(checkpoint_path, "pending_prompts.pt"),
+                )
+            checkpointer.finalize_checkpoint(checkpoint_path)
+        last_saved_step = completed_steps
+
     # Main training loop
     try:
-        while step < effective_max_steps:
-            if steps_per_epoch:
+        while step < effective_max_steps and not data_finished:
+            if steps_per_epoch and not skip_solved:
                 epoch_idx = step // steps_per_epoch
                 header = (
                     f"Epoch {epoch_idx + 1}/{max_num_epochs} | "
@@ -2968,6 +3250,7 @@ def async_grpo_train(
                             num_prompt_groups=num_prompt_groups_needed,
                             current_weight_version=weight_version,
                             max_age_steps=max_trajectory_age_steps,
+                            flexible=flexible_sampling,
                         )
                     )
 
@@ -2979,6 +3262,15 @@ def async_grpo_train(
                         print(
                             "⏳ Buffer empty or not enough groups to form a full step, waiting..."
                         )
+                        if skip_solved and ray.get(
+                            trajectory_collector.is_finished.remote()
+                        ):
+                            print(
+                                "🏁 All data epochs are done and the remaining groups "
+                                "cannot fill a step"
+                            )
+                            data_finished = True
+                            break
 
                         # Get buffer debug info to help diagnose the issue
                         buffer_debug = ray.get(replay_buffer.get_debug_info.remote())
@@ -3000,6 +3292,44 @@ def async_grpo_train(
                     # Extract trajectories and metadata from sample result
                     trajectories = sample_result["trajectories"]
                     avg_trajectory_age = sample_result["avg_trajectory_age"]
+                    expired_dropped_total = sample_result.get(
+                        "expired_dropped_total", 0
+                    )
+                    num_expired_groups = expired_dropped_total - expired_dropped_seen
+                    expired_dropped_seen = expired_dropped_total
+                    num_early_groups = sum(
+                        1
+                        for target in sample_result["target_weight_versions"]
+                        if target != weight_version
+                    )
+                    # [CUSTOM] Prompt bookkeeping: the trained groups' prompts are
+                    # done; expired groups' prompts are generated again.
+                    prompt_stats = ray.get(
+                        trajectory_collector.update_prompt_status.remote(
+                            [
+                                t["prompt_uid"]
+                                for t in trajectories
+                                if t.get("prompt_uid") is not None
+                            ],
+                            sample_result.get("expired_prompt_uids", []),
+                        )
+                    )
+                    # [CUSTOM] Last step: the collector is done and what is left in
+                    # the buffer cannot fill another one.
+                    end_of_data = (
+                        skip_solved
+                        and ray.get(trajectory_collector.is_finished.remote())
+                        and ray.get(replay_buffer.size.remote())
+                        < num_prompt_groups_needed
+                    )
+                    if flexible_sampling and num_early_groups:
+                        # Groups of later targets were taken: let those targets
+                        # generate replacements.
+                        ray.get(
+                            trajectory_collector.release_consumed.remote(
+                                weight_version, sample_result["target_weight_versions"]
+                            )
+                        )
 
                     print(
                         f"✅ Sampled {len(trajectories)} trajectory groups from buffer (avg age: {avg_trajectory_age:.2f} steps)"
@@ -3109,6 +3439,10 @@ def async_grpo_train(
                         repeated_batch = apply_overlong_filtering(
                             repeated_batch,
                             master_config["grpo"].get("overlong_repetition"),
+                        )
+                    elif master_config["grpo"].get("overlong_length_normalization"):
+                        repeated_batch = apply_overlong_length_normalization(
+                            repeated_batch
                         )
                     # Add loss mask to each message
                     for i, message_log in enumerate(repeated_batch["message_log"]):
@@ -3274,45 +3608,13 @@ def async_grpo_train(
 
                 # Validation
                 val_metrics, validation_timings = None, None
-                is_last_step = step + 1 >= effective_max_steps
+                is_last_step = step + 1 >= effective_max_steps or end_of_data
 
                 # Run validation if it's a validation step or last step with val_at_end
                 if (val_period > 0 and (step + 1) % val_period == 0) or (
                     val_at_end and is_last_step
                 ):
-                    # Pause trajectory collection during validation to reduce memory pressure
-                    trajectory_collector.pause.remote()
-
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            policy, policy_generation, colocated_inference
-                        )
-                        POLICY_GENERATION_STALE = False
-                    else:
-                        policy_generation.prepare_for_generation()
-                    val_metrics, validation_timings = validate(
-                        policy_generation,
-                        val_dataloader,
-                        tokenizer,
-                        val_task_to_env,
-                        step=step + 1,
-                        master_config=master_config,
-                        logger=logger,
-                    )
-                    policy_generation.finish_generation()
-                    logger.log_metrics(
-                        validation_timings, step + 1, prefix="timing/validation"
-                    )
-                    logger.log_metrics(val_metrics, step + 1, prefix="validation")
-
-                    # Explicit GPU memory cleanup after validation in async mode
-                    import gc
-
-                    gc.collect()
-                    torch.cuda.empty_cache()
-
-                    # Resume trajectory collection after validation
-                    trajectory_collector.resume.remote()
+                    val_metrics = run_validation(step + 1)
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
@@ -3400,6 +3702,18 @@ def async_grpo_train(
                     metrics["dynamic_sampling_num_discarded_groups"] = target_stats.get(
                         "dynamic_sampling_num_discarded_groups", 0.0
                     )
+                    metrics["dynamic_sampling_num_surplus_groups"] = target_stats.get(
+                        "dynamic_sampling_num_surplus_groups", 0.0
+                    )
+                    metrics["dynamic_sampling_num_reassigned_groups"] = (
+                        target_stats.get("dynamic_sampling_num_reassigned_groups", 0.0)
+                    )
+                metrics["async_num_early_groups"] = float(num_early_groups)
+                # Informative groups (non-zero advantage) lost because they aged
+                # past max_trajectory_age_steps in the buffer, since the last step.
+                metrics["async_num_expired_groups"] = float(num_expired_groups)
+                metrics["async_num_expired_groups_total"] = float(expired_dropped_total)
+                metrics.update(prompt_stats)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
@@ -3424,73 +3738,7 @@ def async_grpo_train(
                 if master_config["checkpointing"]["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
-                    grpo_save_state["current_step"] = step + 1
-                    if steps_per_epoch:
-                        grpo_save_state["current_epoch"] = (step + 1) // steps_per_epoch
-                    grpo_save_state["total_valid_tokens"] = total_valid_tokens
-                    if val_metrics is not None:
-                        grpo_save_state["val_reward"] = val_metrics["accuracy"]
-                    elif "val_reward" in grpo_save_state:
-                        del grpo_save_state["val_reward"]
-                    grpo_save_state["consumed_samples"] = consumed_samples
-
-                    full_metric_name = master_config["checkpointing"]["metric_name"]
-                    if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_reward --> 'val:accuracy'"
-                        )
-                        prefix, metric_name = full_metric_name.split(":", 1)
-                        metrics_source = metrics if prefix == "train" else val_metrics
-                        if not metrics_source:
-                            warnings.warn(
-                                f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
-                                "This checkpoint will not be saved as top-k.",
-                                stacklevel=2,
-                            )
-                            if full_metric_name in grpo_save_state:
-                                del grpo_save_state[full_metric_name]
-                        elif metric_name not in metrics_source:
-                            raise ValueError(
-                                f"Metric {metric_name} not found in {prefix} metrics"
-                            )
-                        else:
-                            grpo_save_state[full_metric_name] = metrics_source[
-                                metric_name
-                            ]
-
-                    with timer.time("checkpointing"):
-                        print(f"Saving checkpoint for step {step + 1}...")
-                        checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            step + 1, grpo_save_state, master_config
-                        )
-                        policy.save_checkpoint(
-                            weights_path=os.path.join(
-                                checkpoint_path, "policy", "weights"
-                            ),
-                            optimizer_path=os.path.join(
-                                checkpoint_path, "policy", "optimizer"
-                            )
-                            if checkpointer.save_optimizer
-                            else None,
-                            tokenizer_path=os.path.join(
-                                checkpoint_path, "policy", "tokenizer"
-                            ),
-                            checkpointing_cfg=master_config["checkpointing"],
-                        )
-                        # Get dataloader state from trajectory collector
-                        actual_dataloader_state = ray.get(
-                            trajectory_collector.get_dataloader_state.remote()
-                        )
-                        torch.save(
-                            actual_dataloader_state,
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                    save_checkpoint(step + 1, metrics, val_metrics)
 
             # Logging
             # Log training data (match sync GRPO logging payload for parity)
@@ -3591,6 +3839,13 @@ def async_grpo_train(
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
+            if end_of_data:
+                print(
+                    f"Finished max_num_epochs={max_num_epochs} data epochs "
+                    f"({step} steps), stopping training.",
+                    flush=True,
+                )
+                return
             if step >= effective_max_steps:
                 if steps_per_epoch and effective_max_steps < max_num_steps:
                     print(
@@ -3604,6 +3859,19 @@ def async_grpo_train(
                         flush=True,
                     )
                 return
+
+        # [CUSTOM] The data ran out while waiting for a step: validate and save
+        # the steps trained since the last checkpoint.
+        if data_finished and step > last_saved_step:
+            final_val_metrics = run_validation(step) if val_at_end else None
+            if master_config["checkpointing"]["enabled"]:
+                save_checkpoint(step, None, final_val_metrics)
+        if data_finished:
+            print(
+                f"Finished max_num_epochs={max_num_epochs} data epochs "
+                f"({step} steps), stopping training.",
+                flush=True,
+            )
 
     except Exception as e:
         print(f"❌ Error in async loop: {e}")
