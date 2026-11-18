@@ -503,6 +503,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
+        from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
             ChatCompletionResponse,
@@ -808,6 +809,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         )
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
+        )
+        # The serving classes expect the template text, not a path: without this a
+        # `.jinja` path is rendered as a literal template and every prompt becomes
+        # the path string (ported from 0.6, 55ac2dc63).
+        serving_chat_kwargs["chat_template"] = load_chat_template(
+            serving_chat_kwargs["chat_template"]
         )
         openai_serving_render = NeMoRLOpenAIServingRender(
             model_config=engine_client.model_config,
