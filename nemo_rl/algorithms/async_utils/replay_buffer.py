@@ -39,6 +39,11 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         self.target_weight_versions = []  # it is the weight-version of the trainer where this trajectory will be used.
 
         self.last_target_weight_already_generated = -1
+        # [CUSTOM] Groups evicted for exceeding the age window, and the prompt
+        # ids of those groups, handed back on the next successful sample so the
+        # collector regenerates the prompts (see AsyncTrajectoryCollector).
+        self.expired_dropped = 0
+        self.expired_prompt_uids: list[int] = []
         self._lock = _threading.Lock()
 
     def add(
@@ -99,6 +104,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         num_prompt_groups: int,
         current_weight_version: int,
         max_age_steps: int,
+        flexible: bool = False,
     ) -> Optional[dict[str, Any]]:
         """Sample per-prompt trajectory groups intended for the current training step.
 
@@ -107,8 +113,17 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         until the remaining trajectories are generated. This ensures no trajectory
         loses its last chance to be used for its intended training step.
 
+        [CUSTOM] With flexible=True, any group inside the age window may serve the
+        step, oldest generation first (earliest expiry first), so a step is not
+        held back by its last straggler while finished groups for later steps sit
+        in the buffer. 'target_weight_versions' lists the targets of the groups
+        taken. Stale groups evicted here hand their prompt ids back through
+        'expired_prompt_uids' (once) so the collector regenerates the prompts.
+
         Returns:
-            Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
+            Dictionary with 'trajectories', 'avg_trajectory_age',
+            'target_weight_versions', 'expired_dropped_total' and
+            'expired_prompt_uids' keys, or None if insufficient data
         """
         with self._lock:
             if not self.trajectories:
@@ -140,6 +155,13 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                     f"   Evicting {len(old_indices)} stale trajectories "
                     f"(version < {min_valid_version})"
                 )
+                # [CUSTOM] Remember the evicted groups' prompts for regeneration.
+                self.expired_dropped += len(old_indices)
+                self.expired_prompt_uids.extend(
+                    self.trajectories[i]["prompt_uid"]
+                    for i in old_indices
+                    if self.trajectories[i].get("prompt_uid") is not None
+                )
                 self._remove_indices(old_indices)
                 total_trajectories = len(self.trajectories)
 
@@ -165,11 +187,18 @@ class ReplayBufferImpl(ReplayBufferProtocol):
 
             # Only select trajectories intended for the current training step
             # This ensures no trajectory loses its "last chance" to be used for its intended step
-            intended_indices = [
-                i
-                for i in valid_indices
-                if self.target_weight_versions[i] == current_weight_version
-            ]
+            if flexible:
+                # [CUSTOM] Oldest generation first; the sort is stable, so
+                # insertion order (FIFO) breaks ties.
+                intended_indices = sorted(
+                    valid_indices, key=lambda i: self.trajectory_versions[i]
+                )
+            else:
+                intended_indices = [
+                    i
+                    for i in valid_indices
+                    if self.target_weight_versions[i] == current_weight_version
+                ]
 
             print(
                 f"   🎯 Found {len(intended_indices)} trajectories intended for current step {current_weight_version}"
@@ -205,6 +234,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
 
             # Remove selected items in reverse order to maintain correct indices
             sampled_items = [self.trajectories[i] for i in selected]
+            sampled_targets = [self.target_weight_versions[i] for i in selected]
             self._remove_indices(selected)
 
             old_last_target = self.last_target_weight_already_generated
@@ -224,10 +254,25 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 f"🗑️ Consumed and removed {len(selected)} groups from buffer, old buffer size: {total_trajectories}, new buffer size: {len(self.trajectories)}, new target weight versions {self.target_weight_versions}"
             )
 
+            expired_prompt_uids = self.expired_prompt_uids
+            self.expired_prompt_uids = []
             return {
                 "trajectories": sampled_items,
                 "avg_trajectory_age": avg_trajectory_age,
+                "target_weight_versions": sampled_targets,
+                # Running total; the trainer logs the per-step difference.
+                "expired_dropped_total": self.expired_dropped,
+                "expired_prompt_uids": expired_prompt_uids,
             }
+
+    def get_prompt_uids(self) -> list[int]:
+        """[CUSTOM] Prompt ids of the buffered groups (restored or not)."""
+        with self._lock:
+            return [
+                t["prompt_uid"]
+                for t in self.trajectories
+                if t.get("prompt_uid") is not None
+            ]
 
     def size(self) -> int:
         """Return current buffer size."""
@@ -496,10 +541,24 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         target_step: int,
         num_prompts_per_step: int,
         max_age_steps: int | None = None,
+        flexible: bool = False,
     ) -> bool:
-        """Return whether ``target_step`` has enough trajectories to train."""
+        """Return whether ``target_step`` has enough trajectories to train.
+
+        [CUSTOM] With flexible=True any group generated inside the age window of
+        ``target_step`` counts, whatever its target (see ``sample``).
+        """
         with self._lock:
-            current_count = self._count_for_target(target_step, max_age_steps)
+            if flexible:
+                current_count = sum(
+                    1
+                    for trajectory_version in self.trajectory_versions
+                    if self._is_valid_for_target(
+                        trajectory_version, target_step, max_age_steps
+                    )
+                )
+            else:
+                current_count = self._count_for_target(target_step, max_age_steps)
             return current_count >= num_prompts_per_step
 
     def _remove_incomplete_target_steps(self, num_prompts_per_step: int) -> None:
