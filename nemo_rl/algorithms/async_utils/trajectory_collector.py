@@ -21,7 +21,9 @@
 
 from __future__ import annotations
 
+import collections
 import concurrent.futures
+import math
 import threading as _threading
 import time
 from collections import defaultdict
@@ -32,8 +34,12 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.grpo import MasterConfig
+from nemo_rl.algorithms.grpo import MasterConfig, scale_rewards
 from nemo_rl.algorithms.opd import resolve_reference_aliases, teacher_seq_pad_multiple
+from nemo_rl.algorithms.reward_functions import (
+    apply_degeneration_penalty,
+    apply_reward_shaping,
+)
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -112,12 +118,38 @@ class AsyncTrajectoryCollector:
         self._inflight_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
 
-        # Limit in-flight generator requests to num_prompts_per_step * max_trajectory_age_steps
+        # [CUSTOM] Over-launch factor per target: a round for a target launches
+        # ceil(needed * groups_multiplier) groups and keeps the first `needed`
+        # ones to pass dynamic sampling (see _claim_target); 1 keeps the
+        # upstream behavior of launching exactly the groups still needed.
+        async_cfg = self.master_config.grpo["async_grpo"]
+        self._groups_multiplier = float(async_cfg.get("groups_multiplier", 1.0))
+        if self._groups_multiplier < 1.0:
+            raise ValueError(
+                f"async_grpo.groups_multiplier must be >= 1, got {self._groups_multiplier}"
+            )
+        # [CUSTOM] With flexible sampling the step a group trains on does not
+        # matter, so a group finishing after its target is full is reassigned
+        # to the next target that still needs groups instead of being dropped.
+        self._reassign_surplus = bool(async_cfg.get("flexible_sampling", False))
+        self._max_age = int(async_cfg["max_trajectory_age_steps"])
+
+        # Limit in-flight generator requests to
+        # num_prompts_per_step * max_trajectory_age_steps * groups_multiplier.
         # This value limits the parallelism of the generation requests.
-        max_inflight = (
-            int(self.master_config.grpo["num_prompts_per_step"])
-            * int(self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"])
-        ) or 1
+        # [CUSTOM] async_grpo.max_concurrent_generations overrides the default.
+        max_concurrent_generations = async_cfg.get("max_concurrent_generations")
+        if max_concurrent_generations is not None:
+            max_inflight = int(max_concurrent_generations)
+        else:
+            max_inflight = (
+                math.ceil(
+                    int(self.master_config.grpo["num_prompts_per_step"])
+                    * self._max_age
+                    * self._groups_multiplier
+                )
+                or 1
+            )
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
         # Simple lock to prevent race conditions when checking/spawning workers
@@ -154,6 +186,61 @@ class AsyncTrajectoryCollector:
         self._discarded_per_target: dict[int, int] = {}
         self._unfiltered_reward_sum: dict[int, float] = {}
         self._unfiltered_reward_count: dict[int, int] = {}
+        # [CUSTOM] Groups that passed dynamic sampling but found their target
+        # full (surplus), and surplus groups reassigned to a later target. Same
+        # lifetime as the dynamic-sampling counters above.
+        self._surplus_per_target: dict[int, int] = {}
+        self._reassigned_per_target: dict[int, int] = {}
+        # [CUSTOM] Groups claimed for a target but not yet in the replay buffer
+        # (see _claim_target): the buffer's own count plus these is what a
+        # target already has.
+        self._claim_lock: _threading.Lock = _threading.Lock()
+        self._claimed_per_target: dict[int, int] = {}
+
+        # [CUSTOM] Data epochs. The collector reads the data max_num_epochs
+        # times (upstream reads it once and then stops collecting); epochs fully
+        # read are counted under _pending_lock together with the dataloader
+        # read so a checkpoint saves a consistent pair (see get_checkpoint_state
+        # / restore_collection_state).
+        self.current_epoch: int = 0
+        self._epochs_completed = 0
+        self._max_data_epochs: Optional[int] = (
+            int(grpo_cfg["max_num_epochs"])
+            if grpo_cfg.get("max_num_epochs") is not None
+            else None
+        )
+        self._data_exhausted = False
+        # True while requeued prompts are taken but their workers not started yet.
+        self._relaunching = False
+
+        # [CUSTOM] Skip solved prompts: a prompt whose whole group reaches
+        # solved_reward_threshold (all-1) is recorded by dataset idx and not
+        # generated again in later epochs, while all-0 prompts stay in. Epochs
+        # then shrink, so max_num_epochs counts passes over the data: the run
+        # ends when the remaining groups cannot fill a step (see is_finished).
+        self._skip_solved = bool(async_cfg.get("skip_solved_prompts", False))
+        self._solved_threshold = float(async_cfg.get("solved_reward_threshold", 1.0))
+        self._solved_prompts: dict[int, int] = {}  # dataset idx -> epoch solved
+        self._num_skipped_solved = 0
+
+        # [CUSTOM] Prompt bookkeeping, so no prompt taken from the dataloader is
+        # lost: every prompt is pending (keyed by a uid) until it is trained on
+        # or discarded by dynamic sampling. Prompts a round does not launch,
+        # and surplus, expired or failed groups, go back to the retry queue;
+        # checkpoints save the pending prompts so a resume regenerates those
+        # that are not in the restored replay buffer.
+        self._pending_lock = _threading.Lock()
+        self._pending_prompts: dict[int, BatchedDataDict[DatumSpec]] = {}
+        self._retry_uids: collections.deque[int] = collections.deque()
+        self._next_prompt_uid = 0
+        self._num_requeued_prompts = 0
+        # [CUSTOM] A prompt whose generation fails, or whose group expires, more
+        # than max_prompt_retries times is dropped: a prompt that always fails
+        # would otherwise take up launches forever and keep is_finished() False.
+        # Surplus and unlaunched prompts do not count; counts restart on resume.
+        self._max_prompt_retries = int(async_cfg.get("max_prompt_retries", 3))
+        self._prompt_failures: dict[int, int] = {}
+        self._num_dropped_prompts = 0
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
@@ -263,6 +350,11 @@ class AsyncTrajectoryCollector:
                 self._discarded_per_target.pop(consumed_target, None)
                 self._unfiltered_reward_sum.pop(consumed_target, None)
                 self._unfiltered_reward_count.pop(consumed_target, None)
+                self._surplus_per_target.pop(consumed_target, None)
+                self._reassigned_per_target.pop(consumed_target, None)
+        with self._claim_lock:
+            for consumed_target in [t for t in self._claimed_per_target if t < version]:
+                self._claimed_per_target.pop(consumed_target, None)
 
         # Resume collection if it was paused due to generation limits
         was_paused = not self._generation_limit_cleared.is_set()
@@ -288,12 +380,16 @@ class AsyncTrajectoryCollector:
             discarded = self._discarded_per_target.get(target_weight, 0)
             reward_sum = self._unfiltered_reward_sum.get(target_weight, 0.0)
             reward_count = self._unfiltered_reward_count.get(target_weight, 0)
+            surplus = self._surplus_per_target.get(target_weight, 0)
+            reassigned = self._reassigned_per_target.get(target_weight, 0)
         if spawned == 0:
             return {}
         num_prompts_per_step = int(self.master_config.grpo["num_prompts_per_step"])
         stats = {
             "dynamic_sampling_num_gen_batches": spawned / num_prompts_per_step,
             "dynamic_sampling_num_discarded_groups": float(discarded),
+            "dynamic_sampling_num_surplus_groups": float(surplus),
+            "dynamic_sampling_num_reassigned_groups": float(reassigned),
         }
         if reward_count > 0:
             stats["unfiltered_reward"] = reward_sum / reward_count
@@ -338,66 +434,145 @@ class AsyncTrajectoryCollector:
 
         print("Collection thread started, start_collection returning")
 
-    def _collection_loop(self):
-        """Run the collection loop in background thread."""
+    def _wait_until_can_launch(self) -> bool:
+        """Block while collection is paused.
+
+        Paused manually, for a refit, or because every target in range has its
+        groups. Returns False if stopped.
+        """
+        # [CUSTOM-GAPFILL-CURRENT 2026-11-08] Every pause clears the event and
+        # re-checks, so a wake (refit, released reservation) with nothing to do
+        # pauses again instead of letting the loop spin; the timeout is only a
+        # backstop.
+        while self.running:
+            # Check if manually paused and wait
+            if not self._manual_pause_cleared.is_set():
+                self._manual_pause_cleared.wait()
+
+            # Check if refit is in progress and wait
+            if not self._refit_pause_cleared.is_set() and self.running:
+                print("⏸️ Pausing collection for refit...")
+                self._refit_pause_cleared.wait()
+                print("▶️ Refit completed, resuming collection")
+
+            if not self.running:
+                break
+
+            # Check if generation limits require pausing collection
+            if not self._should_pause_for_generation_limits():
+                break
+            # Only log warning once per weight version
+            if self._last_limit_warning_version != self.current_weight_version:
+                print(
+                    "⏸️ Pausing collection: every target for weight version "
+                    f"{self.current_weight_version} is generated or in progress. "
+                    "Waiting for a weight update or a short target to gap-fill..."
+                )
+                self._last_limit_warning_version = self.current_weight_version
+            self._generation_limit_cleared.clear()  # Clear the event to pause
+            # Re-check after clearing, so a wake landing between the check and
+            # the clear is not lost.
+            if self._should_pause_for_generation_limits():
+                self._generation_limit_cleared.wait(timeout=_GENERATION_LIMIT_RECHECK_S)
+
+        return self.running
+
+    def _launch_retries(self) -> int:
+        """[CUSTOM] Launch the requeued prompts, if any. Returns how many were taken."""
+        with self._pending_lock:
+            self._relaunching = True
+        retry_items = []
         try:
-            for batch in self.dataloader:
-                if not self.running:
-                    break
+            retry_items = self._take_retry_prompts()
+            if retry_items and self._wait_until_can_launch():
+                if self._launch_prompts(retry_items) == 0:
+                    time.sleep(0.5)
+        finally:
+            with self._pending_lock:
+                self._relaunching = False
+        return len(retry_items)
 
-                # [CUSTOM-GAPFILL-CURRENT 2026-11-08] Hold this batch until a target actually
-                # uses it. Upstream paused at most once per weight version (the event was only
-                # cleared together with the once-per-version warning), so any later wake made
-                # the loop pull batch after batch that _process_batch dropped with "No targets
-                # need generation": job 63861875 burned 478 batches, exhausted the dataloader
-                # and stopped collecting. Now every pause clears the event and re-checks, and a
-                # batch is only released once _process_batch has used it.
+    def _collection_loop(self):
+        """Run the collection loop in background thread.
+
+        [CUSTOM] Reads the data max_num_epochs times (upstream reads it once and
+        stops), regenerating requeued prompts first, skipping prompts solved in
+        an earlier epoch, and keeping every prompt pending until it is trained
+        on or discarded (see _register_prompt). After the last epoch only
+        requeued prompts are generated, until nothing is left (is_finished).
+        """
+        try:
+            while self.running:
+                if (
+                    self._max_data_epochs is not None
+                    and self._epochs_completed >= self._max_data_epochs
+                ):
+                    if not self._data_exhausted:
+                        self._data_exhausted = True
+                        print(
+                            f"🏁 Read all {self._max_data_epochs} data epochs; "
+                            "generating only requeued prompts from now on"
+                        )
+                    if self._launch_retries() == 0:
+                        time.sleep(0.5)
+                    continue
+
+                self.current_epoch = self._epochs_completed + 1
+                print(f"Starting epoch {self.current_epoch} of trajectory collection")
+
+                # Defensive: torchdata's multiprocess iterator asserts
+                # "_snapshot" in next_iter_state. If a stale/partial state was
+                # loaded elsewhere, drop it so iter() doesn't die here.
+                next_state = getattr(self.dataloader, "next_iter_state", None)
+                if (
+                    isinstance(next_state, dict)
+                    and (getattr(self.dataloader, "num_workers", 0) or 0) > 0
+                    and "_snapshot" not in next_state
+                ):
+                    print(
+                        "⚠️  Clearing incompatible dataloader next_iter_state "
+                        "(missing '_snapshot'); using a fresh iterator."
+                    )
+                    self.dataloader.next_iter_state = None
+
+                iterator = iter(self.dataloader)
                 while self.running:
-                    # Check if manually paused and wait
-                    if not self._manual_pause_cleared.is_set():
-                        self._manual_pause_cleared.wait()
-
-                    # Check if refit is in progress and wait
-                    if not self._refit_pause_cleared.is_set() and self.running:
-                        print("⏸️ Pausing collection for refit...")
-                        self._refit_pause_cleared.wait()
-                        print("▶️ Refit completed, resuming collection")
-
-                    if not self.running:
-                        break
-
-                    # Check if generation limits require pausing collection
-                    if self._should_pause_for_generation_limits():
-                        # Only log warning once per weight version
-                        if (
-                            self._last_limit_warning_version
-                            != self.current_weight_version
+                    # Regenerate requeued / restored prompts first.
+                    if self._launch_retries():
+                        continue
+                    # Fetch and register under one lock so a checkpoint never
+                    # sees the dataloader past a prompt that is not pending.
+                    with self._pending_lock:
+                        try:
+                            batch = next(iterator)
+                        except StopIteration:
+                            self._epochs_completed += 1
+                            break
+                        items = []
+                        for single in (
+                            batch.slice(i, i + 1) for i in range(batch.size)
                         ):
-                            print(
-                                "⏸️ Pausing collection: every target for weight version "
-                                f"{self.current_weight_version} is generated or in progress. "
-                                "Waiting for a weight update or a short target to gap-fill..."
-                            )
-                            self._last_limit_warning_version = (
-                                self.current_weight_version
-                            )
-                        self._generation_limit_cleared.clear()  # Clear the event to pause
-                        # Re-check after clearing, so a wake landing between the check and
-                        # the clear is not lost; the timeout is only a backstop.
-                        if self._should_pause_for_generation_limits():
-                            self._generation_limit_cleared.wait(
-                                timeout=_GENERATION_LIMIT_RECHECK_S
-                            )
+                            # Solved in an earlier epoch: skip it.
+                            if (
+                                self._skip_solved
+                                and int(single["idx"][0]) in self._solved_prompts
+                            ):
+                                self._num_skipped_solved += 1
+                                continue
+                            items.append((self._register_prompt(single), single))
+                    if not items:
                         continue
 
-                    if self._process_batch(batch):
+                    if not self._wait_until_can_launch():
                         break
-                    # Nothing to generate after all (lost a race for the reservation):
-                    # keep this batch and re-check.
-                    time.sleep(1.0)
 
-                if not self.running:
-                    break
+                    if self._launch_prompts(items) == 0:
+                        time.sleep(0.5)
+
+                if self.running:
+                    print(
+                        f"Finished epoch {self.current_epoch} of trajectory collection"
+                    )
 
         except Exception as e:
             print(f"❌ Error in trajectory collection: {e}")
@@ -409,16 +584,36 @@ class AsyncTrajectoryCollector:
             print("🛑 Trajectory collection stopped")
 
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> bool:
-        """Process a single batch and generate for one target weight.
+        """Register every prompt of batch and launch it (see _launch_prompts).
 
-        Returns False when no target needed it (the caller keeps the batch), True when the
-        batch was used -- or failed while being used, as upstream (then it is dropped).
+        Returns whether any worker started. Prompts not launched are kept in
+        the retry queue either way.
+        """
+        with self._pending_lock:
+            items = [
+                (self._register_prompt(single), single)
+                for single in (batch.slice(i, i + 1) for i in range(batch.size))
+            ]
+        return self._launch_prompts(items) > 0
+
+    def _launch_prompts(
+        self, items: list[tuple[int, BatchedDataDict[DatumSpec]]]
+    ) -> int:
+        """Generate (uid, prompt) items for one target weight.
+
+        [CUSTOM] Upstream's _process_batch, launching ceil(needed *
+        groups_multiplier) groups for the target (the first `needed` to pass
+        dynamic sampling are kept, see _claim_target) and sending the prompts it
+        does not launch back to the retry queue instead of dropping them.
+        Returns the number of workers started.
         """
         target_weight: Optional[int] = None
+        to_launch: list[tuple[int, BatchedDataDict[DatumSpec]]] = []
+        started = 0
         try:
             generation_weight_version = self.current_weight_version
             num_generations = self.master_config.grpo["num_generations_per_prompt"]
-            num_prompts_in_batch = batch.size
+            num_prompts_in_batch = len(items)
             num_prompts_per_step = int(self.master_config.grpo["num_prompts_per_step"])
             max_age_steps = int(
                 self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
@@ -433,7 +628,8 @@ class AsyncTrajectoryCollector:
                 print(
                     f"🔄 No targets need generation for weight {generation_weight_version}"
                 )
-                return False
+                self._requeue_prompts(items)
+                return 0
 
             print(
                 f"🎯 Generating for target weight {target_weight} from generation_weight_version {generation_weight_version}"
@@ -444,14 +640,18 @@ class AsyncTrajectoryCollector:
                     target_weight, num_prompts_per_step, max_age_steps
                 )
             )
-            num_prompts_to_generate = min(num_prompts_in_batch, trajectories_needed)
+            num_prompts_to_generate = min(
+                num_prompts_in_batch,
+                math.ceil(trajectories_needed * self._groups_multiplier),
+            )
             if num_prompts_to_generate == 0:
                 print(
                     f"🔄 Target {target_weight} already has enough trajectories, skipping"
                 )
                 with self._generation_check_lock:
                     self._generating_targets.discard(target_weight)
-                return False
+                self._requeue_prompts(items)
+                return 0
 
             if num_prompts_to_generate < num_prompts_in_batch:
                 print(
@@ -459,15 +659,19 @@ class AsyncTrajectoryCollector:
                     f"generating {num_prompts_to_generate}/{num_prompts_in_batch} "
                     f"prompts (need {trajectories_needed} more trajectories)"
                 )
+            to_launch = items[:num_prompts_to_generate]
+            # The prompts this round does not launch wait for the next one.
+            self._requeue_prompts(items[num_prompts_to_generate:])
 
             # Generate only the prompt groups needed for this target. While the
             # spawn loop is open, workers may finish before later workers start,
             # so reservation release is deferred until spawning closes.
-            started = 0
             with self._counter_lock:
                 self._spawning_targets.add(target_weight)
             try:
-                for prompt_idx in range(num_prompts_to_generate):
+                for prompt_idx, (prompt_uid, single_prompt_batch) in enumerate(
+                    to_launch
+                ):
                     # Wait for refit to complete if in progress
                     if not self._refit_pause_cleared.is_set() and self.running:
                         with self._threads_lock:
@@ -483,7 +687,6 @@ class AsyncTrajectoryCollector:
                         # After refit finishes if weight version has updated, reflect that in the new trajectories
                         generation_weight_version = self.current_weight_version
 
-                    single_prompt_batch = batch.slice(prompt_idx, prompt_idx + 1)
                     repeated_batch = single_prompt_batch.repeat_interleave(
                         num_generations
                     )
@@ -497,7 +700,9 @@ class AsyncTrajectoryCollector:
                         self._dynsample_spawned_per_target[target_weight] = (
                             self._dynsample_spawned_per_target.get(target_weight, 0) + 1
                         )
-                        total_spawned = self._dynsample_spawned_per_target[target_weight]
+                        total_spawned = self._dynsample_spawned_per_target[
+                            target_weight
+                        ]
                     filterable = (
                         self._use_dynamic_sampling
                         and total_spawned <= self._max_filtered_launches_per_target
@@ -511,6 +716,7 @@ class AsyncTrajectoryCollector:
                             target_weight,
                             prompt_idx,
                             filterable,
+                            prompt_uid,
                         ),
                         daemon=True,
                     )
@@ -556,6 +762,8 @@ class AsyncTrajectoryCollector:
                                     target_weight, None
                                 )
                         self._inflight_sema.release()
+                        # [CUSTOM] Never generated: try the prompt again later.
+                        self._requeue_prompt(prompt_uid, failed=True)
                         raise
                     started += 1
                     print(
@@ -573,18 +781,19 @@ class AsyncTrajectoryCollector:
                 self._maybe_release_target(target_weight)
 
             self._cleanup_finished_threads()
-            return True
 
         except Exception as e:
             if target_weight is not None:
                 with self._counter_lock:
                     self._spawning_targets.discard(target_weight)
                 self._maybe_release_target(target_weight)
+            # [CUSTOM] Prompts the failed round never started stay pending.
+            self._requeue_prompts(to_launch[started:])
             print(f"❌ Error processing batch: {e}")
             import traceback
 
             traceback.print_exc()
-            return True
+        return started
 
     def get_weight_version(self) -> int:
         return self.current_weight_version
@@ -704,6 +913,230 @@ class AsyncTrajectoryCollector:
         if hasattr(self, "dataloader") and hasattr(self.dataloader, "state_dict"):
             return self.dataloader.state_dict()
         return {}
+
+    # ------------------------------------------------------------------
+    # [CUSTOM] Group claims (groups_multiplier / flexible sampling)
+    # ------------------------------------------------------------------
+
+    def _claim_target(
+        self, target_weight: int, generation_weight_version: int
+    ) -> Optional[int]:
+        """Reserve one group of a target before pushing it to the replay buffer.
+
+        A target has its groups when the buffer holds, or workers have claimed,
+        num_prompts_per_step of them. Returns target_weight if it still needs
+        groups, otherwise (with flexible sampling) the lowest later target that
+        does and that the group can still reach within the age window. None
+        means the group is surplus and must not reach the replay buffer, which
+        would keep it past its target and later evict it as stale.
+        """
+        num_prompts = int(self.master_config.grpo["num_prompts_per_step"])
+        candidates = [target_weight]
+        if self._reassign_surplus:
+            first = max(target_weight + 1, self.current_weight_version)
+            candidates += list(
+                range(first, generation_weight_version + self._max_age + 1)
+            )
+        with self._claim_lock:
+            for target in candidates:
+                if target < self.current_weight_version:
+                    continue
+                needed = ray.get(
+                    self.replay_buffer.get_trajectories_needed.remote(
+                        target, num_prompts, self._max_age
+                    )
+                )
+                if needed - self._claimed_per_target.get(target, 0) <= 0:
+                    continue
+                self._claimed_per_target[target] = (
+                    self._claimed_per_target.get(target, 0) + 1
+                )
+                if target != target_weight:
+                    with self._counter_lock:
+                        self._reassigned_per_target[target_weight] = (
+                            self._reassigned_per_target.get(target_weight, 0) + 1
+                        )
+                return target
+        return None
+
+    def _release_claim(self, target: int) -> None:
+        """The claimed group reached the buffer (or never will)."""
+        with self._claim_lock:
+            left = self._claimed_per_target.get(target, 0) - 1
+            if left > 0:
+                self._claimed_per_target[target] = left
+            else:
+                self._claimed_per_target.pop(target, None)
+
+    # ------------------------------------------------------------------
+    # [CUSTOM] Prompt bookkeeping, solved prompts and checkpoint state
+    # ------------------------------------------------------------------
+
+    def _register_prompt(self, single_prompt_batch: BatchedDataDict[DatumSpec]) -> int:
+        """Mark a prompt pending and return its uid. Caller holds _pending_lock."""
+        uid = self._next_prompt_uid
+        self._next_prompt_uid += 1
+        self._pending_prompts[uid] = single_prompt_batch
+        return uid
+
+    def _finish_prompt(self, uid: Optional[int]) -> None:
+        """A prompt was trained on or discarded by dynamic sampling."""
+        if uid is None:
+            return
+        with self._pending_lock:
+            self._pending_prompts.pop(uid, None)
+            self._prompt_failures.pop(uid, None)
+
+    def _requeue_prompt(self, uid: Optional[int], failed: bool = False) -> None:
+        """Send a still-pending prompt back for generation.
+
+        failed: the generation failed or the group expired. Such a prompt is
+        dropped once it has failed more than max_prompt_retries times.
+        """
+        if uid is None:
+            return
+        with self._pending_lock:
+            if uid not in self._pending_prompts or uid in self._retry_uids:
+                return
+            if failed:
+                failures = self._prompt_failures.get(uid, 0) + 1
+                if failures > self._max_prompt_retries:
+                    self._pending_prompts.pop(uid)
+                    self._prompt_failures.pop(uid, None)
+                    self._num_dropped_prompts += 1
+                    print(
+                        f"🗑️ Dropped prompt uid {uid}: failed or expired {failures} times "
+                        f"(max_prompt_retries {self._max_prompt_retries})"
+                    )
+                    return
+                self._prompt_failures[uid] = failures
+            self._retry_uids.append(uid)
+            self._num_requeued_prompts += 1
+
+    def _requeue_prompts(
+        self, items: list[tuple[int, BatchedDataDict[DatumSpec]]]
+    ) -> None:
+        """Prompts a round did not launch go back to the queue, as not failed."""
+        for uid, _ in items:
+            self._requeue_prompt(uid)
+
+    def _take_retry_prompts(self) -> list[tuple[int, BatchedDataDict[DatumSpec]]]:
+        """Pop every prompt waiting in the retry queue."""
+        with self._pending_lock:
+            items = []
+            while self._retry_uids:
+                uid = self._retry_uids.popleft()
+                if uid in self._pending_prompts:
+                    items.append((uid, self._pending_prompts[uid]))
+            return items
+
+    def _mark_solved(self, repeated_batch: BatchedDataDict[DatumSpec]) -> None:
+        """Record a prompt whose whole group was solved (all-1)."""
+        idx = int(repeated_batch["idx"][0])
+        with self._pending_lock:
+            self._solved_prompts.setdefault(idx, self.current_epoch)
+
+    def is_finished(self) -> bool:
+        """Every data epoch is read and no prompt is left to generate.
+
+        Checked under _pending_lock: a worker requeues its prompt before it
+        exits, and the collection loop keeps _relaunching set until the workers
+        of the prompts it took are started, so no prompt slips between checks.
+        """
+        if not self._data_exhausted:
+            return False
+        with self._pending_lock:
+            if self._retry_uids or self._relaunching:
+                return False
+            with self._threads_lock:
+                return not any(t.is_alive() for t in self._inflight_threads)
+
+    def update_prompt_status(
+        self, consumed_uids: list[int], requeue_uids: list[int]
+    ) -> dict[str, float]:
+        """Called by the trainer after each sample.
+
+        consumed_uids: prompts of the groups the step trained on (finished).
+        requeue_uids: prompts of groups the buffer evicted as expired.
+        """
+        for uid in consumed_uids:
+            self._finish_prompt(uid)
+        for uid in requeue_uids:
+            self._requeue_prompt(uid, failed=True)
+        with self._pending_lock:
+            stats = {
+                "async_num_pending_prompts": float(len(self._pending_prompts)),
+                "async_num_requeued_prompts_total": float(self._num_requeued_prompts),
+                "async_num_dropped_prompts_total": float(self._num_dropped_prompts),
+                "async_data_epoch": float(self.current_epoch),
+            }
+            if self._skip_solved:
+                stats["async_num_solved_prompts"] = float(len(self._solved_prompts))
+                stats["async_num_skipped_solved_total"] = float(
+                    self._num_skipped_solved
+                )
+            return stats
+
+    def get_checkpoint_state(self) -> dict[str, Any]:
+        """Dataloader state and collection state, read under one lock.
+
+        Every prompt the dataloader state counts as yielded is then either
+        finished or in pending_prompts. The trainer saves "dataloader_state" as
+        train_dataloader.pt (raw, as upstream) and "collector_state" as
+        collector_state.pt (holds BatchedDataDicts, so it is read back with
+        weights_only=False).
+        """
+        with self._pending_lock:
+            return {
+                "dataloader_state": self.get_dataloader_state(),
+                "collector_state": {
+                    "current_epoch": self.current_epoch,
+                    "epochs_completed": self._epochs_completed,
+                    "solved_prompts": dict(self._solved_prompts),
+                    "pending_prompts": {
+                        uid: self._pending_prompts[uid]
+                        for uid in sorted(self._pending_prompts)
+                    },
+                    "next_prompt_uid": self._next_prompt_uid,
+                },
+            }
+
+    def restore_collection_state(
+        self, state: dict[str, Any], buffered_uids: Optional[list[int]] = None
+    ) -> None:
+        """On resume, restore epochs read, solved prompts and pending prompts.
+
+        state is the collector_state.pt of the checkpoint.
+        buffered_uids: prompt ids of the groups restored into the replay buffer;
+        those prompts stay pending until trained on, every other pending prompt
+        is queued for regeneration first.
+        """
+        buffered = set(buffered_uids or [])
+        with self._pending_lock:
+            self._epochs_completed = int(state.get("epochs_completed", 0))
+            self.current_epoch = int(state.get("current_epoch", 0))
+            self._solved_prompts = {
+                int(idx): int(epoch)
+                for idx, epoch in state.get("solved_prompts", {}).items()
+            }
+            pending = state.get("pending_prompts", {})
+            queued = 0
+            for uid in sorted(pending):
+                uid = int(uid)
+                self._pending_prompts[uid] = pending[uid]
+                if uid not in buffered:
+                    self._retry_uids.append(uid)
+                    queued += 1
+            self._next_prompt_uid = max(
+                int(state.get("next_prompt_uid", 0)),
+                max(self._pending_prompts, default=-1) + 1,
+                self._next_prompt_uid,
+            )
+        print(
+            f"♻️ Restored collection state: {self._epochs_completed} data epochs read, "
+            f"{len(self._solved_prompts)} solved prompts, {len(pending)} pending prompts "
+            f"({queued} queued for regeneration, {len(pending) - queued} in the replay buffer)"
+        )
 
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:
@@ -877,7 +1310,12 @@ class AsyncTrajectoryCollector:
         target_weight_version: int,
         prompt_idx: int,
         filterable: bool = False,
+        prompt_uid: Optional[int] = None,
     ) -> None:
+        # [CUSTOM] What happened to the group: "discarded" (dynamic sampling),
+        # "surplus" (target already full), "pushed", or None (error/shutdown).
+        outcome: Optional[str] = None
+        claim_target: Optional[int] = None
         try:
             # Import here to avoid circular dependency
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
@@ -915,6 +1353,31 @@ class AsyncTrajectoryCollector:
             final_batch_cpu = final_batch.to("cpu")
             del final_batch
 
+            if "total_reward" in final_batch_cpu:
+                raw_rewards = final_batch_cpu["total_reward"]
+                # [CUSTOM] Solved check on the raw rewards, so a correct but
+                # long answer still counts as solved after reward shaping.
+                if self._skip_solved and bool(
+                    (raw_rewards >= self._solved_threshold).all()
+                ):
+                    self._mark_solved(repeated_batch)
+                # [CUSTOM] Reward scaling and shaping (e.g. DAPO's overlong
+                # penalty) as in the sync loop, which applies them before
+                # dynamic sampling; the async path skipped them.
+                grpo_cfg = self.master_config.grpo
+                if grpo_cfg.get("reward_scaling"):
+                    final_batch_cpu = scale_rewards(
+                        final_batch_cpu, grpo_cfg["reward_scaling"]
+                    )
+                shaping_cfg = grpo_cfg.get("reward_shaping")
+                if shaping_cfg and shaping_cfg.get("enabled"):
+                    final_batch_cpu = apply_reward_shaping(final_batch_cpu, shaping_cfg)
+                degeneration_cfg = grpo_cfg.get("degeneration_penalty")
+                if degeneration_cfg and degeneration_cfg["enabled"]:
+                    final_batch_cpu = apply_degeneration_penalty(
+                        final_batch_cpu, degeneration_cfg
+                    )
+
             # [CUSTOM] Dynamic sampling: drop this group instead of pushing it if its
             # rewards are all equal (zero advantage, no training signal) and we're still
             # under the per-target launch cap decided at spawn time (see _process_batch).
@@ -939,13 +1402,22 @@ class AsyncTrajectoryCollector:
                             self._unfiltered_reward_count.get(target_weight_version, 0)
                             + len(reward_values)
                         )
-                    if reward_values and max(reward_values) == min(reward_values):
+                    # As the sync loop (upstream #2478): filter on the reward
+                    # before shaping, so a length penalty alone does not make
+                    # an all-correct (or all-wrong) group look informative.
+                    filter_rewards = final_batch_cpu.get(
+                        "unshaped_total_reward", rewards
+                    )
+                    filter_values = (
+                        filter_rewards.flatten().tolist()
+                        if hasattr(filter_rewards, "flatten")
+                        else list(filter_rewards)
+                    )
+                    if filter_values and max(filter_values) == min(filter_values):
                         discarded = True
                         with self._counter_lock:
                             self._discarded_per_target[target_weight_version] = (
-                                self._discarded_per_target.get(
-                                    target_weight_version, 0
-                                )
+                                self._discarded_per_target.get(target_weight_version, 0)
                                 + 1
                             )
 
@@ -955,7 +1427,41 @@ class AsyncTrajectoryCollector:
                     f"target_weight {target_weight_version}): dynamic sampling will "
                     "relaunch a replacement."
                 )
+                # [CUSTOM] Filtered out: the prompt is done with.
+                outcome = "discarded"
+                self._finish_prompt(prompt_uid)
             else:
+                # [CUSTOM] Reserve the group's place before pushing it. With
+                # groups_multiplier > 1 the target may already have its groups
+                # (surplus); with flexible sampling such a group goes to the
+                # lowest later target that needs one, otherwise it is dropped
+                # and its prompt generated again.
+                claim_target = self._claim_target(
+                    target_weight_version, generation_weight_version
+                )
+                if claim_target is None:
+                    print(
+                        f"♻️ Surplus group dropped (prompt_idx {prompt_idx}, "
+                        f"target_weight {target_weight_version}): target already has its groups"
+                        + (
+                            " and no later target within the age window needs one"
+                            if self._reassign_surplus
+                            else ""
+                        )
+                    )
+                    with self._counter_lock:
+                        self._surplus_per_target[target_weight_version] = (
+                            self._surplus_per_target.get(target_weight_version, 0) + 1
+                        )
+                    outcome = "surplus"
+                    self._requeue_prompt(prompt_uid)
+                elif claim_target != target_weight_version:
+                    print(
+                        f"🔁 Surplus group reassigned (prompt_idx {prompt_idx}): "
+                        f"target_weight {target_weight_version} -> {claim_target}"
+                    )
+
+            if claim_target is not None:
                 # Compute teacher logprobs at collection time (overlapped with async rollouts)
                 if self._has_distillation_teachers and "agent_ref" in final_batch_cpu:
                     agent_refs = final_batch_cpu["agent_ref"]
@@ -982,9 +1488,7 @@ class AsyncTrajectoryCollector:
                         )
                         # Store inside batch dict so from_batches handles
                         # variable-length padding across prompt groups
-                        final_batch_cpu["teacher_reference_logprobs"] = (
-                            teacher_logprobs
-                        )
+                        final_batch_cpu["teacher_reference_logprobs"] = teacher_logprobs
                         rollout_metrics = dict(rollout_metrics)
                         rollout_metrics["teacher_logprob_time"] = teacher_logprob_time
 
@@ -992,6 +1496,7 @@ class AsyncTrajectoryCollector:
                     "batch": final_batch_cpu,
                     "rollout_metrics": rollout_metrics,
                     "timestamp": time.time(),
+                    "prompt_uid": prompt_uid,
                 }
 
                 # Use exponential backoff when buffer is full
@@ -1002,10 +1507,12 @@ class AsyncTrajectoryCollector:
                             self.replay_buffer.add.remote(
                                 trajectory_group,
                                 generation_weight_version,
-                                target_weight_version,
+                                claim_target,
                             )
                         )
                         if status == "success":
+                            outcome = "pushed"
+                            self._release_claim(claim_target)
                             with self._counter_lock:
                                 self._buffered_per_target[target_weight_version] = (
                                     self._buffered_per_target.get(
@@ -1021,7 +1528,7 @@ class AsyncTrajectoryCollector:
                                 )
                             print(
                                 f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, "
-                                f"target_weight {target_weight_version}) "
+                                f"target_weight {claim_target}) "
                                 f"[{buffered_count}/{spawned_count} buffered]"
                             )
                             break
@@ -1043,6 +1550,14 @@ class AsyncTrajectoryCollector:
 
             traceback.print_exc()
         finally:
+            if outcome is None:
+                # [CUSTOM] Error or shutdown: free the claim, if any, and keep the
+                # prompt pending (saved at the next checkpoint); while running
+                # it is generated again, up to max_prompt_retries times.
+                if claim_target is not None:
+                    self._release_claim(claim_target)
+                if self.running:
+                    self._requeue_prompt(prompt_uid, failed=True)
             with self._counter_lock:
                 self._completed_per_target[target_weight_version] = (
                     self._completed_per_target.get(target_weight_version, 0) + 1
