@@ -83,25 +83,41 @@ def load_dataloader_state(
         os.path.join(checkpoint_path, f"train_dataloader{suffix}.pt")
     )
 
-    config_path = os.path.join(checkpoint_path, "config.yaml")
-    if os.path.exists(config_path):
-        with open(config_path) as f:
-            saved_config = yaml.safe_load(f) or {}
-        saved_name = get_train_dataset_name(saved_config.get("data"))
-        current_name = get_train_dataset_name(data_config)
-        if (
-            saved_name is not None
-            and current_name is not None
-            and saved_name != current_name
-        ):
-            print(
-                f"  ⚠ Dataset swap detected: was {saved_name!r}, now {current_name!r}. "
-                f"Skipping dataloader state restore; new dataset starts from index 0.",
-                flush=True,
-            )
-            return
+    if is_dataset_swapped(checkpoint_path, data_config):
+        print(
+            "  ⚠ Dataset swap detected: skipping dataloader state restore; "
+            "new dataset starts from index 0.",
+            flush=True,
+        )
+        return
 
     dataloader.load_state_dict(saved_state)
+
+
+def is_dataset_swapped(checkpoint_path: str, data_config: DataConfig) -> bool:
+    """Whether the checkpoint was trained on a different dataset than data_config.
+
+    Compares the ``dataset_name`` saved in the checkpoint's ``config.yaml`` with
+    the current one; False when either is unknown. load_dataloader_state skips
+    the dataloader restore on a swap, and async GRPO then also restarts its
+    collection state (epochs, solved and pending prompts).
+    """
+    config_path = os.path.join(checkpoint_path, "config.yaml")
+    if not os.path.exists(config_path):
+        return False
+    with open(config_path) as f:
+        saved_config = yaml.safe_load(f) or {}
+    saved_name = get_train_dataset_name(saved_config.get("data"))
+    current_name = get_train_dataset_name(data_config)
+    swapped = (
+        saved_name is not None and current_name is not None and saved_name != current_name
+    )
+    if swapped:
+        print(
+            f"  ⚠ Dataset swap: checkpoint trained on {saved_name!r}, now {current_name!r}.",
+            flush=True,
+        )
+    return swapped
 
 
 # [CUSTOM-DATA-PATH-DIR-EXPANSION 2026-10-21] in the original nemo-RL version,

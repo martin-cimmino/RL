@@ -11,6 +11,7 @@ grpo:
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
+  overlong_length_normalization: false
   advantage_clip_low: null
   advantage_clip_high: null
   max_val_samples: 256
@@ -25,6 +26,12 @@ grpo:
     overlong_buffer_penalty: 1
     max_response_length: ${policy.max_total_sequence_length}
     stop_properly_penalty_coef: null
+  degeneration_penalty:
+    enabled: false
+    logprob_threshold: -10.0
+    window_tokens: 2000
+    min_low_logprob_tokens: 50
+    penalty_reward: -1.0
 
   # Advantage Estimator Configuration
   # Options: "grpo" (default) or "reinforce_plus_plus"
@@ -51,6 +58,11 @@ grpo:
     max_trajectory_age_steps: 1
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
     recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
+    groups_multiplier: 1.0
+    flexible_sampling: false
+    skip_solved_prompts: false
+    solved_reward_threshold: 1.0
+    max_prompt_retries: 3
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
@@ -92,6 +104,7 @@ checkpointing:
   metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
   higher_is_better: true
   keep_top_k: 3
+  keep_steps: null
   save_period: 10
   checkpoint_must_save_by: null
   model_save_format: "safetensors"

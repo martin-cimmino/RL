@@ -63,6 +63,21 @@ grpo:
     max_trajectory_age_steps: 1
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
     recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
+    # [CUSTOM] Launch ceil(needed * groups_multiplier) groups per target and keep
+    # the first ones to pass dynamic sampling (surplus dropped or reassigned).
+    groups_multiplier: 1.0
+    # [CUSTOM] A step may take any group in the age window, oldest first; groups
+    # finishing after their target is full go to a later target.
+    flexible_sampling: false
+    # [CUSTOM] Skip, in later epochs, prompts whose whole group reached
+    # solved_reward_threshold; the run ends when grpo.max_num_epochs are read.
+    skip_solved_prompts: false
+    solved_reward_threshold: 1.0
+    # [CUSTOM] Times a prompt may fail or expire before it is dropped.
+    max_prompt_retries: 3
+    # [CUSTOM] Optional cap on in-flight generations (default:
+    # num_prompts_per_step * max_trajectory_age_steps * groups_multiplier).
+    # max_concurrent_generations: 64
 
 loss_fn:
   reference_policy_kl_penalty: 0.01

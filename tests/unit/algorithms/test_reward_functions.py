@@ -544,6 +544,28 @@ def test_degeneration_penalty_caps_a_rewarded_salad_response():
     assert torch.allclose(result["total_reward"], torch.tensor([-0.5]))
 
 
+def test_degeneration_penalty_keeps_pre_penalty_rewards_for_filtering():
+    batch = create_mock_batch_with_responses(
+        num_samples=2, response_lengths=[300, 300], initial_rewards=[1.0, 1.0]
+    )
+    salad = torch.full((300,), -0.5)
+    salad[100:150] = -15.0
+    _with_generation_logprobs(batch, [torch.full((300,), -0.5), salad])
+    result = apply_degeneration_penalty(batch, _degeneration_cfg())
+    assert torch.allclose(result["total_reward"], torch.tensor([1.0, -1.0]))
+    # Without reward shaping, dynamic sampling still sees the task reward.
+    assert torch.allclose(result["unshaped_total_reward"], torch.tensor([1.0, 1.0]))
+
+    # Saved by reward shaping first: left untouched.
+    batch = create_mock_batch_with_responses(
+        num_samples=1, response_lengths=[300], initial_rewards=[0.5]
+    )
+    batch["unshaped_total_reward"] = torch.tensor([1.0])
+    _with_generation_logprobs(batch, [salad])
+    result = apply_degeneration_penalty(batch, _degeneration_cfg())
+    assert torch.allclose(result["unshaped_total_reward"], torch.tensor([1.0]))
+
+
 def test_degeneration_penalty_disabled_is_a_no_op():
     batch = create_mock_batch_with_responses(
         num_samples=1, response_lengths=[300], initial_rewards=[1.0]

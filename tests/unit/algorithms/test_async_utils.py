@@ -2309,6 +2309,26 @@ class TestReplayBufferFlexibleSampling:
         assert buf.has_complete_batch(2, 2, max_age_steps=2, flexible=True)
         assert not buf.has_complete_batch(2, 3, max_age_steps=2, flexible=True)
 
+    def test_consumed_target_needs_nothing_and_rejects_late_groups(self):
+        buf = ReplayBufferImpl(max_size=10)
+        buf.add(_group(0), weight_version=0, target_weight_version=1)
+        assert buf.sample(1, current_weight_version=1, max_age_steps=1) is not None
+
+        # Target 1 was trained on: late (surplus) groups can no longer use it.
+        assert buf.get_trajectories_needed(1, 1, 1) == 0
+        assert buf.add(_group(1), weight_version=0, target_weight_version=1) == "consumed"
+        assert buf.add(_group(2), weight_version=1, target_weight_version=2) == "success"
+        assert buf.get_prompt_uids() == [2]
+
+    def test_pop_expired_prompt_uids_without_a_full_batch(self):
+        buf = ReplayBufferImpl(max_size=10)
+        buf.add(_group(5), weight_version=0, target_weight_version=1)
+
+        # The group is evicted but no step can be formed.
+        assert buf.sample(1, current_weight_version=3, max_age_steps=2) is None
+        assert buf.pop_expired_prompt_uids() == [5]
+        assert buf.pop_expired_prompt_uids() == []
+
     def test_get_prompt_uids_skips_groups_without_uid(self):
         buf = ReplayBufferImpl(max_size=10)
         buf.add(_group(3), weight_version=0, target_weight_version=0)
@@ -2577,6 +2597,55 @@ class TestCollectorGroupsMultiplier:
         assert list(collector._retry_uids) == [0, 1]
         assert collector._prompt_failures == {}
 
+    def test_launch_prompts_requeues_all_when_round_fails_before_split(self):
+        collector = self.make_collector()
+        collector._get_next_target_for_generation = lambda version: 1
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("buffer RPC failed")
+
+        self.buffer.get_trajectories_needed = boom
+        items = []
+        for i in range(2):
+            uid = self.register(collector, i)
+            items.append((uid, collector._pending_prompts[uid]))
+
+        assert collector._launch_prompts(items) == 0
+        assert list(collector._retry_uids) == [0, 1]
+
+    def test_group_for_consumed_target_is_not_claimed(self):
+        collector = self.make_collector()
+        self.buffer.last_target_weight_already_generated = 1
+
+        uid = self.run_group(collector, [1.0, 0.0], target=1)
+
+        assert self.buffer.size() == 0
+        assert collector._surplus_per_target[1] == 1
+        assert list(collector._retry_uids) == [uid]
+
+    def test_flexible_reassigns_group_of_consumed_target(self):
+        collector = self.make_collector(flexible_sampling=True, max_age=2)
+        self.buffer.last_target_weight_already_generated = 1
+
+        uid = self.run_group(collector, [1.0, 0.0], target=1)
+
+        assert self.buffer.target_weight_versions == [2]
+        assert self.buffer.get_prompt_uids() == [uid]
+
+    def test_target_consumed_between_claim_and_push_requeues(self):
+        collector = self.make_collector()
+        claims = iter([1, None])
+        collector._claim_target = lambda target, gen: next(claims)
+        collector._release_claim = lambda target: None
+        self.buffer.last_target_weight_already_generated = 1
+
+        uid = self.run_group(collector, [1.0, 0.0], target=1)
+
+        assert self.buffer.size() == 0
+        assert collector._surplus_per_target[1] == 1
+        assert list(collector._retry_uids) == [uid]
+        assert collector._prompt_failures == {}
+
     # --- prompt bookkeeping ---------------------------------------------
 
     def test_discarded_group_finishes_its_prompt(self):
@@ -2702,6 +2771,36 @@ class TestCollectorGroupsMultiplier:
         assert restored._solved_prompts == {7: 1}
         assert restored._epochs_completed == 1
         assert restored.current_epoch == 2
+        assert self.register(restored) == 3
+
+    def test_restore_keeps_new_uids_above_buffered_uids(self):
+        collector = self.make_collector()
+        self.register(collector, 0)
+        saved = collector.get_checkpoint_state()["collector_state"]
+        assert saved["next_prompt_uid"] == 1
+
+        # A group registered after the collector snapshot reached the buffer.
+        restored = self.make_collector()
+        restored.restore_collection_state(saved, buffered_uids=[0, 4])
+        assert self.register(restored) == 5
+
+    def test_restore_after_dataset_swap_starts_fresh(self):
+        collector = self.make_collector(skip_solved=True)
+        for i in range(3):
+            self.register(collector, i)
+        collector._epochs_completed = 2
+        collector._solved_prompts = {7: 1}
+        saved = collector.get_checkpoint_state()["collector_state"]
+
+        restored = self.make_collector(skip_solved=True)
+        restored.restore_collection_state(
+            saved, buffered_uids=[2], dataset_swapped=True
+        )
+        assert restored._pending_prompts == {}
+        assert list(restored._retry_uids) == []
+        assert restored._solved_prompts == {}
+        assert restored._epochs_completed == 0
+        # Restored groups keep their uids: new prompts start above them.
         assert self.register(restored) == 3
 
     # --- collection loop, epochs and skip-solved --------------------------

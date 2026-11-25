@@ -1350,20 +1350,31 @@ def test_apply_overlong_filtering_zeroes_truncated_samples(truncated_as_list):
     assert original_multiplier.tolist() == [1.0, 1.0, 0.0, 1.0]
 
 
-def _length_norm_batch(lengths, truncated, loss_multiplier=None):
+def _length_norm_batch(lengths, truncated, loss_multiplier=None, history_tokens=0):
+    def log(n):
+        messages = [{"role": "user", "token_ids": torch.zeros(3, dtype=torch.long)}]
+        if history_tokens:
+            # A few-shot assistant turn from the prompt: not generated.
+            messages += [
+                {"role": "assistant", "token_ids": torch.zeros(history_tokens, dtype=torch.long)},
+                {"role": "user", "token_ids": torch.zeros(3, dtype=torch.long)},
+            ]
+        messages.append(
+            {
+                "role": "assistant",
+                "token_ids": torch.zeros(n, dtype=torch.long),
+                "generation_logprobs": torch.zeros(n),
+            }
+        )
+        return messages
+
     return BatchedDataDict(
         {
             "loss_multiplier": torch.tensor(
                 loss_multiplier if loss_multiplier is not None else [1.0] * len(lengths)
             ),
             "truncated": torch.tensor(truncated, dtype=torch.bool),
-            "message_log": [
-                [
-                    {"role": "user", "token_ids": torch.zeros(3, dtype=torch.long)},
-                    {"role": "assistant", "token_ids": torch.zeros(n, dtype=torch.long)},
-                ]
-                for n in lengths
-            ],
+            "message_log": [log(n) for n in lengths],
         }
     )
 
@@ -1402,6 +1413,15 @@ def test_apply_overlong_length_normalization_all_truncated_uses_all_samples():
     result = apply_overlong_length_normalization(batch)
     # reference = mean of all = 800
     assert torch.allclose(result["loss_multiplier"], torch.tensor([1.0, 800 / 1200]))
+
+
+def test_apply_overlong_length_normalization_ignores_prompt_history():
+    # 1000 history tokens must not count: 100 finished vs 1000 truncated -> 0.1
+    batch = _length_norm_batch(
+        lengths=[100, 1000], truncated=[False, True], history_tokens=1000
+    )
+    result = apply_overlong_length_normalization(batch)
+    assert torch.allclose(result["loss_multiplier"], torch.tensor([1.0, 0.1]))
 
 
 def _assistant_log(token_ids):

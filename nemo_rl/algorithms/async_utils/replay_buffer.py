@@ -58,8 +58,16 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             trajectory: data dict
             weight_version: version of the model weights used for generation
             target_weight_version: version of the model weights this trajectory is intended for training
+
+        Returns:
+            "success", "full" (retry later) or "consumed" ([CUSTOM] the target
+            was already trained on).
         """
         with self._lock:
+            # [CUSTOM] A target already trained on can never use the group
+            # (strict sampling); the caller reassigns or requeues it.
+            if target_weight_version <= self.last_target_weight_already_generated:
+                return "consumed"
             if len(self.trajectories) >= self.max_size:
                 return "full"
 
@@ -264,6 +272,18 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 "expired_dropped_total": self.expired_dropped,
                 "expired_prompt_uids": expired_prompt_uids,
             }
+
+    def pop_expired_prompt_uids(self) -> list[int]:
+        """[CUSTOM] Hand back the prompt ids of groups evicted as expired.
+
+        sample() returns them with a full batch; the trainer calls this when
+        sample() returns None, so evicted prompts are regenerated even when no
+        step can be formed (e.g. at the end of the data).
+        """
+        with self._lock:
+            uids = self.expired_prompt_uids
+            self.expired_prompt_uids = []
+            return uids
 
     def get_prompt_uids(self) -> list[int]:
         """[CUSTOM] Prompt ids of the buffered groups (restored or not)."""
@@ -531,8 +551,14 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         num_prompts_per_step: int,
         max_age_steps: int | None = None,
     ) -> int:
-        """Return additional trajectories needed for ``target_step``."""
+        """Return additional trajectories needed for ``target_step``.
+
+        [CUSTOM] 0 once the target has been trained on, so that late groups
+        (groups_multiplier surplus) are not claimed for it.
+        """
         with self._lock:
+            if target_step <= self.last_target_weight_already_generated:
+                return 0
             current_count = self._count_for_target(target_step, max_age_steps)
             return max(0, num_prompts_per_step - current_count)
 

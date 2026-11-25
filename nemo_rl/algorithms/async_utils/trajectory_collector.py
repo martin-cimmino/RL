@@ -608,7 +608,9 @@ class AsyncTrajectoryCollector:
         Returns the number of workers started.
         """
         target_weight: Optional[int] = None
-        to_launch: list[tuple[int, BatchedDataDict[DatumSpec]]] = []
+        # Until the round is split, every item counts as unlaunched, so an
+        # error before the split (target choice, buffer RPC) requeues them all.
+        to_launch: list[tuple[int, BatchedDataDict[DatumSpec]]] = list(items)
         started = 0
         try:
             generation_weight_version = self.current_weight_version
@@ -1102,24 +1104,35 @@ class AsyncTrajectoryCollector:
             }
 
     def restore_collection_state(
-        self, state: dict[str, Any], buffered_uids: Optional[list[int]] = None
+        self,
+        state: dict[str, Any],
+        buffered_uids: Optional[list[int]] = None,
+        dataset_swapped: bool = False,
     ) -> None:
         """On resume, restore epochs read, solved prompts and pending prompts.
 
         state is the collector_state.pt of the checkpoint.
-        buffered_uids: prompt ids of the groups restored into the replay buffer;
-        those prompts stay pending until trained on, every other pending prompt
-        is queued for regeneration first.
+        buffered_uids: prompt ids of the groups in the replay buffer, which the
+        trainer restores from replay_buffer.pt before calling this. Those
+        prompts stay pending until trained on; every other pending prompt (in
+        flight or queued at the checkpoint) is queued for regeneration first.
+        dataset_swapped: the checkpoint was trained on another dataset (see
+        nemo_rl.data.utils.is_dataset_swapped). The dataloader then restarts at
+        index 0, so epochs, solved and pending prompts start fresh too.
+
+        New prompt uids always start above every saved and buffered uid, so a
+        restored group can never share its uid with a new prompt.
         """
-        buffered = set(buffered_uids or [])
+        buffered = {int(uid) for uid in (buffered_uids or [])}
+        pending = {} if dataset_swapped else state.get("pending_prompts", {})
         with self._pending_lock:
-            self._epochs_completed = int(state.get("epochs_completed", 0))
-            self.current_epoch = int(state.get("current_epoch", 0))
-            self._solved_prompts = {
-                int(idx): int(epoch)
-                for idx, epoch in state.get("solved_prompts", {}).items()
-            }
-            pending = state.get("pending_prompts", {})
+            if not dataset_swapped:
+                self._epochs_completed = int(state.get("epochs_completed", 0))
+                self.current_epoch = int(state.get("current_epoch", 0))
+                self._solved_prompts = {
+                    int(idx): int(epoch)
+                    for idx, epoch in state.get("solved_prompts", {}).items()
+                }
             queued = 0
             for uid in sorted(pending):
                 uid = int(uid)
@@ -1130,8 +1143,16 @@ class AsyncTrajectoryCollector:
             self._next_prompt_uid = max(
                 int(state.get("next_prompt_uid", 0)),
                 max(self._pending_prompts, default=-1) + 1,
+                max(buffered, default=-1) + 1,
                 self._next_prompt_uid,
             )
+        if dataset_swapped:
+            print(
+                "♻️ Dataset swapped: collection state not restored (epochs, solved "
+                f"and pending prompts start fresh); {len(buffered)} restored groups "
+                "in the replay buffer are still trained on."
+            )
+            return
         print(
             f"♻️ Restored collection state: {self._epochs_completed} data epochs read, "
             f"{len(self._solved_prompts)} solved prompts, {len(pending)} pending prompts "
@@ -1532,6 +1553,30 @@ class AsyncTrajectoryCollector:
                                 f"[{buffered_count}/{spawned_count} buffered]"
                             )
                             break
+                        elif status == "consumed":
+                            # [CUSTOM] The target was trained on between the
+                            # claim and the push: claim a target again (a later
+                            # one with flexible sampling), else requeue.
+                            self._release_claim(claim_target)
+                            claim_target = self._claim_target(
+                                target_weight_version, generation_weight_version
+                            )
+                            if claim_target is None:
+                                print(
+                                    f"♻️ Late group dropped (prompt_idx {prompt_idx}, "
+                                    f"target_weight {target_weight_version}): target "
+                                    "already trained on"
+                                )
+                                with self._counter_lock:
+                                    self._surplus_per_target[target_weight_version] = (
+                                        self._surplus_per_target.get(
+                                            target_weight_version, 0
+                                        )
+                                        + 1
+                                    )
+                                outcome = "surplus"
+                                self._requeue_prompt(prompt_uid)
+                                break
                         elif status == "full":
                             # Exponential backoff up to 0.5 second
                             time.sleep(min(backoff_delay, 0.5))

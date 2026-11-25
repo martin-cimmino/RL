@@ -63,7 +63,11 @@ from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, VLMMessageLogT
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
 )
-from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
+from nemo_rl.data.utils import (
+    extract_necessary_env_names,
+    is_dataset_swapped,
+    load_dataloader_state,
+)
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
@@ -1573,7 +1577,7 @@ def apply_overlong_length_normalization(
 
     Args:
         repeated_batch: Rollout batch with "loss_multiplier", "truncated" and
-            "message_log".
+            "message_log" (generated messages carry "generation_logprobs").
 
     Returns:
         The same batch with "loss_multiplier" replaced by the scaled copy.
@@ -1586,9 +1590,16 @@ def apply_overlong_length_normalization(
     if not truncated.any():
         return repeated_batch
 
+    # Only generated tokens count: assistant turns from the prompt history
+    # carry no generation_logprobs and are masked out of the loss (see
+    # add_grpo_token_loss_masks_and_generation_logprobs, which runs after this).
     lengths = torch.tensor(
         [
-            sum(len(m["token_ids"]) for m in log if m["role"] == "assistant")
+            sum(
+                len(m["token_ids"])
+                for m in log
+                if m["role"] == "assistant" and "generation_logprobs" in m
+            )
             for log in repeated_batch["message_log"]
         ],
         dtype=torch.float32,
@@ -3763,6 +3774,9 @@ def async_grpo_train(
     data_finished = False
     end_of_data = False
     last_saved_step = step
+    # [CUSTOM] Last step validated, so the end of the data validates the steps
+    # trained since, independently of whether they still need a checkpoint.
+    last_validated_step = step
     print(
         f"📐 Async GRPO runs {max_num_epochs} data epochs"
         + (" (skipping solved prompts)" if skip_solved else "")
@@ -3895,10 +3909,16 @@ def async_grpo_train(
     if last_checkpoint_path is not None:
         collector_state_path = os.path.join(last_checkpoint_path, "collector_state.pt")
         if os.path.exists(collector_state_path):
+            # A dataset swap restarts the dataloader at index 0 (see
+            # load_dataloader_state), so the epochs, solved and pending
+            # prompts of the old dataset are not restored either.
             ray.get(
                 trajectory_collector.restore_collection_state.remote(
                     torch.load(collector_state_path, weights_only=False),
                     ray.get(replay_buffer.get_prompt_uids.remote()),
+                    dataset_swapped=is_dataset_swapped(
+                        last_checkpoint_path, master_config.data
+                    ),
                 )
             )
         else:
@@ -4029,7 +4049,8 @@ def async_grpo_train(
     # used-up data while waiting for a step that will never fill can still
     # validate and save its last steps.
     def run_validation(completed_steps: int) -> Optional[dict[str, Any]]:
-        nonlocal POLICY_GENERATION_STALE
+        nonlocal POLICY_GENERATION_STALE, last_validated_step
+        last_validated_step = completed_steps
         # Pause trajectory collection during validation to reduce memory pressure
         trajectory_collector.pause.remote()
 
@@ -4133,6 +4154,13 @@ def async_grpo_train(
                 tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
                 checkpointing_cfg=master_config.checkpointing,
             )
+            # [CUSTOM] Snapshot the replay buffer before the collector: the
+            # collector keeps running, so a group pushed in between would
+            # otherwise be saved with a prompt uid the collector state does
+            # not know. In this order every buffered uid is in the collector
+            # snapshot (a group pushed in between is only regenerated).
+            print("📦 Saving replay buffer state...")
+            replay_buffer_state = ray.get(replay_buffer.state_dict.remote())
             # Dataloader and collection state from the trajectory collector,
             # read together: every prompt the dataloader state counts as
             # yielded is then finished, pending or in the replay buffer.
@@ -4147,8 +4175,6 @@ def async_grpo_train(
                 collector_state["collector_state"],
                 os.path.join(checkpoint_path, "collector_state.pt"),
             )
-            print("📦 Saving replay buffer state...")
-            replay_buffer_state = ray.get(replay_buffer.state_dict.remote())
             torch.save(
                 replay_buffer_state,
                 os.path.join(checkpoint_path, "replay_buffer.pt"),
@@ -4200,6 +4226,18 @@ def async_grpo_train(
                         print(
                             "⏳ Buffer empty or not enough groups to form a full step, waiting..."
                         )
+                        # [CUSTOM] sample() may have evicted expired groups
+                        # without forming a step: requeue their prompts before
+                        # checking for the end of the data.
+                        expired_uids = ray.get(
+                            replay_buffer.pop_expired_prompt_uids.remote()
+                        )
+                        if expired_uids:
+                            ray.get(
+                                trajectory_collector.update_prompt_status.remote(
+                                    [], expired_uids
+                                )
+                            )
                         if ray.get(trajectory_collector.is_finished.remote()):
                             print(
                                 "🏁 All data epochs are done and the remaining groups "
@@ -4866,11 +4904,16 @@ def async_grpo_train(
                 )
                 return
 
-        # [CUSTOM] The data ran out while waiting for a step: validate and save
-        # the steps trained since the last checkpoint.
-        if data_finished and step > last_saved_step:
-            final_val_metrics = run_validation(step) if val_at_end else None
-            if master_config.checkpointing["enabled"]:
+        # [CUSTOM] The data ran out while waiting for a step: validate the
+        # steps trained since the last validation and save those trained since
+        # the last checkpoint.
+        if data_finished:
+            final_val_metrics = (
+                run_validation(step)
+                if val_at_end and step > last_validated_step
+                else None
+            )
+            if master_config.checkpointing["enabled"] and step > last_saved_step:
                 save_checkpoint(step, None, final_val_metrics)
         if data_finished:
             print(

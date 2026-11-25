@@ -247,6 +247,10 @@ def apply_degeneration_penalty(
     assert len(batch["message_log"]) == len(rewards), (
         "The number of messages in the batch must match the number of rewards"
     )
+    # Dynamic sampling filters on the task reward, as with reward shaping
+    # (which saves it first when enabled): keep the pre-penalty rewards.
+    if "unshaped_total_reward" not in batch:
+        batch["unshaped_total_reward"] = rewards.clone()
     flagged = torch.zeros_like(rewards, dtype=torch.bool)
     for i, message_log in enumerate(batch["message_log"]):
         logprobs = [
