@@ -247,25 +247,11 @@ The validation set you pass in will directly be used for validation with no addi
         )
     # Check if async mode is enabled
     elif "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
-        # [CUSTOM] Async GRPO does not support reward scaling or reward shaping (DAPO
-        # features). Dynamic sampling IS supported: the AsyncTrajectoryCollector drops
-        # zero-advantage (all-equal-reward) groups before they reach the replay buffer and
-        # relies on the collector's existing gap-filling retry to relaunch a replacement (see
-        # nemo_rl/algorithms/async_utils/trajectory_collector.py). Not implemented upstream at
-        # all (checked v0.7.0 and current upstream main).
-        unsupported_features = [
-            "reward_scaling",
-            "reward_shaping",
-        ]
-
-        for feature in unsupported_features:
-            if feature not in config.grpo:
-                continue
-
-            if config.grpo[feature]["enabled"]:
-                raise NotImplementedError(
-                    f"{feature} is not supported with async GRPO"
-                )
+        # [CUSTOM] Dynamic sampling is supported: the AsyncTrajectoryCollector drops
+        # zero-advantage (all-equal-reward) groups before they reach the replay buffer
+        # (see nemo_rl/algorithms/async_utils/trajectory_collector.py).
+        # [CUSTOM] Reward scaling and shaping are applied by the trajectory
+        # collector to each group before dynamic sampling, as in the sync loop.
 
         # Async GRPO does not support multiple dataloaders
         if config.data["use_multiple_dataloader"]:

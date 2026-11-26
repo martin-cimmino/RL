@@ -34,6 +34,7 @@ from nemo_rl.algorithms.grpo import (
     _should_use_async_rollouts,
     aggregate_rollout_metrics,
     apply_overlong_filtering,
+    apply_overlong_length_normalization,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
@@ -572,7 +573,9 @@ class StubReplayBuffer:
     def sample(self):
         """Return a mock that returns sample result when .remote() is called"""
 
-        def _sample(num_prompt_groups, current_weight_version, max_age_steps):
+        def _sample(
+            num_prompt_groups, current_weight_version, max_age_steps, flexible=False
+        ):
             # Return proper trajectory structure expected by async GRPO
             trajectories = [
                 {
@@ -584,6 +587,10 @@ class StubReplayBuffer:
             return {
                 "trajectories": trajectories,
                 "avg_trajectory_age": 0.5,
+                "target_weight_versions": [current_weight_version]
+                * num_prompt_groups,
+                "expired_dropped_total": 0,
+                "expired_prompt_uids": [],
             }
 
         mock = MagicMock()
@@ -656,9 +663,17 @@ class StubReplayBuffer:
         """Return a mock that reports whether the current step can train."""
         mock = MagicMock()
         mock.remote = MagicMock(
-            side_effect=lambda _target_step, num_prompts_per_step, *_args: self._size
-            >= num_prompts_per_step
+            side_effect=lambda _target_step, num_prompts_per_step, *_args, **_kwargs: (
+                self._size >= num_prompts_per_step
+            )
         )
+        return mock
+
+    @property
+    def get_prompt_uids(self):
+        """Prompt ids of the buffered groups - none in these tests."""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=[])
         return mock
 
 
@@ -713,6 +728,36 @@ class StubAsyncTrajectoryCollector:
     @property
     def stop(self):
         """Stop collection - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
+        return mock
+
+    @property
+    def update_prompt_status(self):
+        """Prompt bookkeeping after a step - {} (no metrics) like the real one without skip_solved_prompts"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={})
+        return mock
+
+    @property
+    def is_finished(self):
+        """Whether the dataloader is used up - never in these tests"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=False)
+        return mock
+
+    @property
+    def get_checkpoint_state(self):
+        """Dataloader + collection state for a checkpoint - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(
+            return_value={"dataloader_state": {}, "collector_state": {}}
+        )
+        return mock
+
+    @property
+    def restore_collection_state(self):
+        """Collection state restored on resume - returns a remote-callable mock"""
         mock = MagicMock()
         mock.remote = MagicMock(return_value=MagicMock())
         return mock
@@ -1305,6 +1350,80 @@ def test_apply_overlong_filtering_zeroes_truncated_samples(truncated_as_list):
     assert original_multiplier.tolist() == [1.0, 1.0, 0.0, 1.0]
 
 
+def _length_norm_batch(lengths, truncated, loss_multiplier=None, history_tokens=0):
+    def log(n):
+        messages = [{"role": "user", "token_ids": torch.zeros(3, dtype=torch.long)}]
+        if history_tokens:
+            # A few-shot assistant turn from the prompt: not generated.
+            messages += [
+                {"role": "assistant", "token_ids": torch.zeros(history_tokens, dtype=torch.long)},
+                {"role": "user", "token_ids": torch.zeros(3, dtype=torch.long)},
+            ]
+        messages.append(
+            {
+                "role": "assistant",
+                "token_ids": torch.zeros(n, dtype=torch.long),
+                "generation_logprobs": torch.zeros(n),
+            }
+        )
+        return messages
+
+    return BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor(
+                loss_multiplier if loss_multiplier is not None else [1.0] * len(lengths)
+            ),
+            "truncated": torch.tensor(truncated, dtype=torch.bool),
+            "message_log": [log(n) for n in lengths],
+        }
+    )
+
+
+def test_apply_overlong_length_normalization_scales_truncated_to_mean_finished():
+    # finished samples average 200 tokens; truncated ones are 1000 and 100 long
+    batch = _length_norm_batch(
+        lengths=[100, 300, 1000, 100], truncated=[False, False, True, True]
+    )
+    original = batch["loss_multiplier"].clone()
+
+    result = apply_overlong_length_normalization(batch)
+
+    # 1000 -> 200/1000; a truncated sample shorter than the reference keeps 1
+    assert torch.allclose(result["loss_multiplier"], torch.tensor([1.0, 1.0, 0.2, 1.0]))
+    # the token-weighted size of the long truncated sample equals the reference
+    assert result["loss_multiplier"][2].item() * 1000 == pytest.approx(200)
+    assert torch.equal(batch["loss_multiplier"], result["loss_multiplier"])
+    assert original.tolist() == [1.0, 1.0, 1.0, 1.0]
+
+
+def test_apply_overlong_length_normalization_keeps_existing_masks_and_no_truncation():
+    batch = _length_norm_batch(
+        lengths=[100, 300, 1000], truncated=[False, False, True], loss_multiplier=[1.0, 0.0, 0.0]
+    )
+    result = apply_overlong_length_normalization(batch)
+    # an already-masked sample stays masked
+    assert result["loss_multiplier"].tolist() == [1.0, 0.0, 0.0]
+
+    untouched = _length_norm_batch(lengths=[100, 300], truncated=[False, False])
+    assert apply_overlong_length_normalization(untouched)["loss_multiplier"].tolist() == [1.0, 1.0]
+
+
+def test_apply_overlong_length_normalization_all_truncated_uses_all_samples():
+    batch = _length_norm_batch(lengths=[400, 1200], truncated=[True, True])
+    result = apply_overlong_length_normalization(batch)
+    # reference = mean of all = 800
+    assert torch.allclose(result["loss_multiplier"], torch.tensor([1.0, 800 / 1200]))
+
+
+def test_apply_overlong_length_normalization_ignores_prompt_history():
+    # 1000 history tokens must not count: 100 finished vs 1000 truncated -> 0.1
+    batch = _length_norm_batch(
+        lengths=[100, 1000], truncated=[False, True], history_tokens=1000
+    )
+    result = apply_overlong_length_normalization(batch)
+    assert torch.allclose(result["loss_multiplier"], torch.tensor([1.0, 0.1]))
+
+
 def _assistant_log(token_ids):
     return [
         {"role": "user", "token_ids": torch.tensor([1, 2, 3])},
@@ -1471,6 +1590,8 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
                     "role": "assistant",
                     "content": f"response_{i}",
                     "token_ids": torch.arange(length, dtype=torch.long),
+                    # [CUSTOM] reward shaping counts only generated turns
+                    "generation_logprobs": torch.zeros(length),
                 },
             ]
         )

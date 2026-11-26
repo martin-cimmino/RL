@@ -1109,6 +1109,7 @@ class TestAsyncTrajectoryCollector:
                 "max_total_sequence_length": 512,
                 "make_sequence_length_divisible_by": 1,
             },
+            "env": {},
         }
         return MasterConfig.model_construct(**config)
 
@@ -1361,67 +1362,80 @@ class TestAsyncTrajectoryCollector:
         assert target_weight not in collector._generating_targets
         assert collector._generation_limit_cleared.is_set()
 
-    def _run_collection_loop(self, monkeypatch, batches, pause_answers, process_answers):
-        """Run _collection_loop synchronously with scripted pause / process answers."""
-        collector = self.create_local_collector()
-        collector.running = True
-        pause_answers = list(pause_answers)
-        process_answers = list(process_answers)
-        processed, waits = [], []
+    class _RecordingEvent:
+        def __init__(self, waits):
+            self.cleared = 0
+            self.waits = waits
 
-        def should_pause():
-            return pause_answers.pop(0) if pause_answers else False
+        def clear(self):
+            self.cleared += 1
 
-        def process_batch(batch):
-            processed.append(batch)
-            used = process_answers.pop(0) if process_answers else True
-            return used
+        def set(self):
+            pass
 
-        class RecordingEvent:
-            def __init__(self):
-                self.cleared = 0
+        def is_set(self):
+            return False
 
-            def clear(self):
-                self.cleared += 1
-
-            def set(self):
-                pass
-
-            def is_set(self):
-                return False
-
-            def wait(self, timeout=None):
-                waits.append(timeout)
-                return True
-
-        collector._should_pause_for_generation_limits = should_pause
-        collector._process_batch = process_batch
-        collector._generation_limit_cleared = RecordingEvent()
-        monkeypatch.setattr(trajectory_collector_mod.time, "sleep", lambda s: None)
-        collector.dataloader = iter(batches)
-        collector._collection_loop()
-        return processed, waits, collector._generation_limit_cleared.cleared
+        def wait(self, timeout=None):
+            self.waits.append(timeout)
+            return True
 
     def test_collection_loop_keeps_batch_when_no_target(self, monkeypatch):
-        """'No targets need generation' must not drop the batch (job 63861875 dropped 478)."""
-        processed, _, _ = self._run_collection_loop(
-            monkeypatch, ["b1", "b2"], pause_answers=[], process_answers=[False, True, True]
-        )
-        assert processed == ["b1", "b1", "b2"]
+        """'No targets need generation' must not drop the batch (job 63861875 dropped 478).
 
-    def test_collection_loop_pauses_every_time_and_holds_batch(self, monkeypatch):
+        [CUSTOM] The prompts go back to the retry queue and are launched first
+        on the next pass, before the next batch is read.
+        """
+        collector = self.create_local_collector()
+        collector.running = True
+        collector.master_config.grpo["max_num_epochs"] = 1
+        collector._max_data_epochs = 1
+        launched = []
+        answers = [False, True, True]
+
+        def launch(items):
+            launched.append(
+                [int(collector._pending_prompts[uid]["idx"][0]) for uid, _ in items]
+            )
+            if answers.pop(0):
+                return len(items)
+            collector._requeue_prompts(items)  # no target: kept
+            return 0
+
+        def stop_when_done(_seconds):
+            if not answers:
+                collector.running = False
+
+        def batch(idxs):
+            return BatchedDataDict(
+                {
+                    "idx": torch.tensor(idxs),
+                    "message_log": [[{"role": "user", "content": "x"}] for _ in idxs],
+                }
+            )
+
+        collector._launch_prompts = launch
+        collector._wait_until_can_launch = lambda: collector.running
+        collector.dataloader = [batch([0, 1]), batch([2, 3])]
+        monkeypatch.setattr(trajectory_collector_mod.time, "sleep", stop_when_done)
+        collector._collection_loop()
+
+        assert launched == [[0, 1], [0, 1], [2, 3]]
+
+    def test_wait_until_can_launch_pauses_every_time(self):
         """Every pause clears the event and waits (with a timeout), even twice in one version."""
-        processed, waits, cleared = self._run_collection_loop(
-            monkeypatch,
-            ["b1", "b2"],
-            # b1: paused (check, re-check), paused again (check, re-check), then free;
-            # b2: free
-            pause_answers=[True, True, True, True, False, False],
-            process_answers=[True, True],
-        )
-        assert processed == ["b1", "b2"]
-        assert cleared == 2
+        collector = self.create_local_collector()
+        collector.running = True
+        # paused (check, re-check), paused again (check, re-check), then free
+        pause_answers = [True, True, True, True, False]
+        waits = []
+        collector._should_pause_for_generation_limits = lambda: pause_answers.pop(0)
+        collector._generation_limit_cleared = self._RecordingEvent(waits)
+
+        assert collector._wait_until_can_launch()
+        assert collector._generation_limit_cleared.cleared == 2
         assert waits == [trajectory_collector_mod._GENERATION_LIMIT_RECHECK_S] * 2
+        assert pause_answers == []
 
     def test_process_batch_releases_target_when_worker_start_fails(self, monkeypatch):
         """Test start failures do not leave a target reserved forever."""
@@ -1584,16 +1598,26 @@ class TestAsyncTrajectoryCollector:
         collector.master_config = master_config
         collector._use_dynamic_sampling = True
         collector.running = True
-        collector._spawning_targets.add(5)  # isolate from _maybe_release_target's cleanup
+        collector._spawning_targets.add(
+            5
+        )  # isolate from _maybe_release_target's cleanup
 
         added = []
 
         class FakeReplayBuffer:
             class add:
                 @staticmethod
-                def remote(trajectory_group, generation_weight_version, target_weight_version):
+                def remote(
+                    trajectory_group, generation_weight_version, target_weight_version
+                ):
                     added.append(target_weight_version)
                     return "success"
+
+            # [CUSTOM] The worker claims a place for the group before pushing it.
+            class get_trajectories_needed:
+                @staticmethod
+                def remote(*args, **kwargs):
+                    return 1
 
         collector.replay_buffer = FakeReplayBuffer()
         monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
@@ -1630,9 +1654,17 @@ class TestAsyncTrajectoryCollector:
         class FakeReplayBuffer:
             class add:
                 @staticmethod
-                def remote(trajectory_group, generation_weight_version, target_weight_version):
+                def remote(
+                    trajectory_group, generation_weight_version, target_weight_version
+                ):
                     added.append(target_weight_version)
                     return "success"
+
+            # [CUSTOM] The worker claims a place for the group before pushing it.
+            class get_trajectories_needed:
+                @staticmethod
+                def remote(*args, **kwargs):
+                    return 1
 
         collector.replay_buffer = FakeReplayBuffer()
         monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
@@ -1667,9 +1699,17 @@ class TestAsyncTrajectoryCollector:
         class FakeReplayBuffer:
             class add:
                 @staticmethod
-                def remote(trajectory_group, generation_weight_version, target_weight_version):
+                def remote(
+                    trajectory_group, generation_weight_version, target_weight_version
+                ):
                     added.append(target_weight_version)
                     return "success"
+
+            # [CUSTOM] The worker claims a place for the group before pushing it.
+            class get_trajectories_needed:
+                @staticmethod
+                def remote(*args, **kwargs):
+                    return 1
 
         collector.replay_buffer = FakeReplayBuffer()
         monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
@@ -1832,6 +1872,7 @@ class TestAsyncUtilsIntegration:
                 "max_total_sequence_length": 512,
                 "make_sequence_length_divisible_by": 1,
             },
+            "env": {},
         }
         return MasterConfig.model_construct(**config)
 
@@ -2197,3 +2238,691 @@ class TestPromptExtraction:
         )
         assert torch.equal(message_log[1]["token_loss_mask"], torch.tensor([0, 0]))
         assert torch.equal(message_log[2]["token_loss_mask"], torch.tensor([1, 1]))
+
+
+# ---------------------------------------------------------------------------
+# [CUSTOM] groups_multiplier, flexible sampling, prompt bookkeeping, data
+# epochs, skip-solved prompts and reward shaping in the async collector.
+# ---------------------------------------------------------------------------
+
+
+def _group(uid):
+    return {"batch": {"data": f"group_{uid}"}, "rollout_metrics": {}, "prompt_uid": uid}
+
+
+class TestReplayBufferFlexibleSampling:
+    def test_strict_waits_for_exact_target_flexible_takes_later_targets(self):
+        buf = ReplayBufferImpl(max_size=10)
+        buf.add(_group(0), weight_version=0, target_weight_version=2)
+        buf.add(_group(1), weight_version=0, target_weight_version=2)
+
+        assert buf.sample(2, current_weight_version=1, max_age_steps=2) is None
+        result = buf.sample(2, current_weight_version=1, max_age_steps=2, flexible=True)
+        assert [t["prompt_uid"] for t in result["trajectories"]] == [0, 1]
+        assert result["target_weight_versions"] == [2, 2]
+        assert buf.size() == 0
+
+    def test_flexible_takes_oldest_generation_first(self):
+        buf = ReplayBufferImpl(max_size=10)
+        buf.add(_group(0), weight_version=1, target_weight_version=2)
+        buf.add(_group(1), weight_version=0, target_weight_version=2)
+        buf.add(_group(2), weight_version=1, target_weight_version=3)
+
+        result = buf.sample(2, current_weight_version=2, max_age_steps=2, flexible=True)
+        assert [t["prompt_uid"] for t in result["trajectories"]] == [1, 0]
+        assert buf.get_prompt_uids() == [2]
+
+    def test_flexible_waits_when_short_and_ignores_newer_generations(self):
+        buf = ReplayBufferImpl(max_size=10)
+        buf.add(_group(0), weight_version=2, target_weight_version=3)
+        # Generated with weights newer than the step: not usable for step 2.
+        buf.add(_group(1), weight_version=3, target_weight_version=4)
+
+        assert (
+            buf.sample(2, current_weight_version=2, max_age_steps=2, flexible=True)
+            is None
+        )
+        assert buf.size() == 2
+
+    def test_eviction_hands_back_expired_prompt_uids_once(self):
+        buf = ReplayBufferImpl(max_size=10)
+        buf.add(_group(5), weight_version=0, target_weight_version=1)
+        buf.add(_group(6), weight_version=3, target_weight_version=3)
+        buf.add(_group(7), weight_version=3, target_weight_version=3)
+
+        result = buf.sample(2, current_weight_version=3, max_age_steps=2)
+        assert result["expired_prompt_uids"] == [5]
+        assert result["expired_dropped_total"] == 1
+
+        buf.add(_group(8), weight_version=3, target_weight_version=4)
+        result = buf.sample(1, current_weight_version=4, max_age_steps=2)
+        assert result["expired_prompt_uids"] == []
+        assert result["expired_dropped_total"] == 1
+
+    def test_has_complete_batch_flexible_counts_any_valid_group(self):
+        buf = ReplayBufferImpl(max_size=10)
+        buf.add(_group(0), weight_version=1, target_weight_version=2)
+        buf.add(_group(1), weight_version=1, target_weight_version=3)
+        buf.add(_group(2), weight_version=5, target_weight_version=6)
+
+        assert not buf.has_complete_batch(2, 2, max_age_steps=2)
+        assert buf.has_complete_batch(2, 2, max_age_steps=2, flexible=True)
+        assert not buf.has_complete_batch(2, 3, max_age_steps=2, flexible=True)
+
+    def test_consumed_target_needs_nothing_and_rejects_late_groups(self):
+        buf = ReplayBufferImpl(max_size=10)
+        buf.add(_group(0), weight_version=0, target_weight_version=1)
+        assert buf.sample(1, current_weight_version=1, max_age_steps=1) is not None
+
+        # Target 1 was trained on: late (surplus) groups can no longer use it.
+        assert buf.get_trajectories_needed(1, 1, 1) == 0
+        assert buf.add(_group(1), weight_version=0, target_weight_version=1) == "consumed"
+        assert buf.add(_group(2), weight_version=1, target_weight_version=2) == "success"
+        assert buf.get_prompt_uids() == [2]
+
+    def test_pop_expired_prompt_uids_without_a_full_batch(self):
+        buf = ReplayBufferImpl(max_size=10)
+        buf.add(_group(5), weight_version=0, target_weight_version=1)
+
+        # The group is evicted but no step can be formed.
+        assert buf.sample(1, current_weight_version=3, max_age_steps=2) is None
+        assert buf.pop_expired_prompt_uids() == [5]
+        assert buf.pop_expired_prompt_uids() == []
+
+    def test_get_prompt_uids_skips_groups_without_uid(self):
+        buf = ReplayBufferImpl(max_size=10)
+        buf.add(_group(3), weight_version=0, target_weight_version=0)
+        buf.add({"batch": {}, "rollout_metrics": {}}, 0, 0)
+        assert buf.get_prompt_uids() == [3]
+
+
+class _RemoteAdapter:
+    """Expose a local object's methods as Ray-style `.method.remote(...)` calls."""
+
+    def __init__(self, impl):
+        self._impl = impl
+
+    def __getattr__(self, name):
+        method = getattr(self._impl, name)
+
+        class _Method:
+            @staticmethod
+            def remote(*args, **kwargs):
+                return method(*args, **kwargs)
+
+        return _Method
+
+
+def _prompt(idx: int) -> BatchedDataDict:
+    return BatchedDataDict(
+        {
+            "idx": torch.tensor([idx]),
+            "message_log": [[{"role": "user", "content": f"prompt {idx}"}]],
+            "task_name": ["test"],
+            "extra_env_info": [{}],
+            "loss_multiplier": torch.ones(1),
+        }
+    )
+
+
+def _prompts_batch(idxs: list[int]) -> BatchedDataDict:
+    return BatchedDataDict(
+        {
+            "idx": torch.tensor(idxs),
+            "message_log": [[{"role": "user", "content": f"prompt {i}"}] for i in idxs],
+            "task_name": ["test"] * len(idxs),
+            "extra_env_info": [{} for _ in idxs],
+            "loss_multiplier": torch.ones(len(idxs)),
+        }
+    )
+
+
+class TestCollectorGroupsMultiplier:
+    """Collector-level tests on a local (non-Ray) collector and buffer."""
+
+    @pytest.fixture(autouse=True)
+    def _identity_ray_get(self, monkeypatch):
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda v: v)
+        self.monkeypatch = monkeypatch
+
+    def make_collector(
+        self,
+        num_prompts_per_step: int = 2,
+        groups_multiplier: float = 1.0,
+        flexible_sampling: bool = False,
+        max_age: int = 1,
+        max_prompt_retries: int = 3,
+        skip_solved: bool = False,
+        max_num_epochs=None,
+        use_dynamic_sampling: bool = False,
+        grpo_extra=None,
+        **async_extra,
+    ):
+        config = {
+            "grpo": {
+                "num_prompts_per_step": num_prompts_per_step,
+                "num_generations_per_prompt": 2,
+                "max_rollout_turns": 1,
+                "use_dynamic_sampling": use_dynamic_sampling,
+                "dynamic_sampling_max_gen_batches": 2,
+                "max_num_epochs": max_num_epochs,
+                "async_grpo": {
+                    "max_trajectory_age_steps": max_age,
+                    "groups_multiplier": groups_multiplier,
+                    "flexible_sampling": flexible_sampling,
+                    "max_prompt_retries": max_prompt_retries,
+                    "skip_solved_prompts": skip_solved,
+                    **async_extra,
+                },
+                **(grpo_extra or {}),
+            },
+            "policy": {
+                "max_total_sequence_length": 512,
+                "make_sequence_length_divisible_by": 1,
+            },
+            "env": {},
+        }
+        self.buffer = ReplayBufferImpl(max_size=100)
+        collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
+        collector = collector_cls(
+            policy_generation=MockGenerationInterface(),
+            tokenizer=mock.MagicMock(),
+            task_to_env={},
+            master_config=MasterConfig.model_construct(**config),
+            replay_buffer=_RemoteAdapter(self.buffer),
+            start_step=0,
+        )
+        collector.running = True
+        return collector
+
+    def register(self, collector, idx: int = 0) -> int:
+        with collector._pending_lock:
+            return collector._register_prompt(_prompt(idx))
+
+    def fill(self, target: int, n: int, version: int = 0) -> None:
+        for i in range(n):
+            self.buffer.add(_group(1000 + target * 10 + i), version, target)
+
+    def run_group(
+        self,
+        collector,
+        rewards,
+        target: int,
+        gen: int = 0,
+        uid=None,
+        idx: int = 0,
+        filterable: bool = False,
+        rollout_error: bool = False,
+    ):
+        if uid is None:
+            uid = self.register(collector, idx)
+
+        def fake_rollout(**kwargs):
+            if rollout_error:
+                raise RuntimeError("rollout failed")
+            return (
+                BatchedDataDict(
+                    {
+                        "total_reward": torch.tensor(rewards, dtype=torch.float32),
+                        "message_log": [[{"role": "user", "content": "x"}]]
+                        * len(rewards),
+                    }
+                ),
+                {},
+            )
+
+        self.monkeypatch.setattr(
+            trajectory_collector_mod, "run_async_multi_turn_rollout", fake_rollout
+        )
+        collector._run_prompt_group_worker(
+            repeated_batch=_prompt(idx),
+            generation_weight_version=gen,
+            target_weight_version=target,
+            prompt_idx=0,
+            filterable=filterable,
+            prompt_uid=uid,
+        )
+        return uid
+
+    # --- init -----------------------------------------------------------
+
+    def test_multiplier_below_one_raises(self):
+        with pytest.raises(ValueError, match="groups_multiplier"):
+            self.make_collector(groups_multiplier=0.5)
+
+    def test_semaphore_size_and_override(self):
+        collector = self.make_collector(
+            num_prompts_per_step=4, max_age=2, groups_multiplier=1.5
+        )
+        assert collector._inflight_sema._value == 12
+        collector = self.make_collector(max_concurrent_generations=5)
+        assert collector._inflight_sema._value == 5
+
+    # --- claims ---------------------------------------------------------
+
+    def test_surplus_without_flexible_is_dropped_and_requeued(self):
+        collector = self.make_collector()
+        self.fill(target=1, n=2)
+
+        uid = self.run_group(collector, [1.0, 0.0], target=1)
+
+        assert self.buffer.size() == 2
+        assert collector._surplus_per_target[1] == 1
+        assert list(collector._retry_uids) == [uid]
+        assert uid in collector._pending_prompts
+        assert collector._prompt_failures == {}  # surplus is not a failure
+
+    def test_flexible_reassigns_surplus_to_next_target(self):
+        collector = self.make_collector(flexible_sampling=True, max_age=2)
+        self.fill(target=1, n=2)
+
+        uid = self.run_group(collector, [1.0, 0.0], target=1)
+
+        assert self.buffer.target_weight_versions.count(2) == 1
+        assert self.buffer.get_prompt_uids()[-1] == uid
+        assert collector._reassigned_per_target[1] == 1
+        assert collector._claimed_per_target == {}
+        assert list(collector._retry_uids) == []
+
+        collector._dynsample_spawned_per_target[1] = 2
+        stats = collector.get_target_stats(1)
+        assert stats["dynamic_sampling_num_reassigned_groups"] == 1.0
+        assert stats["dynamic_sampling_num_surplus_groups"] == 0.0
+
+    def test_flexible_drops_when_no_reachable_target_needs_a_group(self):
+        collector = self.make_collector(flexible_sampling=True, max_age=2)
+        self.fill(target=1, n=2)
+        self.fill(target=2, n=2)
+
+        uid = self.run_group(collector, [1.0, 0.0], target=1)
+
+        assert self.buffer.size() == 4
+        assert collector._surplus_per_target[1] == 1
+        assert list(collector._retry_uids) == [uid]
+
+    def test_inflight_claims_count_until_released(self):
+        collector = self.make_collector()
+        self.fill(target=1, n=1)
+
+        assert collector._claim_target(1, 0) == 1
+        assert collector._claim_target(1, 0) is None
+        collector._release_claim(1)
+        assert collector._claim_target(1, 0) == 1
+
+    def test_set_weight_version_prunes_claims(self):
+        collector = self.make_collector()
+        collector._claimed_per_target = {0: 1, 1: 2}
+        collector._surplus_per_target = {0: 1}
+        collector._dynsample_spawned_per_target = {0: 1}
+        collector.set_weight_version(1)
+        assert collector._claimed_per_target == {1: 2}
+        assert collector._surplus_per_target == {}
+
+    def test_launch_prompts_launches_ceil_needed_times_multiplier(self):
+        collector = self.make_collector(groups_multiplier=1.5)
+        started = []
+
+        class RecordingThread:
+            def __init__(self, *args, **kwargs):
+                self._args = kwargs["args"]
+
+            def start(self):
+                started.append(self._args)
+
+            def is_alive(self):
+                return True
+
+        self.monkeypatch.setattr(
+            trajectory_collector_mod._threading, "Thread", RecordingThread
+        )
+        items = []
+        for i in range(4):
+            uid = self.register(collector, i)
+            items.append((uid, collector._pending_prompts[uid]))
+
+        assert collector._launch_prompts(items) == 3
+        assert [args[5] for args in started] == [0, 1, 2]
+        assert {args[2] for args in started} == {0}
+        assert list(collector._retry_uids) == [3]
+
+    def test_launch_prompts_requeues_all_without_target(self):
+        collector = self.make_collector()
+        collector._get_next_target_for_generation = lambda version: None
+        items = []
+        for i in range(2):
+            uid = self.register(collector, i)
+            items.append((uid, collector._pending_prompts[uid]))
+
+        assert collector._launch_prompts(items) == 0
+        assert list(collector._retry_uids) == [0, 1]
+        assert collector._prompt_failures == {}
+
+    def test_launch_prompts_requeues_all_when_round_fails_before_split(self):
+        collector = self.make_collector()
+        collector._get_next_target_for_generation = lambda version: 1
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("buffer RPC failed")
+
+        self.buffer.get_trajectories_needed = boom
+        items = []
+        for i in range(2):
+            uid = self.register(collector, i)
+            items.append((uid, collector._pending_prompts[uid]))
+
+        assert collector._launch_prompts(items) == 0
+        assert list(collector._retry_uids) == [0, 1]
+
+    def test_group_for_consumed_target_is_not_claimed(self):
+        collector = self.make_collector()
+        self.buffer.last_target_weight_already_generated = 1
+
+        uid = self.run_group(collector, [1.0, 0.0], target=1)
+
+        assert self.buffer.size() == 0
+        assert collector._surplus_per_target[1] == 1
+        assert list(collector._retry_uids) == [uid]
+
+    def test_flexible_reassigns_group_of_consumed_target(self):
+        collector = self.make_collector(flexible_sampling=True, max_age=2)
+        self.buffer.last_target_weight_already_generated = 1
+
+        uid = self.run_group(collector, [1.0, 0.0], target=1)
+
+        assert self.buffer.target_weight_versions == [2]
+        assert self.buffer.get_prompt_uids() == [uid]
+
+    def test_target_consumed_between_claim_and_push_requeues(self):
+        collector = self.make_collector()
+        claims = iter([1, None])
+        collector._claim_target = lambda target, gen: next(claims)
+        collector._release_claim = lambda target: None
+        self.buffer.last_target_weight_already_generated = 1
+
+        uid = self.run_group(collector, [1.0, 0.0], target=1)
+
+        assert self.buffer.size() == 0
+        assert collector._surplus_per_target[1] == 1
+        assert list(collector._retry_uids) == [uid]
+        assert collector._prompt_failures == {}
+
+    # --- prompt bookkeeping ---------------------------------------------
+
+    def test_discarded_group_finishes_its_prompt(self):
+        collector = self.make_collector(use_dynamic_sampling=True)
+        uid = self.run_group(collector, [1.0, 1.0], target=0, filterable=True)
+
+        assert self.buffer.size() == 0
+        assert uid not in collector._pending_prompts
+        assert list(collector._retry_uids) == []
+
+    def test_buffered_group_stays_pending_until_trained(self):
+        collector = self.make_collector()
+        uid = self.run_group(collector, [1.0, 0.0], target=0)
+
+        assert self.buffer.get_prompt_uids() == [uid]
+        assert uid in collector._pending_prompts
+        assert list(collector._retry_uids) == []
+
+        stats = collector.update_prompt_status([uid], [])
+        assert uid not in collector._pending_prompts
+        assert stats["async_num_pending_prompts"] == 0.0
+        assert stats["async_num_requeued_prompts_total"] == 0.0
+
+    def test_failed_worker_requeues_its_prompt(self):
+        collector = self.make_collector()
+        self.fill(target=0, n=1)
+        uid = self.run_group(collector, [1.0, 0.0], target=0, rollout_error=True)
+
+        assert list(collector._retry_uids) == [uid]
+        assert collector._prompt_failures[uid] == 1
+        assert collector._claimed_per_target == {}
+
+    def test_failed_worker_after_shutdown_keeps_prompt_pending_only(self):
+        collector = self.make_collector()
+        collector.running = False
+        uid = self.run_group(collector, [1.0, 0.0], target=0, rollout_error=True)
+
+        assert uid in collector._pending_prompts
+        assert list(collector._retry_uids) == []
+
+    def test_expired_group_is_requeued_once(self):
+        collector = self.make_collector()
+        uid = self.register(collector)
+
+        stats = collector.update_prompt_status([], [uid, uid])
+        assert list(collector._retry_uids) == [uid]
+        assert collector._prompt_failures[uid] == 1
+        assert stats["async_num_requeued_prompts_total"] == 1.0
+
+    def test_prompt_dropped_after_max_retries(self):
+        collector = self.make_collector(max_prompt_retries=1)
+        collector._data_exhausted = True
+        uid = self.register(collector)
+
+        collector._requeue_prompt(uid, failed=True)
+        assert collector._take_retry_prompts() == [
+            (uid, collector._pending_prompts[uid])
+        ]
+        # Expiries count towards the same cap.
+        stats = collector.update_prompt_status([], [uid])
+
+        assert uid not in collector._pending_prompts
+        assert list(collector._retry_uids) == []
+        assert stats["async_num_dropped_prompts_total"] == 1.0
+        assert collector.is_finished()
+
+    def test_unfailed_requeues_do_not_count_and_training_forgets_failures(self):
+        collector = self.make_collector(max_prompt_retries=1)
+        uid = self.register(collector)
+
+        for _ in range(3):
+            collector._requeue_prompt(uid)
+            collector._take_retry_prompts()
+        assert uid in collector._pending_prompts
+        assert collector._prompt_failures == {}
+
+        collector._requeue_prompt(uid, failed=True)
+        assert collector._prompt_failures == {uid: 1}
+        collector._finish_prompt(uid)
+        assert collector._prompt_failures == {}
+
+    def test_is_finished_waits_for_data_retries_and_workers(self):
+        collector = self.make_collector()
+        assert not collector.is_finished()
+
+        collector._data_exhausted = True
+        uid = self.register(collector)
+        collector._requeue_prompt(uid)
+        assert not collector.is_finished()
+
+        collector._take_retry_prompts()
+        collector._relaunching = True
+        assert not collector.is_finished()
+        collector._relaunching = False
+
+        alive = mock.MagicMock()
+        alive.is_alive.return_value = True
+        collector._inflight_threads.add(alive)
+        assert not collector.is_finished()
+        alive.is_alive.return_value = False
+        assert collector.is_finished()
+
+    def test_checkpoint_state_and_restore(self):
+        collector = self.make_collector(skip_solved=True)
+        for i in range(3):
+            self.register(collector, i)
+        collector._epochs_completed = 1
+        collector.current_epoch = 2
+        collector._solved_prompts = {7: 1}
+        collector._finish_prompt(1)
+
+        state = collector.get_checkpoint_state()
+        assert state["dataloader_state"] == {}
+        saved = state["collector_state"]
+        assert sorted(saved["pending_prompts"]) == [0, 2]
+        assert saved["next_prompt_uid"] == 3
+
+        restored = self.make_collector(skip_solved=True)
+        restored.restore_collection_state(saved, buffered_uids=[2])
+        assert sorted(restored._pending_prompts) == [0, 2]
+        # Prompt 2 has a group in the restored buffer: not regenerated.
+        assert list(restored._retry_uids) == [0]
+        assert restored._solved_prompts == {7: 1}
+        assert restored._epochs_completed == 1
+        assert restored.current_epoch == 2
+        assert self.register(restored) == 3
+
+    def test_restore_keeps_new_uids_above_buffered_uids(self):
+        collector = self.make_collector()
+        self.register(collector, 0)
+        saved = collector.get_checkpoint_state()["collector_state"]
+        assert saved["next_prompt_uid"] == 1
+
+        # A group registered after the collector snapshot reached the buffer.
+        restored = self.make_collector()
+        restored.restore_collection_state(saved, buffered_uids=[0, 4])
+        assert self.register(restored) == 5
+
+    def test_restore_after_dataset_swap_starts_fresh(self):
+        collector = self.make_collector(skip_solved=True)
+        for i in range(3):
+            self.register(collector, i)
+        collector._epochs_completed = 2
+        collector._solved_prompts = {7: 1}
+        saved = collector.get_checkpoint_state()["collector_state"]
+
+        restored = self.make_collector(skip_solved=True)
+        restored.restore_collection_state(
+            saved, buffered_uids=[2], dataset_swapped=True
+        )
+        assert restored._pending_prompts == {}
+        assert list(restored._retry_uids) == []
+        assert restored._solved_prompts == {}
+        assert restored._epochs_completed == 0
+        # Restored groups keep their uids: new prompts start above them.
+        assert self.register(restored) == 3
+
+    # --- collection loop, epochs and skip-solved --------------------------
+
+    def run_loop(self, collector, batches):
+        """Run _collection_loop with launches recorded instead of started."""
+        launched = []
+
+        def fake_launch(items):
+            launched.append(
+                [int(collector._pending_prompts[uid]["idx"][0]) for uid, _ in items]
+            )
+            return len(items)
+
+        def stop(_seconds):
+            collector.running = False
+
+        collector._launch_prompts = fake_launch
+        collector._wait_until_can_launch = lambda: collector.running
+        collector.dataloader = batches
+        self.monkeypatch.setattr(trajectory_collector_mod.time, "sleep", stop)
+        collector._collection_loop()
+        return launched
+
+    def test_collection_loop_runs_retries_first_and_reads_max_epochs(self):
+        collector = self.make_collector(max_num_epochs=2)
+        uid = self.register(collector, idx=9)
+        collector._requeue_prompt(uid)
+
+        launched = self.run_loop(collector, [_prompts_batch([0, 1])])
+
+        assert launched == [[9], [0, 1], [0, 1]]
+        assert collector._epochs_completed == 2
+        assert collector._data_exhausted
+        assert collector.is_finished()
+
+    def test_solved_prompts_are_skipped_in_later_epochs(self):
+        collector = self.make_collector(skip_solved=True, max_num_epochs=2)
+        collector._solved_prompts = {0: 1}
+
+        launched = self.run_loop(collector, [_prompts_batch([0, 1])])
+
+        assert launched == [[1], [1]]
+        assert collector._num_skipped_solved == 2
+        stats = collector.update_prompt_status([], [])
+        assert stats["async_num_skipped_solved_total"] == 2.0
+        assert stats["async_num_solved_prompts"] == 1.0
+
+    def test_retries_still_run_after_last_epoch(self):
+        collector = self.make_collector(max_num_epochs=1)
+        collector._epochs_completed = 1
+        uid = self.register(collector, idx=4)
+        collector._requeue_prompt(uid)
+
+        launched = self.run_loop(collector, [_prompts_batch([0, 1])])
+
+        assert launched == [[4]]
+
+    # --- skip-solved marking and reward shaping -------------------------
+
+    def test_only_all_one_groups_are_marked_solved(self):
+        collector = self.make_collector(skip_solved=True)
+        self.run_group(collector, [1.0, 0.0], target=0, idx=3)
+        self.run_group(collector, [0.0, 0.0], target=0, idx=4)
+        assert collector._solved_prompts == {}
+        self.run_group(collector, [1.0, 1.0], target=0, idx=5)
+        assert set(collector._solved_prompts) == {5}
+
+    def _patch_shaping(self, calls):
+        def fake_shaping(batch, cfg):
+            calls.append("shaping")
+            batch["unshaped_total_reward"] = batch["total_reward"].clone()
+            # A length penalty on the second response only.
+            batch["total_reward"] = batch["total_reward"] - torch.tensor([0.0, 0.5])
+            return batch
+
+        def fake_degeneration(batch, cfg):
+            calls.append("degeneration")
+            batch["total_reward"] = torch.minimum(
+                batch["total_reward"], torch.tensor([-1.0, 100.0])
+            )
+            return batch
+
+        self.monkeypatch.setattr(
+            trajectory_collector_mod, "apply_reward_shaping", fake_shaping
+        )
+        self.monkeypatch.setattr(
+            trajectory_collector_mod, "apply_degeneration_penalty", fake_degeneration
+        )
+
+    def test_shaping_does_not_rescue_uniform_group_and_solved_uses_raw(self):
+        calls = []
+        self._patch_shaping(calls)
+        collector = self.make_collector(
+            skip_solved=True,
+            use_dynamic_sampling=True,
+            grpo_extra={"reward_shaping": {"enabled": True}},
+        )
+
+        uid = self.run_group(collector, [1.0, 1.0], target=0, idx=2, filterable=True)
+
+        assert calls == ["shaping"]
+        assert set(collector._solved_prompts) == {2}
+        # Shaped rewards differ, but the raw ones are all equal: discarded.
+        assert self.buffer.size() == 0
+        assert collector._discarded_per_target[0] == 1
+        assert uid not in collector._pending_prompts
+
+    def test_shaping_and_degeneration_penalty_applied_in_order(self):
+        calls = []
+        self._patch_shaping(calls)
+        collector = self.make_collector(
+            use_dynamic_sampling=True,
+            grpo_extra={
+                "reward_shaping": {"enabled": True},
+                "degeneration_penalty": {"enabled": True},
+            },
+        )
+
+        self.run_group(collector, [1.0, 0.0], target=0, filterable=True)
+
+        assert calls == ["shaping", "degeneration"]
+        pushed = self.buffer.trajectories[0]["batch"]
+        assert pushed["total_reward"].tolist() == [-1.0, -0.5]
+        assert pushed["unshaped_total_reward"].tolist() == [1.0, 0.0]
